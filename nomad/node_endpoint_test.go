@@ -3,16 +3,23 @@ package nomad
 import (
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
+	memdb "github.com/hashicorp/go-memdb"
 	"github.com/hashicorp/net-rpc-msgpackrpc"
+	"github.com/hashicorp/nomad/acl"
+	"github.com/hashicorp/nomad/helper/uuid"
 	"github.com/hashicorp/nomad/nomad/mock"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/hashicorp/nomad/testutil"
+	vapi "github.com/hashicorp/vault/api"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestClientEndpoint_Register(t *testing.T) {
+	t.Parallel()
 	s1 := testServer(t, nil)
 	defer s1.Shutdown()
 	codec := rpcClient(t, s1)
@@ -36,7 +43,8 @@ func TestClientEndpoint_Register(t *testing.T) {
 
 	// Check for the node in the FSM
 	state := s1.fsm.State()
-	out, err := state.NodeByID(node.ID)
+	ws := memdb.NewWatchSet()
+	out, err := state.NodeByID(ws, node.ID)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -51,7 +59,36 @@ func TestClientEndpoint_Register(t *testing.T) {
 	}
 }
 
+func TestClientEndpoint_Register_SecretMismatch(t *testing.T) {
+	t.Parallel()
+	s1 := testServer(t, nil)
+	defer s1.Shutdown()
+	codec := rpcClient(t, s1)
+	testutil.WaitForLeader(t, s1.RPC)
+
+	// Create the register request
+	node := mock.Node()
+	req := &structs.NodeRegisterRequest{
+		Node:         node,
+		WriteRequest: structs.WriteRequest{Region: "global"},
+	}
+
+	// Fetch the response
+	var resp structs.GenericResponse
+	if err := msgpackrpc.CallWithCodec(codec, "Node.Register", req, &resp); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Update the nodes SecretID
+	node.SecretID = uuid.Generate()
+	err := msgpackrpc.CallWithCodec(codec, "Node.Register", req, &resp)
+	if err == nil || !strings.Contains(err.Error(), "Not registering") {
+		t.Fatalf("Expecting error regarding mismatching secret id: %v", err)
+	}
+}
+
 func TestClientEndpoint_Deregister(t *testing.T) {
+	t.Parallel()
 	s1 := testServer(t, nil)
 	defer s1.Shutdown()
 	codec := rpcClient(t, s1)
@@ -85,7 +122,8 @@ func TestClientEndpoint_Deregister(t *testing.T) {
 
 	// Check for the node in the FSM
 	state := s1.fsm.State()
-	out, err := state.NodeByID(node.ID)
+	ws := memdb.NewWatchSet()
+	out, err := state.NodeByID(ws, node.ID)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -94,7 +132,134 @@ func TestClientEndpoint_Deregister(t *testing.T) {
 	}
 }
 
+func TestClientEndpoint_Deregister_ACL(t *testing.T) {
+	t.Parallel()
+	s1, root := testACLServer(t, nil)
+	defer s1.Shutdown()
+	codec := rpcClient(t, s1)
+	testutil.WaitForLeader(t, s1.RPC)
+
+	// Create the node
+	node := mock.Node()
+	node1 := mock.Node()
+	state := s1.fsm.State()
+	if err := state.UpsertNode(1, node); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if err := state.UpsertNode(2, node1); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Create the policy and tokens
+	validToken := mock.CreatePolicyAndToken(t, state, 1001, "test-valid", mock.NodePolicy(acl.PolicyWrite))
+	invalidToken := mock.CreatePolicyAndToken(t, state, 1003, "test-invalid", mock.NodePolicy(acl.PolicyRead))
+
+	// Deregister without any token and expect it to fail
+	dereg := &structs.NodeDeregisterRequest{
+		NodeID:       node.ID,
+		WriteRequest: structs.WriteRequest{Region: "global"},
+	}
+	var resp structs.GenericResponse
+	if err := msgpackrpc.CallWithCodec(codec, "Node.Deregister", dereg, &resp); err == nil {
+		t.Fatalf("node de-register succeeded")
+	}
+
+	// Deregister with a valid token
+	dereg.AuthToken = validToken.SecretID
+	if err := msgpackrpc.CallWithCodec(codec, "Node.Deregister", dereg, &resp); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Check for the node in the FSM
+	ws := memdb.NewWatchSet()
+	out, err := state.NodeByID(ws, node.ID)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if out != nil {
+		t.Fatalf("unexpected node")
+	}
+
+	// Deregister with an invalid token.
+	dereg1 := &structs.NodeDeregisterRequest{
+		NodeID:       node1.ID,
+		WriteRequest: structs.WriteRequest{Region: "global"},
+	}
+	dereg1.AuthToken = invalidToken.SecretID
+	if err := msgpackrpc.CallWithCodec(codec, "Node.Deregister", dereg1, &resp); err == nil {
+		t.Fatalf("rpc should not have succeeded")
+	}
+
+	// Try with a root token
+	dereg1.AuthToken = root.SecretID
+	if err := msgpackrpc.CallWithCodec(codec, "Node.Deregister", dereg1, &resp); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+}
+
+func TestClientEndpoint_Deregister_Vault(t *testing.T) {
+	t.Parallel()
+	s1 := testServer(t, nil)
+	defer s1.Shutdown()
+	codec := rpcClient(t, s1)
+	testutil.WaitForLeader(t, s1.RPC)
+
+	// Create the register request
+	node := mock.Node()
+	reg := &structs.NodeRegisterRequest{
+		Node:         node,
+		WriteRequest: structs.WriteRequest{Region: "global"},
+	}
+
+	// Fetch the response
+	var resp structs.GenericResponse
+	if err := msgpackrpc.CallWithCodec(codec, "Node.Register", reg, &resp); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Swap the servers Vault Client
+	tvc := &TestVaultClient{}
+	s1.vault = tvc
+
+	// Put some Vault accessors in the state store for that node
+	state := s1.fsm.State()
+	va1 := mock.VaultAccessor()
+	va1.NodeID = node.ID
+	va2 := mock.VaultAccessor()
+	va2.NodeID = node.ID
+	state.UpsertVaultAccessor(100, []*structs.VaultAccessor{va1, va2})
+
+	// Deregister
+	dereg := &structs.NodeDeregisterRequest{
+		NodeID:       node.ID,
+		WriteRequest: structs.WriteRequest{Region: "global"},
+	}
+	var resp2 structs.GenericResponse
+	if err := msgpackrpc.CallWithCodec(codec, "Node.Deregister", dereg, &resp2); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if resp2.Index == 0 {
+		t.Fatalf("bad index: %d", resp2.Index)
+	}
+
+	// Check for the node in the FSM
+	ws := memdb.NewWatchSet()
+	out, err := state.NodeByID(ws, node.ID)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if out != nil {
+		t.Fatalf("unexpected node")
+	}
+
+	// Check that the endpoint revoked the tokens
+	if l := len(tvc.RevokedTokens); l != 2 {
+		t.Fatalf("Deregister revoked %d tokens; want 2", l)
+	}
+}
+
 func TestClientEndpoint_UpdateStatus(t *testing.T) {
+	t.Parallel()
 	s1 := testServer(t, nil)
 	defer s1.Shutdown()
 	codec := rpcClient(t, s1)
@@ -141,7 +306,8 @@ func TestClientEndpoint_UpdateStatus(t *testing.T) {
 
 	// Check for the node in the FSM
 	state := s1.fsm.State()
-	out, err := state.NodeByID(node.ID)
+	ws := memdb.NewWatchSet()
+	out, err := state.NodeByID(ws, node.ID)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -153,7 +319,160 @@ func TestClientEndpoint_UpdateStatus(t *testing.T) {
 	}
 }
 
+func TestClientEndpoint_UpdateStatus_Vault(t *testing.T) {
+	t.Parallel()
+	s1 := testServer(t, nil)
+	defer s1.Shutdown()
+	codec := rpcClient(t, s1)
+	testutil.WaitForLeader(t, s1.RPC)
+
+	// Create the register request
+	node := mock.Node()
+	reg := &structs.NodeRegisterRequest{
+		Node:         node,
+		WriteRequest: structs.WriteRequest{Region: "global"},
+	}
+
+	// Fetch the response
+	var resp structs.NodeUpdateResponse
+	if err := msgpackrpc.CallWithCodec(codec, "Node.Register", reg, &resp); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Check for heartbeat interval
+	ttl := resp.HeartbeatTTL
+	if ttl < s1.config.MinHeartbeatTTL || ttl > 2*s1.config.MinHeartbeatTTL {
+		t.Fatalf("bad: %#v", ttl)
+	}
+
+	// Swap the servers Vault Client
+	tvc := &TestVaultClient{}
+	s1.vault = tvc
+
+	// Put some Vault accessors in the state store for that node
+	state := s1.fsm.State()
+	va1 := mock.VaultAccessor()
+	va1.NodeID = node.ID
+	va2 := mock.VaultAccessor()
+	va2.NodeID = node.ID
+	state.UpsertVaultAccessor(100, []*structs.VaultAccessor{va1, va2})
+
+	// Update the status to be down
+	dereg := &structs.NodeUpdateStatusRequest{
+		NodeID:       node.ID,
+		Status:       structs.NodeStatusDown,
+		WriteRequest: structs.WriteRequest{Region: "global"},
+	}
+	var resp2 structs.NodeUpdateResponse
+	if err := msgpackrpc.CallWithCodec(codec, "Node.UpdateStatus", dereg, &resp2); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if resp2.Index == 0 {
+		t.Fatalf("bad index: %d", resp2.Index)
+	}
+
+	// Check that the endpoint revoked the tokens
+	if l := len(tvc.RevokedTokens); l != 2 {
+		t.Fatalf("Deregister revoked %d tokens; want 2", l)
+	}
+}
+
+func TestClientEndpoint_Register_GetEvals(t *testing.T) {
+	t.Parallel()
+	s1 := testServer(t, nil)
+	defer s1.Shutdown()
+	codec := rpcClient(t, s1)
+	testutil.WaitForLeader(t, s1.RPC)
+
+	// Register a system job.
+	job := mock.SystemJob()
+	state := s1.fsm.State()
+	if err := state.UpsertJob(1, job); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Create the register request going directly to ready
+	node := mock.Node()
+	node.Status = structs.NodeStatusReady
+	reg := &structs.NodeRegisterRequest{
+		Node:         node,
+		WriteRequest: structs.WriteRequest{Region: "global"},
+	}
+
+	// Fetch the response
+	var resp structs.NodeUpdateResponse
+	if err := msgpackrpc.CallWithCodec(codec, "Node.Register", reg, &resp); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Check for heartbeat interval
+	ttl := resp.HeartbeatTTL
+	if ttl < s1.config.MinHeartbeatTTL || ttl > 2*s1.config.MinHeartbeatTTL {
+		t.Fatalf("bad: %#v", ttl)
+	}
+
+	// Check for an eval caused by the system job.
+	if len(resp.EvalIDs) != 1 {
+		t.Fatalf("expected one eval; got %#v", resp.EvalIDs)
+	}
+
+	evalID := resp.EvalIDs[0]
+	ws := memdb.NewWatchSet()
+	eval, err := state.EvalByID(ws, evalID)
+	if err != nil {
+		t.Fatalf("could not get eval %v", evalID)
+	}
+
+	if eval.Type != "system" {
+		t.Fatalf("unexpected eval type; got %v; want %q", eval.Type, "system")
+	}
+
+	// Check for the node in the FSM
+	out, err := state.NodeByID(ws, node.ID)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if out == nil {
+		t.Fatalf("expected node")
+	}
+	if out.ModifyIndex != resp.Index {
+		t.Fatalf("index mis-match")
+	}
+
+	// Transition it to down and then ready
+	node.Status = structs.NodeStatusDown
+	reg = &structs.NodeRegisterRequest{
+		Node:         node,
+		WriteRequest: structs.WriteRequest{Region: "global"},
+	}
+
+	// Fetch the response
+	if err := msgpackrpc.CallWithCodec(codec, "Node.Register", reg, &resp); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	if len(resp.EvalIDs) != 1 {
+		t.Fatalf("expected one eval; got %#v", resp.EvalIDs)
+	}
+
+	node.Status = structs.NodeStatusReady
+	reg = &structs.NodeRegisterRequest{
+		Node:         node,
+		WriteRequest: structs.WriteRequest{Region: "global"},
+	}
+
+	// Fetch the response
+	if err := msgpackrpc.CallWithCodec(codec, "Node.Register", reg, &resp); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	if len(resp.EvalIDs) != 1 {
+		t.Fatalf("expected one eval; got %#v", resp.EvalIDs)
+	}
+}
+
 func TestClientEndpoint_UpdateStatus_GetEvals(t *testing.T) {
+	t.Parallel()
 	s1 := testServer(t, nil)
 	defer s1.Shutdown()
 	codec := rpcClient(t, s1)
@@ -206,7 +525,8 @@ func TestClientEndpoint_UpdateStatus_GetEvals(t *testing.T) {
 	}
 
 	evalID := resp2.EvalIDs[0]
-	eval, err := state.EvalByID(evalID)
+	ws := memdb.NewWatchSet()
+	eval, err := state.EvalByID(ws, evalID)
 	if err != nil {
 		t.Fatalf("could not get eval %v", evalID)
 	}
@@ -222,7 +542,7 @@ func TestClientEndpoint_UpdateStatus_GetEvals(t *testing.T) {
 	}
 
 	// Check for the node in the FSM
-	out, err := state.NodeByID(node.ID)
+	out, err := state.NodeByID(ws, node.ID)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -235,6 +555,7 @@ func TestClientEndpoint_UpdateStatus_GetEvals(t *testing.T) {
 }
 
 func TestClientEndpoint_UpdateStatus_HeartbeatOnly(t *testing.T) {
+	t.Parallel()
 	s1 := testServer(t, nil)
 	defer s1.Shutdown()
 
@@ -252,8 +573,8 @@ func TestClientEndpoint_UpdateStatus_HeartbeatOnly(t *testing.T) {
 
 	for _, s := range servers {
 		testutil.WaitForResult(func() (bool, error) {
-			peers, _ := s.raftPeers.Peers()
-			return len(peers) == 3, nil
+			peers, _ := s.numPeers()
+			return peers == 3, nil
 		}, func(err error) {
 			t.Fatalf("should have 3 peers")
 		})
@@ -309,6 +630,7 @@ func TestClientEndpoint_UpdateStatus_HeartbeatOnly(t *testing.T) {
 }
 
 func TestClientEndpoint_UpdateDrain(t *testing.T) {
+	t.Parallel()
 	s1 := testServer(t, nil)
 	defer s1.Shutdown()
 	codec := rpcClient(t, s1)
@@ -343,7 +665,8 @@ func TestClientEndpoint_UpdateDrain(t *testing.T) {
 
 	// Check for the node in the FSM
 	state := s1.fsm.State()
-	out, err := state.NodeByID(node.ID)
+	ws := memdb.NewWatchSet()
+	out, err := state.NodeByID(ws, node.ID)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -352,7 +675,201 @@ func TestClientEndpoint_UpdateDrain(t *testing.T) {
 	}
 }
 
+func TestClientEndpoint_UpdateDrain_ACL(t *testing.T) {
+	t.Parallel()
+	s1, root := testACLServer(t, nil)
+	defer s1.Shutdown()
+	codec := rpcClient(t, s1)
+	testutil.WaitForLeader(t, s1.RPC)
+	assert := assert.New(t)
+
+	// Create the node
+	node := mock.Node()
+	state := s1.fsm.State()
+
+	assert.Nil(state.UpsertNode(1, node), "UpsertNode")
+
+	// Create the policy and tokens
+	validToken := mock.CreatePolicyAndToken(t, state, 1001, "test-valid", mock.NodePolicy(acl.PolicyWrite))
+	invalidToken := mock.CreatePolicyAndToken(t, state, 1003, "test-invalid", mock.NodePolicy(acl.PolicyRead))
+
+	// Update the status without a token and expect failure
+	dereg := &structs.NodeUpdateDrainRequest{
+		NodeID:       node.ID,
+		Drain:        true,
+		WriteRequest: structs.WriteRequest{Region: "global"},
+	}
+	{
+		var resp structs.NodeDrainUpdateResponse
+		err := msgpackrpc.CallWithCodec(codec, "Node.UpdateDrain", dereg, &resp)
+		assert.NotNil(err, "RPC")
+		assert.Equal(err.Error(), structs.ErrPermissionDenied.Error())
+	}
+
+	// Try with a valid token
+	dereg.AuthToken = validToken.SecretID
+	{
+		var resp structs.NodeDrainUpdateResponse
+		assert.Nil(msgpackrpc.CallWithCodec(codec, "Node.UpdateDrain", dereg, &resp), "RPC")
+	}
+
+	// Try with a invalid token
+	dereg.AuthToken = invalidToken.SecretID
+	{
+		var resp structs.NodeDrainUpdateResponse
+		err := msgpackrpc.CallWithCodec(codec, "Node.UpdateDrain", dereg, &resp)
+		assert.NotNil(err, "RPC")
+		assert.Equal(err.Error(), structs.ErrPermissionDenied.Error())
+	}
+
+	// Try with a root token
+	dereg.AuthToken = root.SecretID
+	{
+		var resp structs.NodeDrainUpdateResponse
+		assert.Nil(msgpackrpc.CallWithCodec(codec, "Node.UpdateDrain", dereg, &resp), "RPC")
+	}
+}
+
+// This test ensures that Nomad marks client state of allocations which are in
+// pending/running state to lost when a node is marked as down.
+func TestClientEndpoint_Drain_Down(t *testing.T) {
+	t.Parallel()
+	s1 := testServer(t, nil)
+	defer s1.Shutdown()
+	codec := rpcClient(t, s1)
+	testutil.WaitForLeader(t, s1.RPC)
+
+	// Register a node
+	node := mock.Node()
+	reg := &structs.NodeRegisterRequest{
+		Node:         node,
+		WriteRequest: structs.WriteRequest{Region: "global"},
+	}
+	// Fetch the response
+	var resp structs.NodeUpdateResponse
+	if err := msgpackrpc.CallWithCodec(codec, "Node.Register", reg, &resp); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Register a service job
+	var jobResp structs.JobRegisterResponse
+	job := mock.Job()
+	job.TaskGroups[0].Count = 1
+	jobReq := &structs.JobRegisterRequest{
+		Job: job,
+		WriteRequest: structs.WriteRequest{
+			Region:    "global",
+			Namespace: job.Namespace,
+		},
+	}
+	if err := msgpackrpc.CallWithCodec(codec, "Job.Register", jobReq, &jobResp); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Register a system job
+	var jobResp1 structs.JobRegisterResponse
+	job1 := mock.Job()
+	job1.TaskGroups[0].Count = 1
+	job1.Type = structs.JobTypeSystem
+	jobReq1 := &structs.JobRegisterRequest{
+		Job: job1,
+		WriteRequest: structs.WriteRequest{
+			Region:    "global",
+			Namespace: job1.Namespace,
+		},
+	}
+	if err := msgpackrpc.CallWithCodec(codec, "Job.Register", jobReq1, &jobResp1); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Wait for the scheduler to create an allocation
+	testutil.WaitForResult(func() (bool, error) {
+		ws := memdb.NewWatchSet()
+		allocs, err := s1.fsm.state.AllocsByJob(ws, job.Namespace, job.ID, true)
+		if err != nil {
+			return false, err
+		}
+		allocs1, err := s1.fsm.state.AllocsByJob(ws, job1.Namespace, job1.ID, true)
+		if err != nil {
+			return false, err
+		}
+		return len(allocs) > 0 && len(allocs1) > 0, nil
+	}, func(err error) {
+		t.Fatalf("err: %v", err)
+	})
+
+	// Drain the node
+	dereg := &structs.NodeUpdateDrainRequest{
+		NodeID:       node.ID,
+		Drain:        true,
+		WriteRequest: structs.WriteRequest{Region: "global"},
+	}
+	var resp2 structs.NodeDrainUpdateResponse
+	if err := msgpackrpc.CallWithCodec(codec, "Node.UpdateDrain", dereg, &resp2); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Mark the node as down
+	node.Status = structs.NodeStatusDown
+	reg = &structs.NodeRegisterRequest{
+		Node:         node,
+		WriteRequest: structs.WriteRequest{Region: "global"},
+	}
+	if err := msgpackrpc.CallWithCodec(codec, "Node.Register", reg, &resp); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Ensure that the allocation has transitioned to lost
+	testutil.WaitForResult(func() (bool, error) {
+		ws := memdb.NewWatchSet()
+		summary, err := s1.fsm.state.JobSummaryByID(ws, job.Namespace, job.ID)
+		if err != nil {
+			return false, err
+		}
+		expectedSummary := &structs.JobSummary{
+			JobID:     job.ID,
+			Namespace: job.Namespace,
+			Summary: map[string]structs.TaskGroupSummary{
+				"web": {
+					Queued: 1,
+					Lost:   1,
+				},
+			},
+			Children:    new(structs.JobChildrenSummary),
+			CreateIndex: jobResp.JobModifyIndex,
+			ModifyIndex: summary.ModifyIndex,
+		}
+		if !reflect.DeepEqual(summary, expectedSummary) {
+			return false, fmt.Errorf("expected: %#v, actual: %#v", expectedSummary, summary)
+		}
+
+		summary1, err := s1.fsm.state.JobSummaryByID(ws, job1.Namespace, job1.ID)
+		if err != nil {
+			return false, err
+		}
+		expectedSummary1 := &structs.JobSummary{
+			JobID:     job1.ID,
+			Namespace: job1.Namespace,
+			Summary: map[string]structs.TaskGroupSummary{
+				"web": {
+					Lost: 1,
+				},
+			},
+			Children:    new(structs.JobChildrenSummary),
+			CreateIndex: jobResp1.JobModifyIndex,
+			ModifyIndex: summary1.ModifyIndex,
+		}
+		if !reflect.DeepEqual(summary1, expectedSummary1) {
+			return false, fmt.Errorf("expected: %#v, actual: %#v", expectedSummary1, summary1)
+		}
+		return true, nil
+	}, func(err error) {
+		t.Fatalf("err: %v", err)
+	})
+}
+
 func TestClientEndpoint_GetNode(t *testing.T) {
+	t.Parallel()
 	s1 := testServer(t, nil)
 	defer s1.Shutdown()
 	codec := rpcClient(t, s1)
@@ -390,8 +907,11 @@ func TestClientEndpoint_GetNode(t *testing.T) {
 		t.Fatalf("bad ComputedClass: %#v", resp2.Node)
 	}
 
+	// Update the status updated at value
+	node.StatusUpdatedAt = resp2.Node.StatusUpdatedAt
+	node.SecretID = ""
 	if !reflect.DeepEqual(node, resp2.Node) {
-		t.Fatalf("bad: %#v %#v", node, resp2.Node)
+		t.Fatalf("bad: %#v \n %#v", node, resp2.Node)
 	}
 
 	// Lookup non-existing node
@@ -407,7 +927,71 @@ func TestClientEndpoint_GetNode(t *testing.T) {
 	}
 }
 
+func TestClientEndpoint_GetNode_ACL(t *testing.T) {
+	t.Parallel()
+	s1, root := testACLServer(t, nil)
+	defer s1.Shutdown()
+	codec := rpcClient(t, s1)
+	testutil.WaitForLeader(t, s1.RPC)
+	assert := assert.New(t)
+
+	// Create the node
+	node := mock.Node()
+	state := s1.fsm.State()
+	assert.Nil(state.UpsertNode(1, node), "UpsertNode")
+
+	// Create the policy and tokens
+	validToken := mock.CreatePolicyAndToken(t, state, 1001, "test-valid", mock.NodePolicy(acl.PolicyRead))
+	invalidToken := mock.CreatePolicyAndToken(t, state, 1003, "test-invalid", mock.NodePolicy(acl.PolicyDeny))
+
+	// Lookup the node without a token and expect failure
+	req := &structs.NodeSpecificRequest{
+		NodeID:       node.ID,
+		QueryOptions: structs.QueryOptions{Region: "global"},
+	}
+	{
+		var resp structs.SingleNodeResponse
+		err := msgpackrpc.CallWithCodec(codec, "Node.GetNode", req, &resp)
+		assert.NotNil(err, "RPC")
+		assert.Equal(err.Error(), structs.ErrPermissionDenied.Error())
+	}
+
+	// Try with a valid token
+	req.AuthToken = validToken.SecretID
+	{
+		var resp structs.SingleNodeResponse
+		assert.Nil(msgpackrpc.CallWithCodec(codec, "Node.GetNode", req, &resp), "RPC")
+		assert.Equal(node.ID, resp.Node.ID)
+	}
+
+	// Try with a Node.SecretID
+	req.AuthToken = node.SecretID
+	{
+		var resp structs.SingleNodeResponse
+		assert.Nil(msgpackrpc.CallWithCodec(codec, "Node.GetNode", req, &resp), "RPC")
+		assert.Equal(node.ID, resp.Node.ID)
+	}
+
+	// Try with a invalid token
+	req.AuthToken = invalidToken.SecretID
+	{
+		var resp structs.SingleNodeResponse
+		err := msgpackrpc.CallWithCodec(codec, "Node.GetNode", req, &resp)
+		assert.NotNil(err, "RPC")
+		assert.Equal(err.Error(), structs.ErrPermissionDenied.Error())
+	}
+
+	// Try with a root token
+	req.AuthToken = root.SecretID
+	{
+		var resp structs.SingleNodeResponse
+		assert.Nil(msgpackrpc.CallWithCodec(codec, "Node.GetNode", req, &resp), "RPC")
+		assert.Equal(node.ID, resp.Node.ID)
+	}
+}
+
 func TestClientEndpoint_GetNode_Blocking(t *testing.T) {
+	t.Parallel()
 	s1 := testServer(t, nil)
 	defer s1.Shutdown()
 	state := s1.fsm.State()
@@ -437,7 +1021,7 @@ func TestClientEndpoint_GetNode_Blocking(t *testing.T) {
 		NodeID: node2.ID,
 		QueryOptions: structs.QueryOptions{
 			Region:        "global",
-			MinQueryIndex: 50,
+			MinQueryIndex: 150,
 		},
 	}
 	var resp structs.SingleNodeResponse
@@ -509,6 +1093,7 @@ func TestClientEndpoint_GetNode_Blocking(t *testing.T) {
 }
 
 func TestClientEndpoint_GetAllocs(t *testing.T) {
+	t.Parallel()
 	s1 := testServer(t, nil)
 	defer s1.Shutdown()
 	codec := rpcClient(t, s1)
@@ -533,6 +1118,7 @@ func TestClientEndpoint_GetAllocs(t *testing.T) {
 	alloc := mock.Alloc()
 	alloc.NodeID = node.ID
 	state := s1.fsm.State()
+	state.UpsertJobSummary(99, mock.JobSummary(alloc.JobID))
 	err := state.UpsertAllocs(100, []*structs.Allocation{alloc})
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -568,7 +1154,82 @@ func TestClientEndpoint_GetAllocs(t *testing.T) {
 	}
 }
 
+func TestClientEndpoint_GetAllocs_ACL_Basic(t *testing.T) {
+	t.Parallel()
+	s1, root := testACLServer(t, nil)
+	defer s1.Shutdown()
+	codec := rpcClient(t, s1)
+	testutil.WaitForLeader(t, s1.RPC)
+	assert := assert.New(t)
+
+	// Create the node
+	allocDefaultNS := mock.Alloc()
+	node := mock.Node()
+	allocDefaultNS.NodeID = node.ID
+	state := s1.fsm.State()
+	assert.Nil(state.UpsertNode(1, node), "UpsertNode")
+	assert.Nil(state.UpsertJobSummary(2, mock.JobSummary(allocDefaultNS.JobID)), "UpsertJobSummary")
+	allocs := []*structs.Allocation{allocDefaultNS}
+	assert.Nil(state.UpsertAllocs(5, allocs), "UpsertAllocs")
+
+	// Create the namespace policy and tokens
+	validDefaultToken := mock.CreatePolicyAndToken(t, state, 1001, "test-default-valid", mock.NodePolicy(acl.PolicyRead)+
+		mock.NamespacePolicy(structs.DefaultNamespace, "", []string{acl.NamespaceCapabilityReadJob}))
+	invalidToken := mock.CreatePolicyAndToken(t, state, 1004, "test-invalid",
+		mock.NamespacePolicy(structs.DefaultNamespace, "", []string{acl.NamespaceCapabilityReadJob}))
+
+	req := &structs.NodeSpecificRequest{
+		NodeID: node.ID,
+		QueryOptions: structs.QueryOptions{
+			Region: "global",
+		},
+	}
+
+	// Lookup the node without a token and expect failure
+	{
+		var resp structs.NodeAllocsResponse
+		err := msgpackrpc.CallWithCodec(codec, "Node.GetAllocs", req, &resp)
+		assert.NotNil(err, "RPC")
+		assert.Equal(err.Error(), structs.ErrPermissionDenied.Error())
+	}
+
+	// Try with a valid token for the default namespace
+	req.AuthToken = validDefaultToken.SecretID
+	{
+		var resp structs.NodeAllocsResponse
+		assert.Nil(msgpackrpc.CallWithCodec(codec, "Node.GetAllocs", req, &resp), "RPC")
+		assert.Len(resp.Allocs, 1)
+		assert.Equal(allocDefaultNS.ID, resp.Allocs[0].ID)
+	}
+
+	// Try with a invalid token
+	req.AuthToken = invalidToken.SecretID
+	{
+		var resp structs.NodeAllocsResponse
+		err := msgpackrpc.CallWithCodec(codec, "Node.GetAllocs", req, &resp)
+		assert.NotNil(err, "RPC")
+		assert.Equal(err.Error(), structs.ErrPermissionDenied.Error())
+	}
+
+	// Try with a root token
+	req.AuthToken = root.SecretID
+	{
+		var resp structs.NodeAllocsResponse
+		assert.Nil(msgpackrpc.CallWithCodec(codec, "Node.GetAllocs", req, &resp), "RPC")
+		assert.Len(resp.Allocs, 1)
+		for _, alloc := range resp.Allocs {
+			switch alloc.ID {
+			case allocDefaultNS.ID:
+				// expected
+			default:
+				t.Errorf("unexpected alloc %q for namespace %q", alloc.ID, alloc.Namespace)
+			}
+		}
+	}
+}
+
 func TestClientEndpoint_GetClientAllocs(t *testing.T) {
+	t.Parallel()
 	s1 := testServer(t, nil)
 	defer s1.Shutdown()
 	codec := rpcClient(t, s1)
@@ -593,6 +1254,7 @@ func TestClientEndpoint_GetClientAllocs(t *testing.T) {
 	alloc := mock.Alloc()
 	alloc.NodeID = node.ID
 	state := s1.fsm.State()
+	state.UpsertJobSummary(99, mock.JobSummary(alloc.JobID))
 	err := state.UpsertAllocs(100, []*structs.Allocation{alloc})
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -601,6 +1263,7 @@ func TestClientEndpoint_GetClientAllocs(t *testing.T) {
 	// Lookup the allocs
 	get := &structs.NodeSpecificRequest{
 		NodeID:       node.ID,
+		SecretID:     node.SecretID,
 		QueryOptions: structs.QueryOptions{Region: "global"},
 	}
 	var resp2 structs.NodeClientAllocsResponse
@@ -615,21 +1278,30 @@ func TestClientEndpoint_GetClientAllocs(t *testing.T) {
 		t.Fatalf("bad: %#v", resp2.Allocs)
 	}
 
-	// Lookup non-existing node
-	get.NodeID = "foobarbaz"
+	// Lookup node with bad SecretID
+	get.SecretID = "foobarbaz"
 	var resp3 structs.NodeClientAllocsResponse
-	if err := msgpackrpc.CallWithCodec(codec, "Node.GetClientAllocs", get, &resp3); err != nil {
+	err = msgpackrpc.CallWithCodec(codec, "Node.GetClientAllocs", get, &resp3)
+	if err == nil || !strings.Contains(err.Error(), "does not match") {
 		t.Fatalf("err: %v", err)
 	}
-	if resp3.Index != 100 {
+
+	// Lookup non-existing node
+	get.NodeID = uuid.Generate()
+	var resp4 structs.NodeClientAllocsResponse
+	if err := msgpackrpc.CallWithCodec(codec, "Node.GetClientAllocs", get, &resp4); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if resp4.Index != 100 {
 		t.Fatalf("Bad index: %d %d", resp3.Index, 100)
 	}
-	if len(resp3.Allocs) != 0 {
+	if len(resp4.Allocs) != 0 {
 		t.Fatalf("unexpected node %#v", resp3.Allocs)
 	}
 }
 
 func TestClientEndpoint_GetClientAllocs_Blocking(t *testing.T) {
+	t.Parallel()
 	s1 := testServer(t, nil)
 	defer s1.Shutdown()
 	codec := rpcClient(t, s1)
@@ -654,6 +1326,7 @@ func TestClientEndpoint_GetClientAllocs_Blocking(t *testing.T) {
 	alloc := mock.Alloc()
 	alloc.NodeID = node.ID
 	state := s1.fsm.State()
+	state.UpsertJobSummary(99, mock.JobSummary(alloc.JobID))
 	start := time.Now()
 	time.AfterFunc(100*time.Millisecond, func() {
 		err := state.UpsertAllocs(100, []*structs.Allocation{alloc})
@@ -664,7 +1337,8 @@ func TestClientEndpoint_GetClientAllocs_Blocking(t *testing.T) {
 
 	// Lookup the allocs in a blocking query
 	req := &structs.NodeSpecificRequest{
-		NodeID: node.ID,
+		NodeID:   node.ID,
+		SecretID: node.SecretID,
 		QueryOptions: structs.QueryOptions{
 			Region:        "global",
 			MinQueryIndex: 50,
@@ -695,6 +1369,7 @@ func TestClientEndpoint_GetClientAllocs_Blocking(t *testing.T) {
 		allocUpdate.NodeID = alloc.NodeID
 		allocUpdate.ID = alloc.ID
 		allocUpdate.ClientStatus = structs.AllocClientStatusRunning
+		state.UpsertJobSummary(199, mock.JobSummary(allocUpdate.JobID))
 		err := state.UpsertAllocs(200, []*structs.Allocation{allocUpdate})
 		if err != nil {
 			t.Fatalf("err: %v", err)
@@ -718,7 +1393,137 @@ func TestClientEndpoint_GetClientAllocs_Blocking(t *testing.T) {
 	}
 }
 
+func TestClientEndpoint_GetClientAllocs_Blocking_GC(t *testing.T) {
+	t.Parallel()
+	assert := assert.New(t)
+	s1 := testServer(t, nil)
+	defer s1.Shutdown()
+	codec := rpcClient(t, s1)
+	testutil.WaitForLeader(t, s1.RPC)
+
+	// Create the register request
+	node := mock.Node()
+	reg := &structs.NodeRegisterRequest{
+		Node:         node,
+		WriteRequest: structs.WriteRequest{Region: "global"},
+	}
+
+	// Fetch the response
+	var resp structs.GenericResponse
+	assert.Nil(msgpackrpc.CallWithCodec(codec, "Node.Register", reg, &resp))
+	node.CreateIndex = resp.Index
+	node.ModifyIndex = resp.Index
+
+	// Inject fake allocations async
+	alloc1 := mock.Alloc()
+	alloc1.NodeID = node.ID
+	alloc2 := mock.Alloc()
+	alloc2.NodeID = node.ID
+	state := s1.fsm.State()
+	state.UpsertJobSummary(99, mock.JobSummary(alloc1.JobID))
+	start := time.Now()
+	time.AfterFunc(100*time.Millisecond, func() {
+		assert.Nil(state.UpsertAllocs(100, []*structs.Allocation{alloc1, alloc2}))
+	})
+
+	// Lookup the allocs in a blocking query
+	req := &structs.NodeSpecificRequest{
+		NodeID:   node.ID,
+		SecretID: node.SecretID,
+		QueryOptions: structs.QueryOptions{
+			Region:        "global",
+			MinQueryIndex: 50,
+			MaxQueryTime:  time.Second,
+		},
+	}
+	var resp2 structs.NodeClientAllocsResponse
+	assert.Nil(msgpackrpc.CallWithCodec(codec, "Node.GetClientAllocs", req, &resp2))
+
+	// Should block at least 100ms
+	if time.Since(start) < 100*time.Millisecond {
+		t.Fatalf("too fast")
+	}
+
+	assert.EqualValues(100, resp2.Index)
+	if assert.Len(resp2.Allocs, 2) {
+		assert.EqualValues(100, resp2.Allocs[alloc1.ID])
+	}
+
+	// Delete an allocation
+	time.AfterFunc(100*time.Millisecond, func() {
+		assert.Nil(state.DeleteEval(200, nil, []string{alloc2.ID}))
+	})
+
+	req.QueryOptions.MinQueryIndex = 150
+	var resp3 structs.NodeClientAllocsResponse
+	assert.Nil(msgpackrpc.CallWithCodec(codec, "Node.GetClientAllocs", req, &resp3))
+
+	if time.Since(start) < 100*time.Millisecond {
+		t.Fatalf("too fast")
+	}
+	assert.EqualValues(200, resp3.Index)
+	if assert.Len(resp3.Allocs, 1) {
+		assert.EqualValues(100, resp3.Allocs[alloc1.ID])
+	}
+}
+
+// A MigrateToken should not be created if an allocation shares the same node
+// with its previous allocation
+func TestClientEndpoint_GetClientAllocs_WithoutMigrateTokens(t *testing.T) {
+	t.Parallel()
+	assert := assert.New(t)
+
+	s1 := testServer(t, nil)
+	defer s1.Shutdown()
+	codec := rpcClient(t, s1)
+	testutil.WaitForLeader(t, s1.RPC)
+
+	// Create the register request
+	node := mock.Node()
+	reg := &structs.NodeRegisterRequest{
+		Node:         node,
+		WriteRequest: structs.WriteRequest{Region: "global"},
+	}
+
+	// Fetch the response
+	var resp structs.GenericResponse
+	if err := msgpackrpc.CallWithCodec(codec, "Node.Register", reg, &resp); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	node.CreateIndex = resp.Index
+	node.ModifyIndex = resp.Index
+
+	// Inject fake evaluations
+	prevAlloc := mock.Alloc()
+	prevAlloc.NodeID = node.ID
+	alloc := mock.Alloc()
+	alloc.NodeID = node.ID
+	alloc.PreviousAllocation = prevAlloc.ID
+	alloc.DesiredStatus = structs.AllocClientStatusComplete
+	state := s1.fsm.State()
+	state.UpsertJobSummary(99, mock.JobSummary(alloc.JobID))
+	err := state.UpsertAllocs(100, []*structs.Allocation{prevAlloc, alloc})
+	assert.Nil(err)
+
+	// Lookup the allocs
+	get := &structs.NodeSpecificRequest{
+		NodeID:       node.ID,
+		SecretID:     node.SecretID,
+		QueryOptions: structs.QueryOptions{Region: "global"},
+	}
+	var resp2 structs.NodeClientAllocsResponse
+
+	err = msgpackrpc.CallWithCodec(codec, "Node.GetClientAllocs", get, &resp2)
+	assert.Nil(err)
+
+	assert.Equal(uint64(100), resp2.Index)
+	assert.Equal(2, len(resp2.Allocs))
+	assert.Equal(uint64(100), resp2.Allocs[alloc.ID])
+	assert.Equal(0, len(resp2.MigrateTokens))
+}
+
 func TestClientEndpoint_GetAllocs_Blocking(t *testing.T) {
+	t.Parallel()
 	s1 := testServer(t, nil)
 	defer s1.Shutdown()
 	codec := rpcClient(t, s1)
@@ -743,6 +1548,7 @@ func TestClientEndpoint_GetAllocs_Blocking(t *testing.T) {
 	alloc := mock.Alloc()
 	alloc.NodeID = node.ID
 	state := s1.fsm.State()
+	state.UpsertJobSummary(99, mock.JobSummary(alloc.JobID))
 	start := time.Now()
 	time.AfterFunc(100*time.Millisecond, func() {
 		err := state.UpsertAllocs(100, []*structs.Allocation{alloc})
@@ -784,6 +1590,7 @@ func TestClientEndpoint_GetAllocs_Blocking(t *testing.T) {
 		allocUpdate.NodeID = alloc.NodeID
 		allocUpdate.ID = alloc.ID
 		allocUpdate.ClientStatus = structs.AllocClientStatusRunning
+		state.UpsertJobSummary(199, mock.JobSummary(allocUpdate.JobID))
 		err := state.UpdateAllocsFromClient(200, []*structs.Allocation{allocUpdate})
 		if err != nil {
 			t.Fatalf("err: %v", err)
@@ -808,6 +1615,7 @@ func TestClientEndpoint_GetAllocs_Blocking(t *testing.T) {
 }
 
 func TestClientEndpoint_UpdateAlloc(t *testing.T) {
+	t.Parallel()
 	s1 := testServer(t, nil)
 	defer s1.Shutdown()
 	codec := rpcClient(t, s1)
@@ -830,6 +1638,7 @@ func TestClientEndpoint_UpdateAlloc(t *testing.T) {
 	alloc := mock.Alloc()
 	alloc.NodeID = node.ID
 	state := s1.fsm.State()
+	state.UpsertJobSummary(99, mock.JobSummary(alloc.JobID))
 	err := state.UpsertAllocs(100, []*structs.Allocation{alloc})
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -858,7 +1667,8 @@ func TestClientEndpoint_UpdateAlloc(t *testing.T) {
 	}
 
 	// Lookup the alloc
-	out, err := state.AllocByID(alloc.ID)
+	ws := memdb.NewWatchSet()
+	out, err := state.AllocByID(ws, alloc.ID)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -868,6 +1678,7 @@ func TestClientEndpoint_UpdateAlloc(t *testing.T) {
 }
 
 func TestClientEndpoint_BatchUpdate(t *testing.T) {
+	t.Parallel()
 	s1 := testServer(t, nil)
 	defer s1.Shutdown()
 	codec := rpcClient(t, s1)
@@ -890,6 +1701,7 @@ func TestClientEndpoint_BatchUpdate(t *testing.T) {
 	alloc := mock.Alloc()
 	alloc.NodeID = node.ID
 	state := s1.fsm.State()
+	state.UpsertJobSummary(99, mock.JobSummary(alloc.JobID))
 	err := state.UpsertAllocs(100, []*structs.Allocation{alloc})
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -912,7 +1724,8 @@ func TestClientEndpoint_BatchUpdate(t *testing.T) {
 	}
 
 	// Lookup the alloc
-	out, err := state.AllocByID(alloc.ID)
+	ws := memdb.NewWatchSet()
+	out, err := state.AllocByID(ws, alloc.ID)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -921,7 +1734,85 @@ func TestClientEndpoint_BatchUpdate(t *testing.T) {
 	}
 }
 
+func TestClientEndpoint_UpdateAlloc_Vault(t *testing.T) {
+	t.Parallel()
+	s1 := testServer(t, nil)
+	defer s1.Shutdown()
+	codec := rpcClient(t, s1)
+	testutil.WaitForLeader(t, s1.RPC)
+
+	// Create the register request
+	node := mock.Node()
+	reg := &structs.NodeRegisterRequest{
+		Node:         node,
+		WriteRequest: structs.WriteRequest{Region: "global"},
+	}
+
+	// Fetch the response
+	var resp structs.GenericResponse
+	if err := msgpackrpc.CallWithCodec(codec, "Node.Register", reg, &resp); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Swap the servers Vault Client
+	tvc := &TestVaultClient{}
+	s1.vault = tvc
+
+	// Inject fake allocation and vault accessor
+	alloc := mock.Alloc()
+	alloc.NodeID = node.ID
+	state := s1.fsm.State()
+	state.UpsertJobSummary(99, mock.JobSummary(alloc.JobID))
+	if err := state.UpsertAllocs(100, []*structs.Allocation{alloc}); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	va := mock.VaultAccessor()
+	va.NodeID = node.ID
+	va.AllocID = alloc.ID
+	if err := state.UpsertVaultAccessor(101, []*structs.VaultAccessor{va}); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Attempt update
+	clientAlloc := new(structs.Allocation)
+	*clientAlloc = *alloc
+	clientAlloc.ClientStatus = structs.AllocClientStatusFailed
+
+	// Update the alloc
+	update := &structs.AllocUpdateRequest{
+		Alloc:        []*structs.Allocation{clientAlloc},
+		WriteRequest: structs.WriteRequest{Region: "global"},
+	}
+	var resp2 structs.NodeAllocsResponse
+	start := time.Now()
+	if err := msgpackrpc.CallWithCodec(codec, "Node.UpdateAlloc", update, &resp2); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if resp2.Index == 0 {
+		t.Fatalf("Bad index: %d", resp2.Index)
+	}
+	if diff := time.Since(start); diff < batchUpdateInterval {
+		t.Fatalf("too fast: %v", diff)
+	}
+
+	// Lookup the alloc
+	ws := memdb.NewWatchSet()
+	out, err := state.AllocByID(ws, alloc.ID)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if out.ClientStatus != structs.AllocClientStatusFailed {
+		t.Fatalf("Bad: %#v", out)
+	}
+
+	if l := len(tvc.RevokedTokens); l != 1 {
+		t.Fatalf("Deregister revoked %d tokens; want 1", l)
+	}
+}
+
 func TestClientEndpoint_CreateNodeEvals(t *testing.T) {
+	t.Parallel()
 	s1 := testServer(t, nil)
 	defer s1.Shutdown()
 	testutil.WaitForLeader(t, s1.RPC)
@@ -929,13 +1820,14 @@ func TestClientEndpoint_CreateNodeEvals(t *testing.T) {
 	// Inject fake evaluations
 	alloc := mock.Alloc()
 	state := s1.fsm.State()
-	if err := state.UpsertAllocs(1, []*structs.Allocation{alloc}); err != nil {
+	state.UpsertJobSummary(1, mock.JobSummary(alloc.JobID))
+	if err := state.UpsertAllocs(2, []*structs.Allocation{alloc}); err != nil {
 		t.Fatalf("err: %v", err)
 	}
 
 	// Inject a fake system job.
 	job := mock.SystemJob()
-	if err := state.UpsertJob(1, job); err != nil {
+	if err := state.UpsertJob(3, job); err != nil {
 		t.Fatalf("err: %v", err)
 	}
 
@@ -952,9 +1844,10 @@ func TestClientEndpoint_CreateNodeEvals(t *testing.T) {
 	}
 
 	// Lookup the evaluations
+	ws := memdb.NewWatchSet()
 	evalByType := make(map[string]*structs.Evaluation, 2)
 	for _, id := range ids {
-		eval, err := state.EvalByID(id)
+		eval, err := state.EvalByID(ws, id)
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -1007,6 +1900,7 @@ func TestClientEndpoint_CreateNodeEvals(t *testing.T) {
 }
 
 func TestClientEndpoint_Evaluate(t *testing.T) {
+	t.Parallel()
 	s1 := testServer(t, func(c *Config) {
 		c.NumSchedulers = 0 // Prevent automatic dequeue
 	})
@@ -1023,7 +1917,8 @@ func TestClientEndpoint_Evaluate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	err = state.UpsertAllocs(2, []*structs.Allocation{alloc})
+	state.UpsertJobSummary(2, mock.JobSummary(alloc.JobID))
+	err = state.UpsertAllocs(3, []*structs.Allocation{alloc})
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -1050,7 +1945,8 @@ func TestClientEndpoint_Evaluate(t *testing.T) {
 	}
 
 	// Lookup the evaluation
-	eval, err := state.EvalByID(ids[0])
+	ws := memdb.NewWatchSet()
+	eval, err := state.EvalByID(ws, ids[0])
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -1084,7 +1980,66 @@ func TestClientEndpoint_Evaluate(t *testing.T) {
 	}
 }
 
+func TestClientEndpoint_Evaluate_ACL(t *testing.T) {
+	t.Parallel()
+	s1, root := testACLServer(t, nil)
+	defer s1.Shutdown()
+	codec := rpcClient(t, s1)
+	testutil.WaitForLeader(t, s1.RPC)
+	assert := assert.New(t)
+
+	// Create the node with an alloc
+	alloc := mock.Alloc()
+	node := mock.Node()
+	node.ID = alloc.NodeID
+	state := s1.fsm.State()
+
+	assert.Nil(state.UpsertNode(1, node), "UpsertNode")
+	assert.Nil(state.UpsertJobSummary(2, mock.JobSummary(alloc.JobID)), "UpsertJobSummary")
+	assert.Nil(state.UpsertAllocs(3, []*structs.Allocation{alloc}), "UpsertAllocs")
+
+	// Create the policy and tokens
+	validToken := mock.CreatePolicyAndToken(t, state, 1001, "test-valid", mock.NodePolicy(acl.PolicyWrite))
+	invalidToken := mock.CreatePolicyAndToken(t, state, 1003, "test-invalid", mock.NodePolicy(acl.PolicyRead))
+
+	// Re-evaluate without a token and expect failure
+	req := &structs.NodeEvaluateRequest{
+		NodeID:       alloc.NodeID,
+		WriteRequest: structs.WriteRequest{Region: "global"},
+	}
+	{
+		var resp structs.NodeUpdateResponse
+		err := msgpackrpc.CallWithCodec(codec, "Node.Evaluate", req, &resp)
+		assert.NotNil(err, "RPC")
+		assert.Equal(err.Error(), structs.ErrPermissionDenied.Error())
+	}
+
+	// Try with a valid token
+	req.AuthToken = validToken.SecretID
+	{
+		var resp structs.NodeUpdateResponse
+		assert.Nil(msgpackrpc.CallWithCodec(codec, "Node.Evaluate", req, &resp), "RPC")
+	}
+
+	// Try with a invalid token
+	req.AuthToken = invalidToken.SecretID
+	{
+		var resp structs.NodeUpdateResponse
+		err := msgpackrpc.CallWithCodec(codec, "Node.Evaluate", req, &resp)
+		assert.NotNil(err, "RPC")
+		assert.Equal(err.Error(), structs.ErrPermissionDenied.Error())
+	}
+
+	// Try with a root token
+	req.AuthToken = root.SecretID
+	{
+		var resp structs.NodeUpdateResponse
+		assert.Nil(msgpackrpc.CallWithCodec(codec, "Node.Evaluate", req, &resp), "RPC")
+	}
+}
+
 func TestClientEndpoint_ListNodes(t *testing.T) {
+	t.Parallel()
 	s1 := testServer(t, nil)
 	defer s1.Shutdown()
 	codec := rpcClient(t, s1)
@@ -1144,7 +2099,62 @@ func TestClientEndpoint_ListNodes(t *testing.T) {
 	}
 }
 
+func TestClientEndpoint_ListNodes_ACL(t *testing.T) {
+	t.Parallel()
+	s1, root := testACLServer(t, nil)
+	defer s1.Shutdown()
+	codec := rpcClient(t, s1)
+	testutil.WaitForLeader(t, s1.RPC)
+	assert := assert.New(t)
+
+	// Create the node
+	node := mock.Node()
+	state := s1.fsm.State()
+	assert.Nil(state.UpsertNode(1, node), "UpsertNode")
+
+	// Create the namespace policy and tokens
+	validToken := mock.CreatePolicyAndToken(t, state, 1001, "test-valid", mock.NodePolicy(acl.PolicyRead))
+	invalidToken := mock.CreatePolicyAndToken(t, state, 1003, "test-invalid", mock.NodePolicy(acl.PolicyDeny))
+
+	// Lookup the node without a token and expect failure
+	req := &structs.NodeListRequest{
+		QueryOptions: structs.QueryOptions{Region: "global"},
+	}
+	{
+		var resp structs.NodeListResponse
+		err := msgpackrpc.CallWithCodec(codec, "Node.List", req, &resp)
+		assert.NotNil(err, "RPC")
+		assert.Equal(err.Error(), structs.ErrPermissionDenied.Error())
+	}
+
+	// Try with a valid token
+	req.AuthToken = validToken.SecretID
+	{
+		var resp structs.NodeListResponse
+		assert.Nil(msgpackrpc.CallWithCodec(codec, "Node.List", req, &resp), "RPC")
+		assert.Equal(node.ID, resp.Nodes[0].ID)
+	}
+
+	// Try with a invalid token
+	req.AuthToken = invalidToken.SecretID
+	{
+		var resp structs.NodeListResponse
+		err := msgpackrpc.CallWithCodec(codec, "Node.List", req, &resp)
+		assert.NotNil(err, "RPC")
+		assert.Equal(err.Error(), structs.ErrPermissionDenied.Error())
+	}
+
+	// Try with a root token
+	req.AuthToken = root.SecretID
+	{
+		var resp structs.NodeListResponse
+		assert.Nil(msgpackrpc.CallWithCodec(codec, "Node.List", req, &resp), "RPC")
+		assert.Equal(node.ID, resp.Nodes[0].ID)
+	}
+}
+
 func TestClientEndpoint_ListNodes_Blocking(t *testing.T) {
+	t.Parallel()
 	s1 := testServer(t, nil)
 	defer s1.Shutdown()
 	state := s1.fsm.State()
@@ -1257,6 +2267,7 @@ func TestClientEndpoint_ListNodes_Blocking(t *testing.T) {
 }
 
 func TestBatchFuture(t *testing.T) {
+	t.Parallel()
 	bf := NewBatchFuture()
 
 	// Async respond to the future
@@ -1280,5 +2291,235 @@ func TestBatchFuture(t *testing.T) {
 	}
 	if bf.Index() != 1000 {
 		t.Fatalf("bad: %d", bf.Index())
+	}
+}
+
+func TestClientEndpoint_DeriveVaultToken_Bad(t *testing.T) {
+	t.Parallel()
+	s1 := testServer(t, nil)
+	defer s1.Shutdown()
+	state := s1.fsm.State()
+	codec := rpcClient(t, s1)
+	testutil.WaitForLeader(t, s1.RPC)
+
+	// Create the node
+	node := mock.Node()
+	if err := state.UpsertNode(2, node); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Create an alloc
+	alloc := mock.Alloc()
+	task := alloc.Job.TaskGroups[0].Tasks[0]
+	tasks := []string{task.Name}
+	if err := state.UpsertAllocs(3, []*structs.Allocation{alloc}); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	req := &structs.DeriveVaultTokenRequest{
+		NodeID:   node.ID,
+		SecretID: uuid.Generate(),
+		AllocID:  alloc.ID,
+		Tasks:    tasks,
+		QueryOptions: structs.QueryOptions{
+			Region: "global",
+		},
+	}
+
+	var resp structs.DeriveVaultTokenResponse
+	if err := msgpackrpc.CallWithCodec(codec, "Node.DeriveVaultToken", req, &resp); err != nil {
+		t.Fatalf("bad: %v", err)
+	}
+
+	if resp.Error == nil || !strings.Contains(resp.Error.Error(), "SecretID mismatch") {
+		t.Fatalf("Expected SecretID mismatch: %v", resp.Error)
+	}
+
+	// Put the correct SecretID
+	req.SecretID = node.SecretID
+
+	// Now we should get an error about the allocation not running on the node
+	if err := msgpackrpc.CallWithCodec(codec, "Node.DeriveVaultToken", req, &resp); err != nil {
+		t.Fatalf("bad: %v", err)
+	}
+	if resp.Error == nil || !strings.Contains(resp.Error.Error(), "not running on Node") {
+		t.Fatalf("Expected not running on node error: %v", resp.Error)
+	}
+
+	// Update to be running on the node
+	alloc.NodeID = node.ID
+	if err := state.UpsertAllocs(4, []*structs.Allocation{alloc}); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Now we should get an error about the job not needing any Vault secrets
+	if err := msgpackrpc.CallWithCodec(codec, "Node.DeriveVaultToken", req, &resp); err != nil {
+		t.Fatalf("bad: %v", err)
+	}
+	if resp.Error == nil || !strings.Contains(resp.Error.Error(), "does not require") {
+		t.Fatalf("Expected no policies error: %v", resp.Error)
+	}
+
+	// Update to be terminal
+	alloc.DesiredStatus = structs.AllocDesiredStatusStop
+	if err := state.UpsertAllocs(5, []*structs.Allocation{alloc}); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Now we should get an error about the job not needing any Vault secrets
+	if err := msgpackrpc.CallWithCodec(codec, "Node.DeriveVaultToken", req, &resp); err != nil {
+		t.Fatalf("bad: %v", err)
+	}
+	if resp.Error == nil || !strings.Contains(resp.Error.Error(), "terminal") {
+		t.Fatalf("Expected terminal allocation error: %v", resp.Error)
+	}
+}
+
+func TestClientEndpoint_DeriveVaultToken(t *testing.T) {
+	t.Parallel()
+	s1 := testServer(t, nil)
+	defer s1.Shutdown()
+	state := s1.fsm.State()
+	codec := rpcClient(t, s1)
+	testutil.WaitForLeader(t, s1.RPC)
+
+	// Enable vault and allow authenticated
+	tr := true
+	s1.config.VaultConfig.Enabled = &tr
+	s1.config.VaultConfig.AllowUnauthenticated = &tr
+
+	// Replace the Vault Client on the server
+	tvc := &TestVaultClient{}
+	s1.vault = tvc
+
+	// Create the node
+	node := mock.Node()
+	if err := state.UpsertNode(2, node); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Create an alloc an allocation that has vault policies required
+	alloc := mock.Alloc()
+	alloc.NodeID = node.ID
+	task := alloc.Job.TaskGroups[0].Tasks[0]
+	tasks := []string{task.Name}
+	task.Vault = &structs.Vault{Policies: []string{"a", "b"}}
+	if err := state.UpsertAllocs(3, []*structs.Allocation{alloc}); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Return a secret for the task
+	token := uuid.Generate()
+	accessor := uuid.Generate()
+	ttl := 10
+	secret := &vapi.Secret{
+		WrapInfo: &vapi.SecretWrapInfo{
+			Token:           token,
+			WrappedAccessor: accessor,
+			TTL:             ttl,
+		},
+	}
+	tvc.SetCreateTokenSecret(alloc.ID, task.Name, secret)
+
+	req := &structs.DeriveVaultTokenRequest{
+		NodeID:   node.ID,
+		SecretID: node.SecretID,
+		AllocID:  alloc.ID,
+		Tasks:    tasks,
+		QueryOptions: structs.QueryOptions{
+			Region: "global",
+		},
+	}
+
+	var resp structs.DeriveVaultTokenResponse
+	if err := msgpackrpc.CallWithCodec(codec, "Node.DeriveVaultToken", req, &resp); err != nil {
+		t.Fatalf("bad: %v", err)
+	}
+	if resp.Error != nil {
+		t.Fatalf("bad: %v", resp.Error)
+	}
+
+	// Check the state store and ensure that we created a VaultAccessor
+	ws := memdb.NewWatchSet()
+	va, err := state.VaultAccessor(ws, accessor)
+	if err != nil {
+		t.Fatalf("bad: %v", err)
+	}
+	if va == nil {
+		t.Fatalf("bad: %v", va)
+	}
+
+	if va.CreateIndex == 0 {
+		t.Fatalf("bad: %v", va)
+	}
+
+	va.CreateIndex = 0
+	expected := &structs.VaultAccessor{
+		AllocID:     alloc.ID,
+		Task:        task.Name,
+		NodeID:      alloc.NodeID,
+		Accessor:    accessor,
+		CreationTTL: ttl,
+	}
+
+	if !reflect.DeepEqual(expected, va) {
+		t.Fatalf("Got %#v; want %#v", va, expected)
+	}
+}
+
+func TestClientEndpoint_DeriveVaultToken_VaultError(t *testing.T) {
+	t.Parallel()
+	s1 := testServer(t, nil)
+	defer s1.Shutdown()
+	state := s1.fsm.State()
+	codec := rpcClient(t, s1)
+	testutil.WaitForLeader(t, s1.RPC)
+
+	// Enable vault and allow authenticated
+	tr := true
+	s1.config.VaultConfig.Enabled = &tr
+	s1.config.VaultConfig.AllowUnauthenticated = &tr
+
+	// Replace the Vault Client on the server
+	tvc := &TestVaultClient{}
+	s1.vault = tvc
+
+	// Create the node
+	node := mock.Node()
+	if err := state.UpsertNode(2, node); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Create an alloc an allocation that has vault policies required
+	alloc := mock.Alloc()
+	alloc.NodeID = node.ID
+	task := alloc.Job.TaskGroups[0].Tasks[0]
+	tasks := []string{task.Name}
+	task.Vault = &structs.Vault{Policies: []string{"a", "b"}}
+	if err := state.UpsertAllocs(3, []*structs.Allocation{alloc}); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Return an error when creating the token
+	tvc.SetCreateTokenError(alloc.ID, task.Name,
+		structs.NewRecoverableError(fmt.Errorf("recover"), true))
+
+	req := &structs.DeriveVaultTokenRequest{
+		NodeID:   node.ID,
+		SecretID: node.SecretID,
+		AllocID:  alloc.ID,
+		Tasks:    tasks,
+		QueryOptions: structs.QueryOptions{
+			Region: "global",
+		},
+	}
+
+	var resp structs.DeriveVaultTokenResponse
+	err := msgpackrpc.CallWithCodec(codec, "Node.DeriveVaultToken", req, &resp)
+	if err != nil {
+		t.Fatalf("bad: %v", err)
+	}
+	if resp.Error == nil || !resp.Error.IsRecoverable() {
+		t.Fatalf("bad: %+v", resp.Error)
 	}
 }

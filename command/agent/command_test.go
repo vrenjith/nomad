@@ -8,14 +8,17 @@ import (
 	"testing"
 
 	"github.com/hashicorp/nomad/testutil"
+	"github.com/hashicorp/nomad/version"
 	"github.com/mitchellh/cli"
 )
 
 func TestCommand_Implements(t *testing.T) {
+	t.Parallel()
 	var _ cli.Command = &Command{}
 }
 
 func TestCommand_Args(t *testing.T) {
+	t.Parallel()
 	tmpDir, err := ioutil.TempDir("", "nomad")
 	if err != nil {
 		t.Fatalf("err: %s", err)
@@ -55,10 +58,14 @@ func TestCommand_Args(t *testing.T) {
 		shutdownCh := make(chan struct{})
 		close(shutdownCh)
 		cmd := &Command{
+			Version:    version.GetVersion(),
 			Ui:         ui,
 			ShutdownCh: shutdownCh,
 		}
 
+		// To prevent test failures on hosts whose hostname resolves to
+		// a loopback address, we must append a bind address
+		tc.args = append(tc.args, "-bind=169.254.0.1")
 		if code := cmd.Run(tc.args); code != 1 {
 			t.Fatalf("args: %v\nexit: %d\n", tc.args, code)
 		}
@@ -72,16 +79,11 @@ func TestCommand_Args(t *testing.T) {
 	}
 }
 
+// TODO Why is this failing
 func TestRetryJoin(t *testing.T) {
-	dir, agent := makeAgent(t, nil)
-	defer os.RemoveAll(dir)
+	t.Parallel()
+	agent := NewTestAgent(t, t.Name(), nil)
 	defer agent.Shutdown()
-
-	tmpDir, err := ioutil.TempDir("", "nomad")
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-	defer os.RemoveAll(tmpDir)
 
 	doneCh := make(chan struct{})
 	shutdownCh := make(chan struct{})
@@ -92,19 +94,20 @@ func TestRetryJoin(t *testing.T) {
 	}()
 
 	cmd := &Command{
+		Version:    version.GetVersion(),
 		ShutdownCh: shutdownCh,
-		Ui:         new(cli.MockUi),
+		Ui: &cli.BasicUi{
+			Reader:      os.Stdin,
+			Writer:      os.Stdout,
+			ErrorWriter: os.Stderr,
+		},
 	}
 
-	serfAddr := fmt.Sprintf(
-		"%s:%d",
-		agent.config.BindAddr,
-		agent.config.Ports.Serf)
+	serfAddr := agent.Config.normalizedAddrs.Serf
 
 	args := []string{
-		"-server",
-		"-data-dir", tmpDir,
-		"-node", fmt.Sprintf(`"Node %d"`, getPort()),
+		"-dev",
+		"-node", "foo",
 		"-retry-join", serfAddr,
 		"-retry-interval", "1s",
 	}

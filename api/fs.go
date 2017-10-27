@@ -4,10 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
-	"net/http"
-	"net/url"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -53,150 +51,101 @@ func (c *Client) AllocFS() *AllocFS {
 
 // List is used to list the files at a given path of an allocation directory
 func (a *AllocFS) List(alloc *Allocation, path string, q *QueryOptions) ([]*AllocFileInfo, *QueryMeta, error) {
-	node, _, err := a.client.Nodes().Info(alloc.NodeID, &QueryOptions{})
+	nodeClient, err := a.client.GetNodeClient(alloc.NodeID, q)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	if node.HTTPAddr == "" {
-		return nil, nil, fmt.Errorf("http addr of the node where alloc %q is running is not advertised", alloc.ID)
+	if q == nil {
+		q = &QueryOptions{}
 	}
-	u := &url.URL{
-		Scheme: "http",
-		Host:   node.HTTPAddr,
-		Path:   fmt.Sprintf("/v1/client/fs/ls/%s", alloc.ID),
+	if q.Params == nil {
+		q.Params = make(map[string]string)
 	}
-	v := url.Values{}
-	v.Set("path", path)
-	u.RawQuery = v.Encode()
-	req := &http.Request{
-		Method: "GET",
-		URL:    u,
-	}
-	c := http.Client{}
-	resp, err := c.Do(req)
+
+	q.Params["path"] = path
+
+	var resp []*AllocFileInfo
+	qm, err := nodeClient.query(fmt.Sprintf("/v1/client/fs/ls/%s", alloc.ID), &resp, q)
 	if err != nil {
 		return nil, nil, err
 	}
-	if resp.StatusCode != 200 {
-		return nil, nil, a.getErrorMsg(resp)
-	}
-	decoder := json.NewDecoder(resp.Body)
-	var files []*AllocFileInfo
-	if err := decoder.Decode(&files); err != nil {
-		return nil, nil, err
-	}
-	return files, nil, nil
+
+	return resp, qm, nil
 }
 
 // Stat is used to stat a file at a given path of an allocation directory
 func (a *AllocFS) Stat(alloc *Allocation, path string, q *QueryOptions) (*AllocFileInfo, *QueryMeta, error) {
-	node, _, err := a.client.Nodes().Info(alloc.NodeID, &QueryOptions{})
+	nodeClient, err := a.client.GetNodeClient(alloc.NodeID, q)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	if node.HTTPAddr == "" {
-		return nil, nil, fmt.Errorf("http addr of the node where alloc %q is running is not advertised", alloc.ID)
+	if q == nil {
+		q = &QueryOptions{}
 	}
-	u := &url.URL{
-		Scheme: "http",
-		Host:   node.HTTPAddr,
-		Path:   fmt.Sprintf("/v1/client/fs/stat/%s", alloc.ID),
+	if q.Params == nil {
+		q.Params = make(map[string]string)
 	}
-	v := url.Values{}
-	v.Set("path", path)
-	u.RawQuery = v.Encode()
-	req := &http.Request{
-		Method: "GET",
-		URL:    u,
-	}
-	c := http.Client{}
-	resp, err := c.Do(req)
+
+	q.Params["path"] = path
+
+	var resp AllocFileInfo
+	qm, err := nodeClient.query(fmt.Sprintf("/v1/client/fs/stat/%s", alloc.ID), &resp, q)
 	if err != nil {
 		return nil, nil, err
 	}
-	if resp.StatusCode != 200 {
-		return nil, nil, a.getErrorMsg(resp)
-	}
-	decoder := json.NewDecoder(resp.Body)
-	var file *AllocFileInfo
-	if err := decoder.Decode(&file); err != nil {
-		return nil, nil, err
-	}
-	return file, nil, nil
+	return &resp, qm, nil
 }
 
 // ReadAt is used to read bytes at a given offset until limit at the given path
 // in an allocation directory. If limit is <= 0, there is no limit.
-func (a *AllocFS) ReadAt(alloc *Allocation, path string, offset int64, limit int64, q *QueryOptions) (io.ReadCloser, *QueryMeta, error) {
-	node, _, err := a.client.Nodes().Info(alloc.NodeID, &QueryOptions{})
+func (a *AllocFS) ReadAt(alloc *Allocation, path string, offset int64, limit int64, q *QueryOptions) (io.ReadCloser, error) {
+	nodeClient, err := a.client.GetNodeClient(alloc.NodeID, q)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
-	if node.HTTPAddr == "" {
-		return nil, nil, fmt.Errorf("http addr of the node where alloc %q is running is not advertised", alloc.ID)
+	if q == nil {
+		q = &QueryOptions{}
 	}
-	u := &url.URL{
-		Scheme: "http",
-		Host:   node.HTTPAddr,
-		Path:   fmt.Sprintf("/v1/client/fs/readat/%s", alloc.ID),
+	if q.Params == nil {
+		q.Params = make(map[string]string)
 	}
-	v := url.Values{}
-	v.Set("path", path)
-	v.Set("offset", strconv.FormatInt(offset, 10))
-	v.Set("limit", strconv.FormatInt(limit, 10))
-	u.RawQuery = v.Encode()
-	req := &http.Request{
-		Method: "GET",
-		URL:    u,
-	}
-	c := http.Client{}
-	resp, err := c.Do(req)
+
+	q.Params["path"] = path
+	q.Params["offset"] = strconv.FormatInt(offset, 10)
+	q.Params["limit"] = strconv.FormatInt(limit, 10)
+
+	r, err := nodeClient.rawQuery(fmt.Sprintf("/v1/client/fs/readat/%s", alloc.ID), q)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return resp.Body, nil, nil
+	return r, nil
 }
 
 // Cat is used to read contents of a file at the given path in an allocation
 // directory
-func (a *AllocFS) Cat(alloc *Allocation, path string, q *QueryOptions) (io.ReadCloser, *QueryMeta, error) {
-	node, _, err := a.client.Nodes().Info(alloc.NodeID, &QueryOptions{})
+func (a *AllocFS) Cat(alloc *Allocation, path string, q *QueryOptions) (io.ReadCloser, error) {
+	nodeClient, err := a.client.GetNodeClient(alloc.NodeID, q)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
-	if node.HTTPAddr == "" {
-		return nil, nil, fmt.Errorf("http addr of the node where alloc %q is running is not advertised", alloc.ID)
+	if q == nil {
+		q = &QueryOptions{}
 	}
-	u := &url.URL{
-		Scheme: "http",
-		Host:   node.HTTPAddr,
-		Path:   fmt.Sprintf("/v1/client/fs/cat/%s", alloc.ID),
+	if q.Params == nil {
+		q.Params = make(map[string]string)
 	}
-	v := url.Values{}
-	v.Set("path", path)
-	u.RawQuery = v.Encode()
-	req := &http.Request{
-		Method: "GET",
-		URL:    u,
-	}
-	c := http.Client{}
-	resp, err := c.Do(req)
-	if err != nil {
-		return nil, nil, err
-	}
-	return resp.Body, nil, nil
-}
 
-func (a *AllocFS) getErrorMsg(resp *http.Response) error {
-	if errMsg, err := ioutil.ReadAll(resp.Body); err == nil {
-		return fmt.Errorf(string(errMsg))
-	} else {
-		return err
+	q.Params["path"] = path
+
+	r, err := nodeClient.rawQuery(fmt.Sprintf("/v1/client/fs/cat/%s", alloc.ID), q)
+	if err != nil {
+		return nil, err
 	}
+	return r, nil
 }
 
 // Stream streams the content of a file blocking on EOF.
@@ -204,38 +153,34 @@ func (a *AllocFS) getErrorMsg(resp *http.Response) error {
 // * path: path to file to stream.
 // * offset: The offset to start streaming data at.
 // * origin: Either "start" or "end" and defines from where the offset is applied.
+// * cancel: A channel that when closed, streaming will end.
 //
 // The return value is a channel that will emit StreamFrames as they are read.
 func (a *AllocFS) Stream(alloc *Allocation, path, origin string, offset int64,
-	cancel <-chan struct{}, q *QueryOptions) (<-chan *StreamFrame, *QueryMeta, error) {
+	cancel <-chan struct{}, q *QueryOptions) (<-chan *StreamFrame, <-chan error) {
 
-	node, _, err := a.client.Nodes().Info(alloc.NodeID, q)
+	errCh := make(chan error, 1)
+	nodeClient, err := a.client.GetNodeClient(alloc.NodeID, q)
 	if err != nil {
-		return nil, nil, err
+		errCh <- err
+		return nil, errCh
 	}
 
-	if node.HTTPAddr == "" {
-		return nil, nil, fmt.Errorf("http addr of the node where alloc %q is running is not advertised", alloc.ID)
+	if q == nil {
+		q = &QueryOptions{}
 	}
-	u := &url.URL{
-		Scheme: "http",
-		Host:   node.HTTPAddr,
-		Path:   fmt.Sprintf("/v1/client/fs/stream/%s", alloc.ID),
+	if q.Params == nil {
+		q.Params = make(map[string]string)
 	}
-	v := url.Values{}
-	v.Set("path", path)
-	v.Set("origin", origin)
-	v.Set("offset", strconv.FormatInt(offset, 10))
-	u.RawQuery = v.Encode()
-	req := &http.Request{
-		Method: "GET",
-		URL:    u,
-		Cancel: cancel,
-	}
-	c := http.Client{}
-	resp, err := c.Do(req)
+
+	q.Params["path"] = path
+	q.Params["offset"] = strconv.FormatInt(offset, 10)
+	q.Params["origin"] = origin
+
+	r, err := nodeClient.rawQuery(fmt.Sprintf("/v1/client/fs/stream/%s", alloc.ID), q)
 	if err != nil {
-		return nil, nil, err
+		errCh <- err
+		return nil, errCh
 	}
 
 	// Create the output channel
@@ -243,10 +188,10 @@ func (a *AllocFS) Stream(alloc *Allocation, path, origin string, offset int64,
 
 	go func() {
 		// Close the body
-		defer resp.Body.Close()
+		defer r.Close()
 
 		// Create a decoder
-		dec := json.NewDecoder(resp.Body)
+		dec := json.NewDecoder(r)
 
 		for {
 			// Check if we have been cancelled
@@ -259,6 +204,7 @@ func (a *AllocFS) Stream(alloc *Allocation, path, origin string, offset int64,
 			// Decode the next frame
 			var frame StreamFrame
 			if err := dec.Decode(&frame); err != nil {
+				errCh <- err
 				close(frames)
 				return
 			}
@@ -272,32 +218,118 @@ func (a *AllocFS) Stream(alloc *Allocation, path, origin string, offset int64,
 		}
 	}()
 
-	return frames, nil, nil
+	return frames, errCh
+}
+
+// Logs streams the content of a tasks logs blocking on EOF.
+// The parameters are:
+// * allocation: the allocation to stream from.
+// * follow: Whether the logs should be followed.
+// * task: the tasks name to stream logs for.
+// * logType: Either "stdout" or "stderr"
+// * origin: Either "start" or "end" and defines from where the offset is applied.
+// * offset: The offset to start streaming data at.
+// * cancel: A channel that when closed, streaming will end.
+//
+// The return value is a channel that will emit StreamFrames as they are read.
+func (a *AllocFS) Logs(alloc *Allocation, follow bool, task, logType, origin string,
+	offset int64, cancel <-chan struct{}, q *QueryOptions) (<-chan *StreamFrame, <-chan error) {
+
+	errCh := make(chan error, 1)
+	nodeClient, err := a.client.GetNodeClient(alloc.NodeID, q)
+	if err != nil {
+		errCh <- err
+		return nil, errCh
+	}
+
+	if q == nil {
+		q = &QueryOptions{}
+	}
+	if q.Params == nil {
+		q.Params = make(map[string]string)
+	}
+
+	q.Params["follow"] = strconv.FormatBool(follow)
+	q.Params["task"] = task
+	q.Params["type"] = logType
+	q.Params["origin"] = origin
+	q.Params["offset"] = strconv.FormatInt(offset, 10)
+
+	r, err := nodeClient.rawQuery(fmt.Sprintf("/v1/client/fs/logs/%s", alloc.ID), q)
+	if err != nil {
+		errCh <- err
+		return nil, errCh
+	}
+
+	// Create the output channel
+	frames := make(chan *StreamFrame, 10)
+
+	go func() {
+		// Close the body
+		defer r.Close()
+
+		// Create a decoder
+		dec := json.NewDecoder(r)
+
+		for {
+			// Check if we have been cancelled
+			select {
+			case <-cancel:
+				return
+			default:
+			}
+
+			// Decode the next frame
+			var frame StreamFrame
+			if err := dec.Decode(&frame); err != nil {
+				errCh <- err
+				close(frames)
+				return
+			}
+
+			// Discard heartbeat frames
+			if frame.IsHeartbeat() {
+				continue
+			}
+
+			frames <- &frame
+		}
+	}()
+
+	return frames, errCh
 }
 
 // FrameReader is used to convert a stream of frames into a read closer.
 type FrameReader struct {
 	frames   <-chan *StreamFrame
+	errCh    <-chan error
 	cancelCh chan struct{}
-	closed   bool
+
+	closedLock sync.Mutex
+	closed     bool
+
+	unblockTime time.Duration
 
 	frame       *StreamFrame
 	frameOffset int
-
-	// To handle printing the file events
-	fileEventOffset int
-	fileEvent       []byte
 
 	byteOffset int
 }
 
 // NewFrameReader takes a channel of frames and returns a FrameReader which
 // implements io.ReadCloser
-func NewFrameReader(frames <-chan *StreamFrame, cancelCh chan struct{}) *FrameReader {
+func NewFrameReader(frames <-chan *StreamFrame, errCh <-chan error, cancelCh chan struct{}) *FrameReader {
 	return &FrameReader{
 		frames:   frames,
+		errCh:    errCh,
 		cancelCh: cancelCh,
 	}
+}
+
+// SetUnblockTime sets the time to unblock and return zero bytes read. If the
+// duration is unset or is zero or less, the read will block til data is read.
+func (f *FrameReader) SetUnblockTime(d time.Duration) {
+	f.unblockTime = d
 }
 
 // Offset returns the offset into the stream.
@@ -308,32 +340,35 @@ func (f *FrameReader) Offset() int {
 // Read reads the data of the incoming frames into the bytes buffer. Returns EOF
 // when there are no more frames.
 func (f *FrameReader) Read(p []byte) (n int, err error) {
+	f.closedLock.Lock()
+	closed := f.closed
+	f.closedLock.Unlock()
+	if closed {
+		return 0, io.EOF
+	}
+
 	if f.frame == nil {
-		frame, ok := <-f.frames
-		if !ok {
+		var unblock <-chan time.Time
+		if f.unblockTime.Nanoseconds() > 0 {
+			unblock = time.After(f.unblockTime)
+		}
+
+		select {
+		case frame, ok := <-f.frames:
+			if !ok {
+				return 0, io.EOF
+			}
+			f.frame = frame
+
+			// Store the total offset into the file
+			f.byteOffset = int(f.frame.Offset)
+		case <-unblock:
+			return 0, nil
+		case err := <-f.errCh:
+			return 0, err
+		case <-f.cancelCh:
 			return 0, io.EOF
 		}
-		f.frame = frame
-
-		// Store the total offset into the file
-		f.byteOffset = int(f.frame.Offset)
-	}
-
-	if f.frame.FileEvent != "" && len(f.fileEvent) == 0 {
-		f.fileEvent = []byte(fmt.Sprintf("\nnomad: %q\n", f.frame.FileEvent))
-		f.fileEventOffset = 0
-	}
-
-	// If there is a file event we inject it into the read stream
-	if l := len(f.fileEvent); l != 0 && l != f.fileEventOffset {
-		n = copy(p, f.fileEvent[f.fileEventOffset:])
-		f.fileEventOffset += n
-		return n, nil
-	}
-
-	if len(f.fileEvent) == f.fileEventOffset {
-		f.fileEvent = nil
-		f.fileEventOffset = 0
 	}
 
 	// Copy the data out of the frame and update our offset
@@ -351,6 +386,8 @@ func (f *FrameReader) Read(p []byte) (n int, err error) {
 
 // Close cancels the stream of frames
 func (f *FrameReader) Close() error {
+	f.closedLock.Lock()
+	defer f.closedLock.Unlock()
 	if f.closed {
 		return nil
 	}

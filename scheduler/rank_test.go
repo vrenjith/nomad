@@ -3,6 +3,7 @@ package scheduler
 import (
 	"testing"
 
+	"github.com/hashicorp/nomad/helper/uuid"
 	"github.com/hashicorp/nomad/nomad/mock"
 	"github.com/hashicorp/nomad/nomad/structs"
 )
@@ -26,7 +27,7 @@ func TestFeasibleRankIterator(t *testing.T) {
 func TestBinPackIterator_NoExistingAlloc(t *testing.T) {
 	_, ctx := testContext(t)
 	nodes := []*RankedNode{
-		&RankedNode{
+		{
 			Node: &structs.Node{
 				// Perfect fit
 				Resources: &structs.Resources{
@@ -39,7 +40,7 @@ func TestBinPackIterator_NoExistingAlloc(t *testing.T) {
 				},
 			},
 		},
-		&RankedNode{
+		{
 			Node: &structs.Node{
 				// Overloaded
 				Resources: &structs.Resources{
@@ -52,7 +53,7 @@ func TestBinPackIterator_NoExistingAlloc(t *testing.T) {
 				},
 			},
 		},
-		&RankedNode{
+		{
 			Node: &structs.Node{
 				// 50% fit
 				Resources: &structs.Resources{
@@ -68,16 +69,20 @@ func TestBinPackIterator_NoExistingAlloc(t *testing.T) {
 	}
 	static := NewStaticRankIterator(ctx, nodes)
 
-	task := &structs.Task{
-		Name: "web",
-		Resources: &structs.Resources{
-			CPU:      1024,
-			MemoryMB: 1024,
+	taskGroup := &structs.TaskGroup{
+		EphemeralDisk: &structs.EphemeralDisk{},
+		Tasks: []*structs.Task{
+			{
+				Name: "web",
+				Resources: &structs.Resources{
+					CPU:      1024,
+					MemoryMB: 1024,
+				},
+			},
 		},
 	}
-
 	binp := NewBinPackIterator(ctx, static, false, 0)
-	binp.SetTasks([]*structs.Task{task})
+	binp.SetTaskGroup(taskGroup)
 
 	out := collectRanked(binp)
 	if len(out) != 2 {
@@ -98,20 +103,20 @@ func TestBinPackIterator_NoExistingAlloc(t *testing.T) {
 func TestBinPackIterator_PlannedAlloc(t *testing.T) {
 	_, ctx := testContext(t)
 	nodes := []*RankedNode{
-		&RankedNode{
+		{
 			Node: &structs.Node{
 				// Perfect fit
-				ID: structs.GenerateUUID(),
+				ID: uuid.Generate(),
 				Resources: &structs.Resources{
 					CPU:      2048,
 					MemoryMB: 2048,
 				},
 			},
 		},
-		&RankedNode{
+		{
 			Node: &structs.Node{
 				// Perfect fit
-				ID: structs.GenerateUUID(),
+				ID: uuid.Generate(),
 				Resources: &structs.Resources{
 					CPU:      2048,
 					MemoryMB: 2048,
@@ -124,7 +129,7 @@ func TestBinPackIterator_PlannedAlloc(t *testing.T) {
 	// Add a planned alloc to node1 that fills it
 	plan := ctx.Plan()
 	plan.NodeAllocation[nodes[0].Node.ID] = []*structs.Allocation{
-		&structs.Allocation{
+		{
 			Resources: &structs.Resources{
 				CPU:      2048,
 				MemoryMB: 2048,
@@ -134,7 +139,7 @@ func TestBinPackIterator_PlannedAlloc(t *testing.T) {
 
 	// Add a planned alloc to node2 that half fills it
 	plan.NodeAllocation[nodes[1].Node.ID] = []*structs.Allocation{
-		&structs.Allocation{
+		{
 			Resources: &structs.Resources{
 				CPU:      1024,
 				MemoryMB: 1024,
@@ -142,16 +147,21 @@ func TestBinPackIterator_PlannedAlloc(t *testing.T) {
 		},
 	}
 
-	task := &structs.Task{
-		Name: "web",
-		Resources: &structs.Resources{
-			CPU:      1024,
-			MemoryMB: 1024,
+	taskGroup := &structs.TaskGroup{
+		EphemeralDisk: &structs.EphemeralDisk{},
+		Tasks: []*structs.Task{
+			{
+				Name: "web",
+				Resources: &structs.Resources{
+					CPU:      1024,
+					MemoryMB: 1024,
+				},
+			},
 		},
 	}
 
 	binp := NewBinPackIterator(ctx, static, false, 0)
-	binp.SetTasks([]*structs.Task{task})
+	binp.SetTaskGroup(taskGroup)
 
 	out := collectRanked(binp)
 	if len(out) != 1 {
@@ -169,20 +179,20 @@ func TestBinPackIterator_PlannedAlloc(t *testing.T) {
 func TestBinPackIterator_ExistingAlloc(t *testing.T) {
 	state, ctx := testContext(t)
 	nodes := []*RankedNode{
-		&RankedNode{
+		{
 			Node: &structs.Node{
 				// Perfect fit
-				ID: structs.GenerateUUID(),
+				ID: uuid.Generate(),
 				Resources: &structs.Resources{
 					CPU:      2048,
 					MemoryMB: 2048,
 				},
 			},
 		},
-		&RankedNode{
+		{
 			Node: &structs.Node{
 				// Perfect fit
-				ID: structs.GenerateUUID(),
+				ID: uuid.Generate(),
 				Resources: &structs.Resources{
 					CPU:      2048,
 					MemoryMB: 2048,
@@ -193,42 +203,55 @@ func TestBinPackIterator_ExistingAlloc(t *testing.T) {
 	static := NewStaticRankIterator(ctx, nodes)
 
 	// Add existing allocations
+	j1, j2 := mock.Job(), mock.Job()
 	alloc1 := &structs.Allocation{
-		ID:     structs.GenerateUUID(),
-		EvalID: structs.GenerateUUID(),
-		NodeID: nodes[0].Node.ID,
-		JobID:  structs.GenerateUUID(),
+		Namespace: structs.DefaultNamespace,
+		ID:        uuid.Generate(),
+		EvalID:    uuid.Generate(),
+		NodeID:    nodes[0].Node.ID,
+		JobID:     j1.ID,
+		Job:       j1,
 		Resources: &structs.Resources{
 			CPU:      2048,
 			MemoryMB: 2048,
 		},
 		DesiredStatus: structs.AllocDesiredStatusRun,
 		ClientStatus:  structs.AllocClientStatusPending,
+		TaskGroup:     "web",
 	}
 	alloc2 := &structs.Allocation{
-		ID:     structs.GenerateUUID(),
-		EvalID: structs.GenerateUUID(),
-		NodeID: nodes[1].Node.ID,
-		JobID:  structs.GenerateUUID(),
+		Namespace: structs.DefaultNamespace,
+		ID:        uuid.Generate(),
+		EvalID:    uuid.Generate(),
+		NodeID:    nodes[1].Node.ID,
+		JobID:     j2.ID,
+		Job:       j2,
 		Resources: &structs.Resources{
 			CPU:      1024,
 			MemoryMB: 1024,
 		},
 		DesiredStatus: structs.AllocDesiredStatusRun,
 		ClientStatus:  structs.AllocClientStatusPending,
+		TaskGroup:     "web",
 	}
+	noErr(t, state.UpsertJobSummary(998, mock.JobSummary(alloc1.JobID)))
+	noErr(t, state.UpsertJobSummary(999, mock.JobSummary(alloc2.JobID)))
 	noErr(t, state.UpsertAllocs(1000, []*structs.Allocation{alloc1, alloc2}))
 
-	task := &structs.Task{
-		Name: "web",
-		Resources: &structs.Resources{
-			CPU:      1024,
-			MemoryMB: 1024,
+	taskGroup := &structs.TaskGroup{
+		EphemeralDisk: &structs.EphemeralDisk{},
+		Tasks: []*structs.Task{
+			{
+				Name: "web",
+				Resources: &structs.Resources{
+					CPU:      1024,
+					MemoryMB: 1024,
+				},
+			},
 		},
 	}
-
 	binp := NewBinPackIterator(ctx, static, false, 0)
-	binp.SetTasks([]*structs.Task{task})
+	binp.SetTaskGroup(taskGroup)
 
 	out := collectRanked(binp)
 	if len(out) != 1 {
@@ -245,20 +268,20 @@ func TestBinPackIterator_ExistingAlloc(t *testing.T) {
 func TestBinPackIterator_ExistingAlloc_PlannedEvict(t *testing.T) {
 	state, ctx := testContext(t)
 	nodes := []*RankedNode{
-		&RankedNode{
+		{
 			Node: &structs.Node{
 				// Perfect fit
-				ID: structs.GenerateUUID(),
+				ID: uuid.Generate(),
 				Resources: &structs.Resources{
 					CPU:      2048,
 					MemoryMB: 2048,
 				},
 			},
 		},
-		&RankedNode{
+		{
 			Node: &structs.Node{
 				// Perfect fit
-				ID: structs.GenerateUUID(),
+				ID: uuid.Generate(),
 				Resources: &structs.Resources{
 					CPU:      2048,
 					MemoryMB: 2048,
@@ -269,46 +292,60 @@ func TestBinPackIterator_ExistingAlloc_PlannedEvict(t *testing.T) {
 	static := NewStaticRankIterator(ctx, nodes)
 
 	// Add existing allocations
+	j1, j2 := mock.Job(), mock.Job()
 	alloc1 := &structs.Allocation{
-		ID:     structs.GenerateUUID(),
-		EvalID: structs.GenerateUUID(),
-		NodeID: nodes[0].Node.ID,
-		JobID:  structs.GenerateUUID(),
+		Namespace: structs.DefaultNamespace,
+		ID:        uuid.Generate(),
+		EvalID:    uuid.Generate(),
+		NodeID:    nodes[0].Node.ID,
+		JobID:     j1.ID,
+		Job:       j1,
 		Resources: &structs.Resources{
 			CPU:      2048,
 			MemoryMB: 2048,
 		},
 		DesiredStatus: structs.AllocDesiredStatusRun,
 		ClientStatus:  structs.AllocClientStatusPending,
+		TaskGroup:     "web",
 	}
 	alloc2 := &structs.Allocation{
-		ID:     structs.GenerateUUID(),
-		EvalID: structs.GenerateUUID(),
-		NodeID: nodes[1].Node.ID,
-		JobID:  structs.GenerateUUID(),
+		Namespace: structs.DefaultNamespace,
+		ID:        uuid.Generate(),
+		EvalID:    uuid.Generate(),
+		NodeID:    nodes[1].Node.ID,
+		JobID:     j2.ID,
+		Job:       j2,
 		Resources: &structs.Resources{
 			CPU:      1024,
 			MemoryMB: 1024,
 		},
 		DesiredStatus: structs.AllocDesiredStatusRun,
 		ClientStatus:  structs.AllocClientStatusPending,
+		TaskGroup:     "web",
 	}
+	noErr(t, state.UpsertJobSummary(998, mock.JobSummary(alloc1.JobID)))
+	noErr(t, state.UpsertJobSummary(999, mock.JobSummary(alloc2.JobID)))
 	noErr(t, state.UpsertAllocs(1000, []*structs.Allocation{alloc1, alloc2}))
 
 	// Add a planned eviction to alloc1
 	plan := ctx.Plan()
 	plan.NodeUpdate[nodes[0].Node.ID] = []*structs.Allocation{alloc1}
 
-	task := &structs.Task{
-		Name: "web",
-		Resources: &structs.Resources{
-			CPU:      1024,
-			MemoryMB: 1024,
+	taskGroup := &structs.TaskGroup{
+		EphemeralDisk: &structs.EphemeralDisk{},
+		Tasks: []*structs.Task{
+			{
+				Name: "web",
+				Resources: &structs.Resources{
+					CPU:      1024,
+					MemoryMB: 1024,
+				},
+			},
 		},
 	}
 
 	binp := NewBinPackIterator(ctx, static, false, 0)
-	binp.SetTasks([]*structs.Task{task})
+	binp.SetTaskGroup(taskGroup)
 
 	out := collectRanked(binp)
 	if len(out) != 2 {
@@ -328,14 +365,14 @@ func TestBinPackIterator_ExistingAlloc_PlannedEvict(t *testing.T) {
 func TestJobAntiAffinity_PlannedAlloc(t *testing.T) {
 	_, ctx := testContext(t)
 	nodes := []*RankedNode{
-		&RankedNode{
+		{
 			Node: &structs.Node{
-				ID: structs.GenerateUUID(),
+				ID: uuid.Generate(),
 			},
 		},
-		&RankedNode{
+		{
 			Node: &structs.Node{
-				ID: structs.GenerateUUID(),
+				ID: uuid.Generate(),
 			},
 		},
 	}
@@ -344,19 +381,19 @@ func TestJobAntiAffinity_PlannedAlloc(t *testing.T) {
 	// Add a planned alloc to node1 that fills it
 	plan := ctx.Plan()
 	plan.NodeAllocation[nodes[0].Node.ID] = []*structs.Allocation{
-		&structs.Allocation{
-			ID:    structs.GenerateUUID(),
+		{
+			ID:    uuid.Generate(),
 			JobID: "foo",
 		},
-		&structs.Allocation{
-			ID:    structs.GenerateUUID(),
+		{
+			ID:    uuid.Generate(),
 			JobID: "foo",
 		},
 	}
 
 	// Add a planned alloc to node2 that half fills it
 	plan.NodeAllocation[nodes[1].Node.ID] = []*structs.Allocation{
-		&structs.Allocation{
+		{
 			JobID: "bar",
 		},
 	}

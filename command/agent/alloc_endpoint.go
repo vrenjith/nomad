@@ -1,14 +1,18 @@
 package agent
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 
+	"github.com/golang/snappy"
+	"github.com/hashicorp/nomad/acl"
 	"github.com/hashicorp/nomad/nomad/structs"
 )
 
 const (
-	allocNotFoundErr = "allocation not found"
+	allocNotFoundErr    = "allocation not found"
+	resourceNotFoundErr = "resource not found"
 )
 
 func (s *HTTPServer) AllocsRequest(resp http.ResponseWriter, req *http.Request) (interface{}, error) {
@@ -55,7 +59,19 @@ func (s *HTTPServer) AllocSpecificRequest(resp http.ResponseWriter, req *http.Re
 	if out.Alloc == nil {
 		return nil, CodedError(404, "alloc not found")
 	}
-	return out.Alloc, nil
+
+	// Decode the payload if there is any
+	alloc := out.Alloc
+	if alloc.Job != nil && len(alloc.Job.Payload) != 0 {
+		decoded, err := snappy.Decode(nil, alloc.Job.Payload)
+		if err != nil {
+			return nil, err
+		}
+		alloc = alloc.Copy()
+		alloc.Job.Payload = decoded
+	}
+
+	return alloc, nil
 }
 
 func (s *HTTPServer) ClientAllocRequest(resp http.ResponseWriter, req *http.Request) (interface{}, error) {
@@ -68,12 +84,87 @@ func (s *HTTPServer) ClientAllocRequest(resp http.ResponseWriter, req *http.Requ
 	// tokenize the suffix of the path to get the alloc id and find the action
 	// invoked on the alloc id
 	tokens := strings.Split(reqSuffix, "/")
-	if len(tokens) == 1 || tokens[1] != "stats" {
-		return nil, CodedError(404, allocNotFoundErr)
+	if len(tokens) != 2 {
+		return nil, CodedError(404, resourceNotFoundErr)
 	}
 	allocID := tokens[0]
+	switch tokens[1] {
+	case "stats":
+		return s.allocStats(allocID, resp, req)
+	case "snapshot":
+		return s.allocSnapshot(allocID, resp, req)
+	case "gc":
+		return s.allocGC(allocID, resp, req)
+	}
 
-	// Get the stats reporter
+	return nil, CodedError(404, resourceNotFoundErr)
+}
+
+func (s *HTTPServer) ClientGCRequest(resp http.ResponseWriter, req *http.Request) (interface{}, error) {
+	if s.agent.client == nil {
+		return nil, clientNotRunning
+	}
+
+	var secret string
+	s.parseToken(req, &secret)
+
+	// Check node write permissions
+	if aclObj, err := s.agent.Client().ResolveToken(secret); err != nil {
+		return nil, err
+	} else if aclObj != nil && !aclObj.AllowNodeWrite() {
+		return nil, structs.ErrPermissionDenied
+	}
+
+	return nil, s.agent.Client().CollectAllAllocs()
+}
+
+func (s *HTTPServer) allocGC(allocID string, resp http.ResponseWriter, req *http.Request) (interface{}, error) {
+	var secret string
+	s.parseToken(req, &secret)
+
+	var namespace string
+	parseNamespace(req, &namespace)
+
+	// Check namespace submit-job permissions
+	if aclObj, err := s.agent.Client().ResolveToken(secret); err != nil {
+		return nil, err
+	} else if aclObj != nil && !aclObj.AllowNsOp(namespace, acl.NamespaceCapabilitySubmitJob) {
+		return nil, structs.ErrPermissionDenied
+	}
+	return nil, s.agent.Client().CollectAllocation(allocID)
+}
+
+func (s *HTTPServer) allocSnapshot(allocID string, resp http.ResponseWriter, req *http.Request) (interface{}, error) {
+	var secret string
+	s.parseToken(req, &secret)
+	if !s.agent.Client().ValidateMigrateToken(allocID, secret) {
+		return nil, structs.ErrPermissionDenied
+	}
+
+	allocFS, err := s.agent.Client().GetAllocFS(allocID)
+	if err != nil {
+		return nil, fmt.Errorf(allocNotFoundErr)
+	}
+	if err := allocFS.Snapshot(resp); err != nil {
+		return nil, fmt.Errorf("error making snapshot: %v", err)
+	}
+	return nil, nil
+}
+
+func (s *HTTPServer) allocStats(allocID string, resp http.ResponseWriter, req *http.Request) (interface{}, error) {
+	var secret string
+	s.parseToken(req, &secret)
+
+	var namespace string
+	parseNamespace(req, &namespace)
+
+	// Check namespace read-job permissions
+	if aclObj, err := s.agent.Client().ResolveToken(secret); err != nil {
+		return nil, err
+	} else if aclObj != nil && !aclObj.AllowNsOp(namespace, acl.NamespaceCapabilityReadJob) {
+		return nil, structs.ErrPermissionDenied
+	}
+
 	clientStats := s.agent.client.StatsReporter()
 	aStats, err := clientStats.GetAllocStats(allocID)
 	if err != nil {

@@ -4,10 +4,17 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"io/ioutil"
+	"os"
 	"strconv"
+	"strings"
 	"time"
 
+	gg "github.com/hashicorp/go-getter"
 	"github.com/hashicorp/nomad/api"
+	"github.com/hashicorp/nomad/jobspec"
+	"github.com/posener/complete"
+
 	"github.com/ryanuber/columnize"
 )
 
@@ -48,7 +55,17 @@ func limit(s string, length int) string {
 
 // formatTime formats the time to string based on RFC822
 func formatTime(t time.Time) string {
+	if t.Unix() < 1 {
+		// It's more confusing to display the UNIX epoch or a zero value than nothing
+		return ""
+	}
 	return t.Format("01/02/06 15:04:05 MST")
+}
+
+// formatUnixNanoTime is a helper for formatting time for output.
+func formatUnixNanoTime(nano int64) string {
+	t := time.Unix(0, nano)
+	return formatTime(t)
 }
 
 // formatTimeDifference takes two times and determines their duration difference
@@ -65,14 +82,12 @@ func getLocalNodeID(client *api.Client) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("Error querying agent info: %s", err)
 	}
-	var stats map[string]interface{}
-	stats, _ = info["stats"]
-	clientStats, ok := stats["client"].(map[string]interface{})
+	clientStats, ok := info.Stats["client"]
 	if !ok {
 		return "", fmt.Errorf("Nomad not running in client mode")
 	}
 
-	nodeID, ok := clientStats["node_id"].(string)
+	nodeID, ok := clientStats["node_id"]
 	if !ok {
 		return "", fmt.Errorf("Failed to determine node ID")
 	}
@@ -105,17 +120,26 @@ type LineLimitReader struct {
 	lines       int
 	searchLimit int
 
+	timeLimit time.Duration
+	lastRead  time.Time
+
 	buffer     *bytes.Buffer
 	bufFiled   bool
 	foundLines bool
 }
 
 // NewLineLimitReader takes the ReadCloser to wrap, the number of lines to find
-// searching backwards in the first searchLimit bytes.
-func NewLineLimitReader(r io.ReadCloser, lines, searchLimit int) *LineLimitReader {
+// searching backwards in the first searchLimit bytes. timeLimit can optionally
+// be specified by passing a non-zero duration. When set, the search for the
+// last n lines is aborted if no data has been read in the duration. This
+// can be used to flush what is had if no extra data is being received. When
+// used, the underlying reader must not block forever and must periodically
+// unblock even when no data has been read.
+func NewLineLimitReader(r io.ReadCloser, lines, searchLimit int, timeLimit time.Duration) *LineLimitReader {
 	return &LineLimitReader{
 		ReadCloser:  r,
 		searchLimit: searchLimit,
+		timeLimit:   timeLimit,
 		lines:       lines,
 		buffer:      bytes.NewBuffer(make([]byte, 0, searchLimit)),
 	}
@@ -124,14 +148,52 @@ func NewLineLimitReader(r io.ReadCloser, lines, searchLimit int) *LineLimitReade
 func (l *LineLimitReader) Read(p []byte) (n int, err error) {
 	// Fill up the buffer so we can find the correct number of lines.
 	if !l.bufFiled {
-		_, err := l.buffer.ReadFrom(io.LimitReader(l.ReadCloser, int64(l.searchLimit)))
-		if err != nil {
-			return 0, err
+		b := make([]byte, len(p))
+		n, err := l.ReadCloser.Read(b)
+		if n > 0 {
+			if _, err := l.buffer.Write(b[:n]); err != nil {
+				return 0, err
+			}
 		}
 
-		l.bufFiled = true
+		if err != nil {
+			if err != io.EOF {
+				return 0, err
+			}
+
+			l.bufFiled = true
+			goto READ
+		}
+
+		if l.buffer.Len() >= l.searchLimit {
+			l.bufFiled = true
+			goto READ
+		}
+
+		if l.timeLimit.Nanoseconds() > 0 {
+			if l.lastRead.IsZero() {
+				l.lastRead = time.Now()
+				return 0, nil
+			}
+
+			now := time.Now()
+			if n == 0 {
+				// We hit the limit
+				if l.lastRead.Add(l.timeLimit).Before(now) {
+					l.bufFiled = true
+					goto READ
+				} else {
+					return 0, nil
+				}
+			} else {
+				l.lastRead = now
+			}
+		}
+
+		return 0, nil
 	}
 
+READ:
 	if l.bufFiled && l.buffer.Len() != 0 {
 		b := l.buffer.Bytes()
 
@@ -168,4 +230,114 @@ func (l *LineLimitReader) Read(p []byte) (n int, err error) {
 
 	// Just stream from the underlying reader now
 	return l.ReadCloser.Read(p)
+}
+
+type JobGetter struct {
+	// The fields below can be overwritten for tests
+	testStdin io.Reader
+}
+
+// StructJob returns the Job struct from jobfile.
+func (j *JobGetter) ApiJob(jpath string) (*api.Job, error) {
+	var jobfile io.Reader
+	switch jpath {
+	case "-":
+		if j.testStdin != nil {
+			jobfile = j.testStdin
+		} else {
+			jobfile = os.Stdin
+		}
+	default:
+		if len(jpath) == 0 {
+			return nil, fmt.Errorf("Error jobfile path has to be specified.")
+		}
+
+		job, err := ioutil.TempFile("", "jobfile")
+		if err != nil {
+			return nil, err
+		}
+		defer os.Remove(job.Name())
+
+		if err := job.Close(); err != nil {
+			return nil, err
+		}
+
+		// Get the pwd
+		pwd, err := os.Getwd()
+		if err != nil {
+			return nil, err
+		}
+
+		client := &gg.Client{
+			Src: jpath,
+			Pwd: pwd,
+			Dst: job.Name(),
+		}
+
+		if err := client.Get(); err != nil {
+			return nil, fmt.Errorf("Error getting jobfile from %q: %v", jpath, err)
+		} else {
+			file, err := os.Open(job.Name())
+			defer file.Close()
+			if err != nil {
+				return nil, fmt.Errorf("Error opening file %q: %v", jpath, err)
+			}
+			jobfile = file
+		}
+	}
+
+	// Parse the JobFile
+	jobStruct, err := jobspec.Parse(jobfile)
+	if err != nil {
+		return nil, fmt.Errorf("Error parsing job file from %s: %v", jpath, err)
+	}
+
+	return jobStruct, nil
+}
+
+// COMPAT: Remove in 0.7.0
+// Nomad 0.6.0 introduces the submit time field so CLI's interacting with
+// older versions of Nomad would SEGFAULT as reported here:
+// https://github.com/hashicorp/nomad/issues/2918
+// getSubmitTime returns a submit time of the job converting to time.Time
+func getSubmitTime(job *api.Job) time.Time {
+	if job.SubmitTime != nil {
+		return time.Unix(0, *job.SubmitTime)
+	}
+
+	return time.Time{}
+}
+
+// COMPAT: Remove in 0.7.0
+// Nomad 0.6.0 introduces job Versions so CLI's interacting with
+// older versions of Nomad would SEGFAULT as reported here:
+// https://github.com/hashicorp/nomad/issues/2918
+// getVersion returns a version of the job in safely.
+func getVersion(job *api.Job) uint64 {
+	if job.Version != nil {
+		return *job.Version
+	}
+
+	return 0
+}
+
+// mergeAutocompleteFlags is used to join multiple flag completion sets.
+func mergeAutocompleteFlags(flags ...complete.Flags) complete.Flags {
+	merged := make(map[string]complete.Predictor, len(flags))
+	for _, f := range flags {
+		for k, v := range f {
+			merged[k] = v
+		}
+	}
+	return merged
+}
+
+// sanatizeUUIDPrefix is used to sanatize a UUID prefix. The returned result
+// will be a truncated version of the prefix if the prefix would not be
+// queriable.
+func sanatizeUUIDPrefix(prefix string) string {
+	hyphens := strings.Count(prefix, "-")
+	length := len(prefix) - hyphens
+	remainder := length % 2
+	return prefix[:len(prefix)-remainder]
 }

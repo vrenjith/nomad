@@ -8,16 +8,25 @@ description: >
 
 # Command: plan
 
-The `plan` command can be used to envoke the scheduler in a dry-run mode with new
-jobs or when updating existing jobs to determine what would happen if the job
-is submitted. Job files must conform to the [job specification](/docs/jobspec/index.html)
-format.
+The `plan` command can be used to envoke the scheduler in a dry-run mode with
+new jobs or when updating existing jobs to determine what would happen if the
+job is submitted. Job files must conform to the [job
+specification](/docs/job-specification/index.html) format.
 
 ## Usage
 
 ```
-nomad plan [options] <file>
+nomad plan [options] <path>
 ```
+
+The plan command requires a single argument, specifying the path to a file
+containing a [HCL job specification](/docs/job-specification/index.html). This
+file will be read and the resulting parsed job will be validated. If the
+supplied path is "-", the job file is read from STDIN. Otherwise it is read
+from the file at the supplied path or downloaded and read from URL specified.
+Nomad downloads the job file using
+[`go-getter`](https://github.com/hashicorp/go-getter)
+and supports `go-getter` syntax.
 
 Plan invokes a dry-run of the scheduler to determine the effects of submitting
 either a new or updated version of a job. The plan will not result in any
@@ -34,16 +43,24 @@ A structured diff between the local and remote job is displayed to
 give insight into what the scheduler will attempt to do and why.
 
 If the job has specified the region, the `-region` flag and `NOMAD_REGION`
-environment variable are overridden and the the job's region is used.
+environment variable are overridden and the job's region is used.
+
+Plan will return one of the following exit codes:
+
+  * 0: No allocations created or destroyed.
+  * 1: Allocations created or destroyed.
+  * 255: Error determining plan results.
 
 ## General Options
 
-<%= general_options_usage %>
+<%= partial "docs/commands/_general_options" %>
 
 ## Plan Options
 
 * `-diff`: Determines whether the diff between the remote job and planned job is
   shown. Defaults to true.
+
+* `-policy-override`: Sets the flag to force override any soft mandatory Sentinel policies.
 
 * `-verbose`: Increase diff verbosity.
 
@@ -67,7 +84,7 @@ To submit the job with version verification run:
 nomad run -check-index 0 example.nomad
 
 When running the job with the check-index flag, the job will only be run if the
-server side version matches the the job modify index returned. If the index has
+server side version matches the job modify index returned. If the index has
 changed, another user has modified the job and the plan's results are
 potentially invalid.
 ```
@@ -94,7 +111,7 @@ To submit the job with version verification run:
 nomad run -check-index 15 example.nomad
 
 When running the job with the check-index flag, the job will only be run if the
-server side version matches the the job modify index returned. If the index has
+server side version matches the job modify index returned. If the index has
 changed, another user has modified the job and the plan's results are
 potentially invalid.
 ```
@@ -121,7 +138,7 @@ To submit the job with version verification run:
 nomad run -check-index 7 example.nomad
 
 When running the job with the check-index flag, the job will only be run if the
-server side version matches the the job modify index returned. If the index has
+server side version matches the job modify index returned. If the index has
 changed, another user has modified the job and the plan's results are
 potentially invalid.
 ```
@@ -180,7 +197,7 @@ To submit the job with version verification run:
 nomad run -check-index 7 example.nomad
 
 When running the job with the check-index flag, the job will only be run if the
-server side version matches the the job modify index returned. If the index has
+server side version matches the job modify index returned. If the index has
 changed, another user has modified the job and the plan's results are
 potentially invalid.
 ```

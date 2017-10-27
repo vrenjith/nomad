@@ -19,6 +19,7 @@ const (
 	UpdateTypeCreate            = "create"
 	UpdateTypeDestroy           = "destroy"
 	UpdateTypeMigrate           = "migrate"
+	UpdateTypeCanary            = "canary"
 	UpdateTypeInplaceUpdate     = "in-place update"
 	UpdateTypeDestructiveUpdate = "create/destroy update"
 )
@@ -70,6 +71,9 @@ func annotateTaskGroup(diff *structs.TaskGroupDiff, annotations *structs.PlanAnn
 			}
 			if tg.Stop != 0 {
 				diff.Updates[UpdateTypeDestroy] = tg.Stop
+			}
+			if tg.Canary != 0 {
+				diff.Updates[UpdateTypeCanary] = tg.Canary
 			}
 			if tg.InPlaceUpdate != 0 {
 				diff.Updates[UpdateTypeInplaceUpdate] = tg.InPlaceUpdate
@@ -159,21 +163,30 @@ func annotateTask(diff *structs.TaskDiff, parent *structs.TaskGroupDiff) {
 		}
 	}
 
-	// All changes to primitive fields result in a destructive update.
+	// All changes to primitive fields result in a destructive update except
+	// KillTimeout
 	destructive := false
-	if len(diff.Fields) != 0 {
-		destructive = true
-	}
-
-	// Changes that can be done in-place are log configs, services and
-	// constraints.
-	for _, oDiff := range diff.Objects {
-		switch oDiff.Name {
-		case "LogConfig", "Service", "Constraint":
+	for _, fDiff := range diff.Fields {
+		switch fDiff.Name {
+		case "KillTimeout":
 			continue
 		default:
 			destructive = true
 			break
+		}
+	}
+
+	// Object changes that can be done in-place are log configs, services,
+	// constraints.
+	if !destructive {
+		for _, oDiff := range diff.Objects {
+			switch oDiff.Name {
+			case "LogConfig", "Service", "Constraint":
+				continue
+			default:
+				destructive = true
+				break
+			}
 		}
 	}
 

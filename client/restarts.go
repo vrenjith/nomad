@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	cstructs "github.com/hashicorp/nomad/client/driver/structs"
+	dstructs "github.com/hashicorp/nomad/client/driver/structs"
 	"github.com/hashicorp/nomad/nomad/structs"
 )
 
@@ -34,15 +34,17 @@ func newRestartTracker(policy *structs.RestartPolicy, jobType string) *RestartTr
 }
 
 type RestartTracker struct {
-	waitRes   *cstructs.WaitResult
-	startErr  error
-	count     int       // Current number of attempts.
-	onSuccess bool      // Whether to restart on successful exit code.
-	startTime time.Time // When the interval began
-	reason    string    // The reason for the last state
-	policy    *structs.RestartPolicy
-	rand      *rand.Rand
-	lock      sync.Mutex
+	waitRes          *dstructs.WaitResult
+	startErr         error
+	restartTriggered bool      // Whether the task has been signalled to be restarted
+	failure          bool      // Whether a failure triggered the restart
+	count            int       // Current number of attempts.
+	onSuccess        bool      // Whether to restart on successful exit code.
+	startTime        time.Time // When the interval began
+	reason           string    // The reason for the last state
+	policy           *structs.RestartPolicy
+	rand             *rand.Rand
+	lock             sync.Mutex
 }
 
 // SetPolicy updates the policy used to determine restarts.
@@ -58,14 +60,31 @@ func (r *RestartTracker) SetStartError(err error) *RestartTracker {
 	r.lock.Lock()
 	defer r.lock.Unlock()
 	r.startErr = err
+	r.failure = true
 	return r
 }
 
 // SetWaitResult is used to mark the most recent wait result.
-func (r *RestartTracker) SetWaitResult(res *cstructs.WaitResult) *RestartTracker {
+func (r *RestartTracker) SetWaitResult(res *dstructs.WaitResult) *RestartTracker {
 	r.lock.Lock()
 	defer r.lock.Unlock()
 	r.waitRes = res
+	r.failure = true
+	return r
+}
+
+// SetRestartTriggered is used to mark that the task has been signalled to be
+// restarted. Setting the failure to true restarts according to the restart
+// policy. When failure is false the task is restarted without considering the
+// restart policy.
+func (r *RestartTracker) SetRestartTriggered(failure bool) *RestartTracker {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+	if failure {
+		r.failure = true
+	} else {
+		r.restartTriggered = true
+	}
 	return r
 }
 
@@ -91,6 +110,20 @@ func (r *RestartTracker) GetState() (string, time.Duration) {
 	r.lock.Lock()
 	defer r.lock.Unlock()
 
+	// Clear out the existing state
+	defer func() {
+		r.startErr = nil
+		r.waitRes = nil
+		r.restartTriggered = false
+		r.failure = false
+	}()
+
+	// Hot path if a restart was triggered
+	if r.restartTriggered {
+		r.reason = ""
+		return structs.TaskRestarting, 0
+	}
+
 	// Hot path if no attempts are expected
 	if r.policy.Attempts == 0 {
 		r.reason = ReasonNoRestartsAllowed
@@ -111,56 +144,33 @@ func (r *RestartTracker) GetState() (string, time.Duration) {
 		r.startTime = now
 	}
 
-	if r.startErr != nil {
-		return r.handleStartError()
-	} else if r.waitRes != nil {
-		return r.handleWaitResult()
-	} else {
+	// Handle restarts due to failures
+	if !r.failure {
 		return "", 0
 	}
-}
 
-// handleStartError returns the new state and potential wait duration for
-// restarting the task after it was not successfully started. On start errors,
-// the restart policy is always treated as fail mode to ensure we don't
-// infinitely try to start a task.
-func (r *RestartTracker) handleStartError() (string, time.Duration) {
-	// If the error is not recoverable, do not restart.
-	if rerr, ok := r.startErr.(*cstructs.RecoverableError); !(ok && rerr.Recoverable) {
-		r.reason = ReasonUnrecoverableErrror
-		return structs.TaskNotRestarting, 0
-	}
-
-	if r.count > r.policy.Attempts {
-		if r.policy.Mode == structs.RestartPolicyModeFail {
-			r.reason = fmt.Sprintf(
-				`Exceeded allowed atttempts %d in interval %v and mode is "fail"`,
-				r.policy.Attempts, r.policy.Interval)
+	if r.startErr != nil {
+		// If the error is not recoverable, do not restart.
+		if !structs.IsRecoverable(r.startErr) {
+			r.reason = ReasonUnrecoverableErrror
 			return structs.TaskNotRestarting, 0
-		} else {
-			r.reason = ReasonDelay
-			return structs.TaskRestarting, r.getDelay()
+		}
+	} else if r.waitRes != nil {
+		// If the task started successfully and restart on success isn't specified,
+		// don't restart but don't mark as failed.
+		if r.waitRes.Successful() && !r.onSuccess {
+			r.reason = "Restart unnecessary as task terminated successfully"
+			return structs.TaskTerminated, 0
 		}
 	}
 
-	r.reason = ReasonWithinPolicy
-	return structs.TaskRestarting, r.jitter()
-}
-
-// handleWaitResult returns the new state and potential wait duration for
-// restarting the task after it has exited.
-func (r *RestartTracker) handleWaitResult() (string, time.Duration) {
-	// If the task started successfully and restart on success isn't specified,
-	// don't restart but don't mark as failed.
-	if r.waitRes.Successful() && !r.onSuccess {
-		r.reason = "Restart unnecessary as task terminated successfully"
-		return structs.TaskTerminated, 0
-	}
-
+	// If this task has been restarted due to failures more times
+	// than the restart policy allows within an interval fail
+	// according to the restart policy's mode.
 	if r.count > r.policy.Attempts {
 		if r.policy.Mode == structs.RestartPolicyModeFail {
 			r.reason = fmt.Sprintf(
-				`Exceeded allowed atttempts %d in interval %v and mode is "fail"`,
+				`Exceeded allowed attempts %d in interval %v and mode is "fail"`,
 				r.policy.Attempts, r.policy.Interval)
 			return structs.TaskNotRestarting, 0
 		} else {
@@ -190,10 +200,4 @@ func (r *RestartTracker) jitter() time.Duration {
 
 	j := float64(r.rand.Int63n(d)) * jitter
 	return time.Duration(d + int64(j))
-}
-
-// Returns a tracker that never restarts.
-func noRestartsTracker() *RestartTracker {
-	policy := &structs.RestartPolicy{Attempts: 0, Mode: structs.RestartPolicyModeFail}
-	return newRestartTracker(policy, structs.JobTypeBatch)
 }

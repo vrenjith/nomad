@@ -6,16 +6,14 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/hashicorp/nomad/helper/uuid"
 	"github.com/hashicorp/nomad/nomad/mock"
 	"github.com/hashicorp/nomad/nomad/state"
 	"github.com/hashicorp/nomad/nomad/structs"
 )
 
 func testContext(t testing.TB) (*state.StateStore, *EvalContext) {
-	state, err := state.NewStateStore(os.Stderr)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
+	state := state.TestStateStore(t)
 	plan := &structs.Plan{
 		NodeUpdate:     make(map[string][]*structs.Allocation),
 		NodeAllocation: make(map[string][]*structs.Allocation),
@@ -30,20 +28,20 @@ func testContext(t testing.TB) (*state.StateStore, *EvalContext) {
 func TestEvalContext_ProposedAlloc(t *testing.T) {
 	state, ctx := testContext(t)
 	nodes := []*RankedNode{
-		&RankedNode{
+		{
 			Node: &structs.Node{
 				// Perfect fit
-				ID: structs.GenerateUUID(),
+				ID: uuid.Generate(),
 				Resources: &structs.Resources{
 					CPU:      2048,
 					MemoryMB: 2048,
 				},
 			},
 		},
-		&RankedNode{
+		{
 			Node: &structs.Node{
 				// Perfect fit
-				ID: structs.GenerateUUID(),
+				ID: uuid.Generate(),
 				Resources: &structs.Resources{
 					CPU:      2048,
 					MemoryMB: 2048,
@@ -53,30 +51,39 @@ func TestEvalContext_ProposedAlloc(t *testing.T) {
 	}
 
 	// Add existing allocations
+	j1, j2 := mock.Job(), mock.Job()
 	alloc1 := &structs.Allocation{
-		ID:     structs.GenerateUUID(),
-		EvalID: structs.GenerateUUID(),
-		NodeID: nodes[0].Node.ID,
-		JobID:  structs.GenerateUUID(),
+		ID:        uuid.Generate(),
+		Namespace: structs.DefaultNamespace,
+		EvalID:    uuid.Generate(),
+		NodeID:    nodes[0].Node.ID,
+		JobID:     j1.ID,
+		Job:       j1,
 		Resources: &structs.Resources{
 			CPU:      2048,
 			MemoryMB: 2048,
 		},
 		DesiredStatus: structs.AllocDesiredStatusRun,
 		ClientStatus:  structs.AllocClientStatusPending,
+		TaskGroup:     "web",
 	}
 	alloc2 := &structs.Allocation{
-		ID:     structs.GenerateUUID(),
-		EvalID: structs.GenerateUUID(),
-		NodeID: nodes[1].Node.ID,
-		JobID:  structs.GenerateUUID(),
+		ID:        uuid.Generate(),
+		Namespace: structs.DefaultNamespace,
+		EvalID:    uuid.Generate(),
+		NodeID:    nodes[1].Node.ID,
+		JobID:     j2.ID,
+		Job:       j2,
 		Resources: &structs.Resources{
 			CPU:      1024,
 			MemoryMB: 1024,
 		},
 		DesiredStatus: structs.AllocDesiredStatusRun,
 		ClientStatus:  structs.AllocClientStatusPending,
+		TaskGroup:     "web",
 	}
+	noErr(t, state.UpsertJobSummary(998, mock.JobSummary(alloc1.JobID)))
+	noErr(t, state.UpsertJobSummary(999, mock.JobSummary(alloc2.JobID)))
 	noErr(t, state.UpsertAllocs(1000, []*structs.Allocation{alloc1, alloc2}))
 
 	// Add a planned eviction to alloc1
@@ -85,7 +92,7 @@ func TestEvalContext_ProposedAlloc(t *testing.T) {
 
 	// Add a planned placement to node1
 	plan.NodeAllocation[nodes[1].Node.ID] = []*structs.Allocation{
-		&structs.Allocation{
+		{
 			Resources: &structs.Resources{
 				CPU:      1024,
 				MemoryMB: 1024,

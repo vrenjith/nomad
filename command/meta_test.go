@@ -8,6 +8,7 @@ import (
 )
 
 func TestMeta_FlagSet(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		Flags    FlagSetFlags
 		Expected []string
@@ -18,7 +19,19 @@ func TestMeta_FlagSet(t *testing.T) {
 		},
 		{
 			FlagSetClient,
-			[]string{"address", "no-color", "region"},
+			[]string{
+				"address",
+				"no-color",
+				"region",
+				"namespace",
+				"ca-cert",
+				"ca-path",
+				"client-cert",
+				"client-key",
+				"insecure",
+				"tls-skip-verify",
+				"token",
+			},
 		},
 	}
 

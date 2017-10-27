@@ -10,7 +10,8 @@ import (
 )
 
 func TestHTTP_EvalList(t *testing.T) {
-	httpTest(t, nil, func(s *TestServer) {
+	t.Parallel()
+	httpTest(t, nil, func(s *TestAgent) {
 		// Directly manipulate the state
 		state := s.Agent.server.State()
 		eval1 := mock.Eval()
@@ -54,7 +55,8 @@ func TestHTTP_EvalList(t *testing.T) {
 }
 
 func TestHTTP_EvalPrefixList(t *testing.T) {
-	httpTest(t, nil, func(s *TestServer) {
+	t.Parallel()
+	httpTest(t, nil, func(s *TestAgent) {
 		// Directly manipulate the state
 		state := s.Agent.server.State()
 		eval1 := mock.Eval()
@@ -105,12 +107,15 @@ func TestHTTP_EvalPrefixList(t *testing.T) {
 }
 
 func TestHTTP_EvalAllocations(t *testing.T) {
-	httpTest(t, nil, func(s *TestServer) {
+	t.Parallel()
+	httpTest(t, nil, func(s *TestAgent) {
 		// Directly manipulate the state
 		state := s.Agent.server.State()
 		alloc1 := mock.Alloc()
 		alloc2 := mock.Alloc()
 		alloc2.EvalID = alloc1.EvalID
+		state.UpsertJobSummary(998, mock.JobSummary(alloc1.JobID))
+		state.UpsertJobSummary(999, mock.JobSummary(alloc2.JobID))
 		err := state.UpsertAllocs(1000,
 			[]*structs.Allocation{alloc1, alloc2})
 		if err != nil {
@@ -151,7 +156,8 @@ func TestHTTP_EvalAllocations(t *testing.T) {
 }
 
 func TestHTTP_EvalQuery(t *testing.T) {
-	httpTest(t, nil, func(s *TestServer) {
+	t.Parallel()
+	httpTest(t, nil, func(s *TestAgent) {
 		// Directly manipulate the state
 		state := s.Agent.server.State()
 		eval := mock.Eval()

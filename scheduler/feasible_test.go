@@ -1,9 +1,11 @@
 package scheduler
 
 import (
+	"fmt"
 	"reflect"
 	"testing"
 
+	"github.com/hashicorp/nomad/helper/uuid"
 	"github.com/hashicorp/nomad/nomad/mock"
 	"github.com/hashicorp/nomad/nomad/structs"
 )
@@ -90,8 +92,8 @@ func TestDriverChecker(t *testing.T) {
 	nodes[3].Attributes["driver.foo"] = "False"
 
 	drivers := map[string]struct{}{
-		"exec": struct{}{},
-		"foo":  struct{}{},
+		"exec": {},
+		"foo":  {},
 	}
 	checker := NewDriverChecker(ctx, drivers)
 	cases := []struct {
@@ -137,17 +139,17 @@ func TestConstraintChecker(t *testing.T) {
 	nodes[2].NodeClass = "large"
 
 	constraints := []*structs.Constraint{
-		&structs.Constraint{
+		{
 			Operand: "=",
 			LTarget: "${node.datacenter}",
 			RTarget: "dc1",
 		},
-		&structs.Constraint{
+		{
 			Operand: "is",
 			LTarget: "${attr.kernel.name}",
 			RTarget: "linux",
 		},
-		&structs.Constraint{
+		{
 			Operand: "is",
 			LTarget: "${node.class}",
 			RTarget: "large",
@@ -304,6 +306,16 @@ func TestCheckConstraint(t *testing.T) {
 			lVal: "foo", rVal: "bar",
 			result: false,
 		},
+		{
+			op:   structs.ConstraintSetContains,
+			lVal: "foo,bar,baz", rVal: "foo,  bar  ",
+			result: true,
+		},
+		{
+			op:   structs.ConstraintSetContains,
+			lVal: "foo,bar,baz", rVal: "foo,bam",
+			result: false,
+		},
 	}
 
 	for _, tc := range cases {
@@ -424,10 +436,11 @@ func TestCheckRegexpConstraint(t *testing.T) {
 	}
 }
 
-func TestProposedAllocConstraint_JobDistinctHosts(t *testing.T) {
+// This test puts allocations on the node to test if it detects infeasibility of
+// nodes correctly and picks the only feasible one
+func TestDistinctHostsIterator_JobDistinctHosts(t *testing.T) {
 	_, ctx := testContext(t)
 	nodes := []*structs.Node{
-		mock.Node(),
 		mock.Node(),
 		mock.Node(),
 		mock.Node(),
@@ -440,89 +453,66 @@ func TestProposedAllocConstraint_JobDistinctHosts(t *testing.T) {
 
 	job := &structs.Job{
 		ID:          "foo",
-		Constraints: []*structs.Constraint{{Operand: structs.ConstraintDistinctHosts}},
-		TaskGroups:  []*structs.TaskGroup{tg1, tg2},
-	}
-
-	propsed := NewProposedAllocConstraintIterator(ctx, static)
-	propsed.SetTaskGroup(tg1)
-	propsed.SetJob(job)
-
-	out := collectFeasible(propsed)
-	if len(out) != 4 {
-		t.Fatalf("Bad: %#v", out)
-	}
-
-	selected := make(map[string]struct{}, 4)
-	for _, option := range out {
-		if _, ok := selected[option.ID]; ok {
-			t.Fatalf("selected node %v for more than one alloc", option)
-		}
-		selected[option.ID] = struct{}{}
-	}
-}
-
-func TestProposedAllocConstraint_JobDistinctHosts_Infeasible(t *testing.T) {
-	_, ctx := testContext(t)
-	nodes := []*structs.Node{
-		mock.Node(),
-		mock.Node(),
-	}
-	static := NewStaticIterator(ctx, nodes)
-
-	// Create a job with a distinct_hosts constraint and two task groups.
-	tg1 := &structs.TaskGroup{Name: "bar"}
-	tg2 := &structs.TaskGroup{Name: "baz"}
-
-	job := &structs.Job{
-		ID:          "foo",
+		Namespace:   structs.DefaultNamespace,
 		Constraints: []*structs.Constraint{{Operand: structs.ConstraintDistinctHosts}},
 		TaskGroups:  []*structs.TaskGroup{tg1, tg2},
 	}
 
 	// Add allocs placing tg1 on node1 and tg2 on node2. This should make the
-	// job unsatisfiable.
+	// job unsatisfiable on all nodes but node3
 	plan := ctx.Plan()
 	plan.NodeAllocation[nodes[0].ID] = []*structs.Allocation{
-		&structs.Allocation{
+		{
+			Namespace: structs.DefaultNamespace,
 			TaskGroup: tg1.Name,
 			JobID:     job.ID,
-			ID:        structs.GenerateUUID(),
+			Job:       job,
+			ID:        uuid.Generate(),
 		},
 
 		// Should be ignored as it is a different job.
-		&structs.Allocation{
+		{
+			Namespace: structs.DefaultNamespace,
 			TaskGroup: tg2.Name,
 			JobID:     "ignore 2",
-			ID:        structs.GenerateUUID(),
+			Job:       job,
+			ID:        uuid.Generate(),
 		},
 	}
 	plan.NodeAllocation[nodes[1].ID] = []*structs.Allocation{
-		&structs.Allocation{
+		{
+			Namespace: structs.DefaultNamespace,
 			TaskGroup: tg2.Name,
 			JobID:     job.ID,
-			ID:        structs.GenerateUUID(),
+			Job:       job,
+			ID:        uuid.Generate(),
 		},
 
 		// Should be ignored as it is a different job.
-		&structs.Allocation{
+		{
+			Namespace: structs.DefaultNamespace,
 			TaskGroup: tg1.Name,
 			JobID:     "ignore 2",
-			ID:        structs.GenerateUUID(),
+			Job:       job,
+			ID:        uuid.Generate(),
 		},
 	}
 
-	propsed := NewProposedAllocConstraintIterator(ctx, static)
-	propsed.SetTaskGroup(tg1)
-	propsed.SetJob(job)
+	proposed := NewDistinctHostsIterator(ctx, static)
+	proposed.SetTaskGroup(tg1)
+	proposed.SetJob(job)
 
-	out := collectFeasible(propsed)
-	if len(out) != 0 {
+	out := collectFeasible(proposed)
+	if len(out) != 1 {
 		t.Fatalf("Bad: %#v", out)
+	}
+
+	if out[0].ID != nodes[2].ID {
+		t.Fatalf("wrong node picked")
 	}
 }
 
-func TestProposedAllocConstraint_JobDistinctHosts_InfeasibleCount(t *testing.T) {
+func TestDistinctHostsIterator_JobDistinctHosts_InfeasibleCount(t *testing.T) {
 	_, ctx := testContext(t)
 	nodes := []*structs.Node{
 		mock.Node(),
@@ -537,22 +527,43 @@ func TestProposedAllocConstraint_JobDistinctHosts_InfeasibleCount(t *testing.T) 
 
 	job := &structs.Job{
 		ID:          "foo",
+		Namespace:   structs.DefaultNamespace,
 		Constraints: []*structs.Constraint{{Operand: structs.ConstraintDistinctHosts}},
 		TaskGroups:  []*structs.TaskGroup{tg1, tg2, tg3},
 	}
 
-	propsed := NewProposedAllocConstraintIterator(ctx, static)
-	propsed.SetTaskGroup(tg1)
-	propsed.SetJob(job)
+	// Add allocs placing tg1 on node1 and tg2 on node2. This should make the
+	// job unsatisfiable for tg3
+	plan := ctx.Plan()
+	plan.NodeAllocation[nodes[0].ID] = []*structs.Allocation{
+		{
+			Namespace: structs.DefaultNamespace,
+			TaskGroup: tg1.Name,
+			JobID:     job.ID,
+			ID:        uuid.Generate(),
+		},
+	}
+	plan.NodeAllocation[nodes[1].ID] = []*structs.Allocation{
+		{
+			Namespace: structs.DefaultNamespace,
+			TaskGroup: tg2.Name,
+			JobID:     job.ID,
+			ID:        uuid.Generate(),
+		},
+	}
+
+	proposed := NewDistinctHostsIterator(ctx, static)
+	proposed.SetTaskGroup(tg3)
+	proposed.SetJob(job)
 
 	// It should not be able to place 3 tasks with only two nodes.
-	out := collectFeasible(propsed)
-	if len(out) != 2 {
+	out := collectFeasible(proposed)
+	if len(out) != 0 {
 		t.Fatalf("Bad: %#v", out)
 	}
 }
 
-func TestProposedAllocConstraint_TaskGroupDistinctHosts(t *testing.T) {
+func TestDistinctHostsIterator_TaskGroupDistinctHosts(t *testing.T) {
 	_, ctx := testContext(t)
 	nodes := []*structs.Node{
 		mock.Node(),
@@ -561,18 +572,20 @@ func TestProposedAllocConstraint_TaskGroupDistinctHosts(t *testing.T) {
 	static := NewStaticIterator(ctx, nodes)
 
 	// Create a task group with a distinct_hosts constraint.
-	taskGroup := &structs.TaskGroup{
+	tg1 := &structs.TaskGroup{
 		Name: "example",
 		Constraints: []*structs.Constraint{
 			{Operand: structs.ConstraintDistinctHosts},
 		},
 	}
+	tg2 := &structs.TaskGroup{Name: "baz"}
 
 	// Add a planned alloc to node1.
 	plan := ctx.Plan()
 	plan.NodeAllocation[nodes[0].ID] = []*structs.Allocation{
-		&structs.Allocation{
-			TaskGroup: taskGroup.Name,
+		{
+			Namespace: structs.DefaultNamespace,
+			TaskGroup: tg1.Name,
 			JobID:     "foo",
 		},
 	}
@@ -580,17 +593,21 @@ func TestProposedAllocConstraint_TaskGroupDistinctHosts(t *testing.T) {
 	// Add a planned alloc to node2 with the same task group name but a
 	// different job.
 	plan.NodeAllocation[nodes[1].ID] = []*structs.Allocation{
-		&structs.Allocation{
-			TaskGroup: taskGroup.Name,
+		{
+			Namespace: structs.DefaultNamespace,
+			TaskGroup: tg1.Name,
 			JobID:     "bar",
 		},
 	}
 
-	propsed := NewProposedAllocConstraintIterator(ctx, static)
-	propsed.SetTaskGroup(taskGroup)
-	propsed.SetJob(&structs.Job{ID: "foo"})
+	proposed := NewDistinctHostsIterator(ctx, static)
+	proposed.SetTaskGroup(tg1)
+	proposed.SetJob(&structs.Job{
+		ID:        "foo",
+		Namespace: structs.DefaultNamespace,
+	})
 
-	out := collectFeasible(propsed)
+	out := collectFeasible(proposed)
 	if len(out) != 1 {
 		t.Fatalf("Bad: %#v", out)
 	}
@@ -599,6 +616,784 @@ func TestProposedAllocConstraint_TaskGroupDistinctHosts(t *testing.T) {
 	// the same task group.
 	if out[0] != nodes[1] {
 		t.Fatalf("Bad: %v", out)
+	}
+
+	// Since the other task group doesn't have the constraint, both nodes should
+	// be feasible.
+	proposed.Reset()
+	proposed.SetTaskGroup(tg2)
+	out = collectFeasible(proposed)
+	if len(out) != 2 {
+		t.Fatalf("Bad: %#v", out)
+	}
+}
+
+// This test puts creates allocations across task groups that use a property
+// value to detect if the constraint at the job level properly considers all
+// task groups.
+func TestDistinctPropertyIterator_JobDistinctProperty(t *testing.T) {
+	state, ctx := testContext(t)
+	nodes := []*structs.Node{
+		mock.Node(),
+		mock.Node(),
+		mock.Node(),
+		mock.Node(),
+		mock.Node(),
+	}
+
+	for i, n := range nodes {
+		n.Meta["rack"] = fmt.Sprintf("%d", i)
+
+		// Add to state store
+		if err := state.UpsertNode(uint64(100+i), n); err != nil {
+			t.Fatalf("failed to upsert node: %v", err)
+		}
+	}
+
+	static := NewStaticIterator(ctx, nodes)
+
+	// Create a job with a distinct_property constraint and a task groups.
+	tg1 := &structs.TaskGroup{Name: "bar"}
+	tg2 := &structs.TaskGroup{Name: "baz"}
+
+	job := &structs.Job{
+		ID:        "foo",
+		Namespace: structs.DefaultNamespace,
+		Constraints: []*structs.Constraint{
+			{
+				Operand: structs.ConstraintDistinctProperty,
+				LTarget: "${meta.rack}",
+			},
+		},
+		TaskGroups: []*structs.TaskGroup{tg1, tg2},
+	}
+
+	// Add allocs placing tg1 on node1 and 2 and tg2 on node3 and 4. This should make the
+	// job unsatisfiable on all nodes but node5. Also mix the allocations
+	// existing in the plan and the state store.
+	plan := ctx.Plan()
+	alloc1ID := uuid.Generate()
+	plan.NodeAllocation[nodes[0].ID] = []*structs.Allocation{
+		{
+			Namespace: structs.DefaultNamespace,
+			TaskGroup: tg1.Name,
+			JobID:     job.ID,
+			Job:       job,
+			ID:        alloc1ID,
+			NodeID:    nodes[0].ID,
+		},
+
+		// Should be ignored as it is a different job.
+		{
+			Namespace: structs.DefaultNamespace,
+			TaskGroup: tg2.Name,
+			JobID:     "ignore 2",
+			Job:       job,
+			ID:        uuid.Generate(),
+			NodeID:    nodes[0].ID,
+		},
+	}
+	plan.NodeAllocation[nodes[2].ID] = []*structs.Allocation{
+		{
+			Namespace: structs.DefaultNamespace,
+			TaskGroup: tg2.Name,
+			JobID:     job.ID,
+			Job:       job,
+			ID:        uuid.Generate(),
+			NodeID:    nodes[2].ID,
+		},
+
+		// Should be ignored as it is a different job.
+		{
+			Namespace: structs.DefaultNamespace,
+			TaskGroup: tg1.Name,
+			JobID:     "ignore 2",
+			Job:       job,
+			ID:        uuid.Generate(),
+			NodeID:    nodes[2].ID,
+		},
+	}
+
+	// Put an allocation on Node 5 but make it stopped in the plan
+	stoppingAllocID := uuid.Generate()
+	plan.NodeUpdate[nodes[4].ID] = []*structs.Allocation{
+		{
+			Namespace: structs.DefaultNamespace,
+			TaskGroup: tg2.Name,
+			JobID:     job.ID,
+			Job:       job,
+			ID:        stoppingAllocID,
+			NodeID:    nodes[4].ID,
+		},
+	}
+
+	upserting := []*structs.Allocation{
+		// Have one of the allocations exist in both the plan and the state
+		// store. This resembles an allocation update
+		{
+			Namespace: structs.DefaultNamespace,
+			TaskGroup: tg1.Name,
+			JobID:     job.ID,
+			Job:       job,
+			ID:        alloc1ID,
+			EvalID:    uuid.Generate(),
+			NodeID:    nodes[0].ID,
+		},
+
+		{
+			Namespace: structs.DefaultNamespace,
+			TaskGroup: tg1.Name,
+			JobID:     job.ID,
+			Job:       job,
+			ID:        uuid.Generate(),
+			EvalID:    uuid.Generate(),
+			NodeID:    nodes[1].ID,
+		},
+
+		// Should be ignored as it is a different job.
+		{
+			Namespace: structs.DefaultNamespace,
+			TaskGroup: tg2.Name,
+			JobID:     "ignore 2",
+			Job:       job,
+			ID:        uuid.Generate(),
+			EvalID:    uuid.Generate(),
+			NodeID:    nodes[1].ID,
+		},
+		{
+			Namespace: structs.DefaultNamespace,
+			TaskGroup: tg2.Name,
+			JobID:     job.ID,
+			Job:       job,
+			ID:        uuid.Generate(),
+			EvalID:    uuid.Generate(),
+			NodeID:    nodes[3].ID,
+		},
+
+		// Should be ignored as it is a different job.
+		{
+			Namespace: structs.DefaultNamespace,
+			TaskGroup: tg1.Name,
+			JobID:     "ignore 2",
+			Job:       job,
+			ID:        uuid.Generate(),
+			EvalID:    uuid.Generate(),
+			NodeID:    nodes[3].ID,
+		},
+		{
+			Namespace: structs.DefaultNamespace,
+			TaskGroup: tg2.Name,
+			JobID:     job.ID,
+			Job:       job,
+			ID:        stoppingAllocID,
+			EvalID:    uuid.Generate(),
+			NodeID:    nodes[4].ID,
+		},
+	}
+	if err := state.UpsertAllocs(1000, upserting); err != nil {
+		t.Fatalf("failed to UpsertAllocs: %v", err)
+	}
+
+	proposed := NewDistinctPropertyIterator(ctx, static)
+	proposed.SetJob(job)
+	proposed.SetTaskGroup(tg2)
+	proposed.Reset()
+
+	out := collectFeasible(proposed)
+	if len(out) != 1 {
+		t.Fatalf("Bad: %#v", out)
+	}
+	if out[0].ID != nodes[4].ID {
+		t.Fatalf("wrong node picked")
+	}
+}
+
+// This test creates allocations across task groups that use a property value to
+// detect if the constraint at the job level properly considers all task groups
+// when the constraint allows a count greater than one
+func TestDistinctPropertyIterator_JobDistinctProperty_Count(t *testing.T) {
+	state, ctx := testContext(t)
+	nodes := []*structs.Node{
+		mock.Node(),
+		mock.Node(),
+		mock.Node(),
+	}
+
+	for i, n := range nodes {
+		n.Meta["rack"] = fmt.Sprintf("%d", i)
+
+		// Add to state store
+		if err := state.UpsertNode(uint64(100+i), n); err != nil {
+			t.Fatalf("failed to upsert node: %v", err)
+		}
+	}
+
+	static := NewStaticIterator(ctx, nodes)
+
+	// Create a job with a distinct_property constraint and a task groups.
+	tg1 := &structs.TaskGroup{Name: "bar"}
+	tg2 := &structs.TaskGroup{Name: "baz"}
+
+	job := &structs.Job{
+		ID:        "foo",
+		Namespace: structs.DefaultNamespace,
+		Constraints: []*structs.Constraint{
+			{
+				Operand: structs.ConstraintDistinctProperty,
+				LTarget: "${meta.rack}",
+				RTarget: "2",
+			},
+		},
+		TaskGroups: []*structs.TaskGroup{tg1, tg2},
+	}
+
+	// Add allocs placing two allocations on both node 1 and 2 and only one on
+	// node 3. This should make the job unsatisfiable on all nodes but node5.
+	// Also mix the allocations existing in the plan and the state store.
+	plan := ctx.Plan()
+	alloc1ID := uuid.Generate()
+	plan.NodeAllocation[nodes[0].ID] = []*structs.Allocation{
+		{
+			Namespace: structs.DefaultNamespace,
+			TaskGroup: tg1.Name,
+			JobID:     job.ID,
+			Job:       job,
+			ID:        alloc1ID,
+			NodeID:    nodes[0].ID,
+		},
+
+		{
+			Namespace: structs.DefaultNamespace,
+			TaskGroup: tg2.Name,
+			JobID:     job.ID,
+			Job:       job,
+			ID:        alloc1ID,
+			NodeID:    nodes[0].ID,
+		},
+
+		// Should be ignored as it is a different job.
+		{
+			Namespace: structs.DefaultNamespace,
+			TaskGroup: tg2.Name,
+			JobID:     "ignore 2",
+			Job:       job,
+			ID:        uuid.Generate(),
+			NodeID:    nodes[0].ID,
+		},
+	}
+	plan.NodeAllocation[nodes[1].ID] = []*structs.Allocation{
+		{
+			Namespace: structs.DefaultNamespace,
+			TaskGroup: tg1.Name,
+			JobID:     job.ID,
+			Job:       job,
+			ID:        uuid.Generate(),
+			NodeID:    nodes[1].ID,
+		},
+
+		{
+			Namespace: structs.DefaultNamespace,
+			TaskGroup: tg2.Name,
+			JobID:     job.ID,
+			Job:       job,
+			ID:        uuid.Generate(),
+			NodeID:    nodes[1].ID,
+		},
+
+		// Should be ignored as it is a different job.
+		{
+			Namespace: structs.DefaultNamespace,
+			TaskGroup: tg1.Name,
+			JobID:     "ignore 2",
+			Job:       job,
+			ID:        uuid.Generate(),
+			NodeID:    nodes[1].ID,
+		},
+	}
+	plan.NodeAllocation[nodes[2].ID] = []*structs.Allocation{
+		{
+			Namespace: structs.DefaultNamespace,
+			TaskGroup: tg1.Name,
+			JobID:     job.ID,
+			Job:       job,
+			ID:        uuid.Generate(),
+			NodeID:    nodes[2].ID,
+		},
+
+		// Should be ignored as it is a different job.
+		{
+			Namespace: structs.DefaultNamespace,
+			TaskGroup: tg1.Name,
+			JobID:     "ignore 2",
+			Job:       job,
+			ID:        uuid.Generate(),
+			NodeID:    nodes[2].ID,
+		},
+	}
+
+	// Put an allocation on Node 3 but make it stopped in the plan
+	stoppingAllocID := uuid.Generate()
+	plan.NodeUpdate[nodes[2].ID] = []*structs.Allocation{
+		{
+			Namespace: structs.DefaultNamespace,
+			TaskGroup: tg2.Name,
+			JobID:     job.ID,
+			Job:       job,
+			ID:        stoppingAllocID,
+			NodeID:    nodes[2].ID,
+		},
+	}
+
+	upserting := []*structs.Allocation{
+		// Have one of the allocations exist in both the plan and the state
+		// store. This resembles an allocation update
+		{
+			Namespace: structs.DefaultNamespace,
+			TaskGroup: tg1.Name,
+			JobID:     job.ID,
+			Job:       job,
+			ID:        alloc1ID,
+			EvalID:    uuid.Generate(),
+			NodeID:    nodes[0].ID,
+		},
+
+		{
+			Namespace: structs.DefaultNamespace,
+			TaskGroup: tg1.Name,
+			JobID:     job.ID,
+			Job:       job,
+			ID:        uuid.Generate(),
+			EvalID:    uuid.Generate(),
+			NodeID:    nodes[1].ID,
+		},
+
+		{
+			Namespace: structs.DefaultNamespace,
+			TaskGroup: tg2.Name,
+			JobID:     job.ID,
+			Job:       job,
+			ID:        uuid.Generate(),
+			EvalID:    uuid.Generate(),
+			NodeID:    nodes[0].ID,
+		},
+
+		// Should be ignored as it is a different job.
+		{
+			Namespace: structs.DefaultNamespace,
+			TaskGroup: tg1.Name,
+			JobID:     "ignore 2",
+			Job:       job,
+			ID:        uuid.Generate(),
+			EvalID:    uuid.Generate(),
+			NodeID:    nodes[1].ID,
+		},
+		{
+			Namespace: structs.DefaultNamespace,
+			TaskGroup: tg2.Name,
+			JobID:     "ignore 2",
+			Job:       job,
+			ID:        uuid.Generate(),
+			EvalID:    uuid.Generate(),
+			NodeID:    nodes[1].ID,
+		},
+	}
+	if err := state.UpsertAllocs(1000, upserting); err != nil {
+		t.Fatalf("failed to UpsertAllocs: %v", err)
+	}
+
+	proposed := NewDistinctPropertyIterator(ctx, static)
+	proposed.SetJob(job)
+	proposed.SetTaskGroup(tg2)
+	proposed.Reset()
+
+	out := collectFeasible(proposed)
+	if len(out) != 1 {
+		t.Fatalf("Bad: %#v", out)
+	}
+	if out[0].ID != nodes[2].ID {
+		t.Fatalf("wrong node picked")
+	}
+}
+
+// This test checks that if a node has an allocation on it that gets stopped,
+// there is a plan to re-use that for a new allocation, that the next select
+// won't select that node.
+func TestDistinctPropertyIterator_JobDistinctProperty_RemoveAndReplace(t *testing.T) {
+	state, ctx := testContext(t)
+	nodes := []*structs.Node{
+		mock.Node(),
+	}
+
+	nodes[0].Meta["rack"] = "1"
+
+	// Add to state store
+	if err := state.UpsertNode(uint64(100), nodes[0]); err != nil {
+		t.Fatalf("failed to upsert node: %v", err)
+	}
+
+	static := NewStaticIterator(ctx, nodes)
+
+	// Create a job with a distinct_property constraint and a task groups.
+	tg1 := &structs.TaskGroup{Name: "bar"}
+	job := &structs.Job{
+		Namespace: structs.DefaultNamespace,
+		ID:        "foo",
+		Constraints: []*structs.Constraint{
+			{
+				Operand: structs.ConstraintDistinctProperty,
+				LTarget: "${meta.rack}",
+			},
+		},
+		TaskGroups: []*structs.TaskGroup{tg1},
+	}
+
+	plan := ctx.Plan()
+	plan.NodeAllocation[nodes[0].ID] = []*structs.Allocation{
+		{
+			Namespace: structs.DefaultNamespace,
+			TaskGroup: tg1.Name,
+			JobID:     job.ID,
+			Job:       job,
+			ID:        uuid.Generate(),
+			NodeID:    nodes[0].ID,
+		},
+	}
+
+	stoppingAllocID := uuid.Generate()
+	plan.NodeUpdate[nodes[0].ID] = []*structs.Allocation{
+		{
+			Namespace: structs.DefaultNamespace,
+			TaskGroup: tg1.Name,
+			JobID:     job.ID,
+			Job:       job,
+			ID:        stoppingAllocID,
+			NodeID:    nodes[0].ID,
+		},
+	}
+
+	upserting := []*structs.Allocation{
+		{
+			Namespace: structs.DefaultNamespace,
+			TaskGroup: tg1.Name,
+			JobID:     job.ID,
+			Job:       job,
+			ID:        stoppingAllocID,
+			EvalID:    uuid.Generate(),
+			NodeID:    nodes[0].ID,
+		},
+	}
+	if err := state.UpsertAllocs(1000, upserting); err != nil {
+		t.Fatalf("failed to UpsertAllocs: %v", err)
+	}
+
+	proposed := NewDistinctPropertyIterator(ctx, static)
+	proposed.SetJob(job)
+	proposed.SetTaskGroup(tg1)
+	proposed.Reset()
+
+	out := collectFeasible(proposed)
+	if len(out) != 0 {
+		t.Fatalf("Bad: %#v", out)
+	}
+}
+
+// This test creates previous allocations selecting certain property values to
+// test if it detects infeasibility of property values correctly and picks the
+// only feasible one
+func TestDistinctPropertyIterator_JobDistinctProperty_Infeasible(t *testing.T) {
+	state, ctx := testContext(t)
+	nodes := []*structs.Node{
+		mock.Node(),
+		mock.Node(),
+	}
+
+	for i, n := range nodes {
+		n.Meta["rack"] = fmt.Sprintf("%d", i)
+
+		// Add to state store
+		if err := state.UpsertNode(uint64(100+i), n); err != nil {
+			t.Fatalf("failed to upsert node: %v", err)
+		}
+	}
+
+	static := NewStaticIterator(ctx, nodes)
+
+	// Create a job with a distinct_property constraint and a task groups.
+	tg1 := &structs.TaskGroup{Name: "bar"}
+	tg2 := &structs.TaskGroup{Name: "baz"}
+	tg3 := &structs.TaskGroup{Name: "bam"}
+
+	job := &structs.Job{
+		Namespace: structs.DefaultNamespace,
+		ID:        "foo",
+		Constraints: []*structs.Constraint{
+			{
+				Operand: structs.ConstraintDistinctProperty,
+				LTarget: "${meta.rack}",
+			},
+		},
+		TaskGroups: []*structs.TaskGroup{tg1, tg2, tg3},
+	}
+
+	// Add allocs placing tg1 on node1 and tg2 on node2. This should make the
+	// job unsatisfiable for tg3.
+	plan := ctx.Plan()
+	plan.NodeAllocation[nodes[0].ID] = []*structs.Allocation{
+		{
+			Namespace: structs.DefaultNamespace,
+			TaskGroup: tg1.Name,
+			JobID:     job.ID,
+			Job:       job,
+			ID:        uuid.Generate(),
+			NodeID:    nodes[0].ID,
+		},
+	}
+	upserting := []*structs.Allocation{
+		{
+			Namespace: structs.DefaultNamespace,
+			TaskGroup: tg2.Name,
+			JobID:     job.ID,
+			Job:       job,
+			ID:        uuid.Generate(),
+			EvalID:    uuid.Generate(),
+			NodeID:    nodes[1].ID,
+		},
+	}
+	if err := state.UpsertAllocs(1000, upserting); err != nil {
+		t.Fatalf("failed to UpsertAllocs: %v", err)
+	}
+
+	proposed := NewDistinctPropertyIterator(ctx, static)
+	proposed.SetJob(job)
+	proposed.SetTaskGroup(tg3)
+	proposed.Reset()
+
+	out := collectFeasible(proposed)
+	if len(out) != 0 {
+		t.Fatalf("Bad: %#v", out)
+	}
+}
+
+// This test creates previous allocations selecting certain property values to
+// test if it detects infeasibility of property values correctly and picks the
+// only feasible one
+func TestDistinctPropertyIterator_JobDistinctProperty_Infeasible_Count(t *testing.T) {
+	state, ctx := testContext(t)
+	nodes := []*structs.Node{
+		mock.Node(),
+		mock.Node(),
+	}
+
+	for i, n := range nodes {
+		n.Meta["rack"] = fmt.Sprintf("%d", i)
+
+		// Add to state store
+		if err := state.UpsertNode(uint64(100+i), n); err != nil {
+			t.Fatalf("failed to upsert node: %v", err)
+		}
+	}
+
+	static := NewStaticIterator(ctx, nodes)
+
+	// Create a job with a distinct_property constraint and a task groups.
+	tg1 := &structs.TaskGroup{Name: "bar"}
+	tg2 := &structs.TaskGroup{Name: "baz"}
+	tg3 := &structs.TaskGroup{Name: "bam"}
+
+	job := &structs.Job{
+		Namespace: structs.DefaultNamespace,
+		ID:        "foo",
+		Constraints: []*structs.Constraint{
+			{
+				Operand: structs.ConstraintDistinctProperty,
+				LTarget: "${meta.rack}",
+				RTarget: "2",
+			},
+		},
+		TaskGroups: []*structs.TaskGroup{tg1, tg2, tg3},
+	}
+
+	// Add allocs placing two tg1's on node1 and two tg2's on node2. This should
+	// make the job unsatisfiable for tg3.
+	plan := ctx.Plan()
+	plan.NodeAllocation[nodes[0].ID] = []*structs.Allocation{
+		{
+			Namespace: structs.DefaultNamespace,
+			TaskGroup: tg1.Name,
+			JobID:     job.ID,
+			Job:       job,
+			ID:        uuid.Generate(),
+			NodeID:    nodes[0].ID,
+		},
+		{
+			Namespace: structs.DefaultNamespace,
+			TaskGroup: tg2.Name,
+			JobID:     job.ID,
+			Job:       job,
+			ID:        uuid.Generate(),
+			NodeID:    nodes[0].ID,
+		},
+	}
+	upserting := []*structs.Allocation{
+		{
+			Namespace: structs.DefaultNamespace,
+			TaskGroup: tg1.Name,
+			JobID:     job.ID,
+			Job:       job,
+			ID:        uuid.Generate(),
+			EvalID:    uuid.Generate(),
+			NodeID:    nodes[1].ID,
+		},
+		{
+			Namespace: structs.DefaultNamespace,
+			TaskGroup: tg2.Name,
+			JobID:     job.ID,
+			Job:       job,
+			ID:        uuid.Generate(),
+			EvalID:    uuid.Generate(),
+			NodeID:    nodes[1].ID,
+		},
+	}
+	if err := state.UpsertAllocs(1000, upserting); err != nil {
+		t.Fatalf("failed to UpsertAllocs: %v", err)
+	}
+
+	proposed := NewDistinctPropertyIterator(ctx, static)
+	proposed.SetJob(job)
+	proposed.SetTaskGroup(tg3)
+	proposed.Reset()
+
+	out := collectFeasible(proposed)
+	if len(out) != 0 {
+		t.Fatalf("Bad: %#v", out)
+	}
+}
+
+// This test creates previous allocations selecting certain property values to
+// test if it detects infeasibility of property values correctly and picks the
+// only feasible one when the constraint is at the task group.
+func TestDistinctPropertyIterator_TaskGroupDistinctProperty(t *testing.T) {
+	state, ctx := testContext(t)
+	nodes := []*structs.Node{
+		mock.Node(),
+		mock.Node(),
+		mock.Node(),
+	}
+
+	for i, n := range nodes {
+		n.Meta["rack"] = fmt.Sprintf("%d", i)
+
+		// Add to state store
+		if err := state.UpsertNode(uint64(100+i), n); err != nil {
+			t.Fatalf("failed to upsert node: %v", err)
+		}
+	}
+
+	static := NewStaticIterator(ctx, nodes)
+
+	// Create a job with a task group with the distinct_property constraint
+	tg1 := &structs.TaskGroup{
+		Name: "example",
+		Constraints: []*structs.Constraint{
+			{
+				Operand: structs.ConstraintDistinctProperty,
+				LTarget: "${meta.rack}",
+			},
+		},
+	}
+	tg2 := &structs.TaskGroup{Name: "baz"}
+
+	job := &structs.Job{
+		Namespace:  structs.DefaultNamespace,
+		ID:         "foo",
+		TaskGroups: []*structs.TaskGroup{tg1, tg2},
+	}
+
+	// Add allocs placing tg1 on node1 and 2. This should make the
+	// job unsatisfiable on all nodes but node3. Also mix the allocations
+	// existing in the plan and the state store.
+	plan := ctx.Plan()
+	plan.NodeAllocation[nodes[0].ID] = []*structs.Allocation{
+		{
+			Namespace: structs.DefaultNamespace,
+			TaskGroup: tg1.Name,
+			JobID:     job.ID,
+			Job:       job,
+			ID:        uuid.Generate(),
+			NodeID:    nodes[0].ID,
+		},
+	}
+
+	// Put an allocation on Node 3 but make it stopped in the plan
+	stoppingAllocID := uuid.Generate()
+	plan.NodeUpdate[nodes[2].ID] = []*structs.Allocation{
+		{
+			Namespace: structs.DefaultNamespace,
+			TaskGroup: tg1.Name,
+			JobID:     job.ID,
+			Job:       job,
+			ID:        stoppingAllocID,
+			NodeID:    nodes[2].ID,
+		},
+	}
+
+	upserting := []*structs.Allocation{
+		{
+			Namespace: structs.DefaultNamespace,
+			TaskGroup: tg1.Name,
+			JobID:     job.ID,
+			Job:       job,
+			ID:        uuid.Generate(),
+			EvalID:    uuid.Generate(),
+			NodeID:    nodes[1].ID,
+		},
+
+		// Should be ignored as it is a different job.
+		{
+			Namespace: structs.DefaultNamespace,
+			TaskGroup: tg1.Name,
+			JobID:     "ignore 2",
+			Job:       job,
+			ID:        uuid.Generate(),
+			EvalID:    uuid.Generate(),
+			NodeID:    nodes[2].ID,
+		},
+
+		{
+			Namespace: structs.DefaultNamespace,
+			TaskGroup: tg1.Name,
+			JobID:     job.ID,
+			Job:       job,
+			ID:        stoppingAllocID,
+			EvalID:    uuid.Generate(),
+			NodeID:    nodes[2].ID,
+		},
+	}
+	if err := state.UpsertAllocs(1000, upserting); err != nil {
+		t.Fatalf("failed to UpsertAllocs: %v", err)
+	}
+
+	proposed := NewDistinctPropertyIterator(ctx, static)
+	proposed.SetJob(job)
+	proposed.SetTaskGroup(tg1)
+	proposed.Reset()
+
+	out := collectFeasible(proposed)
+	if len(out) != 1 {
+		t.Fatalf("Bad: %#v", out)
+	}
+	if out[0].ID != nodes[2].ID {
+		t.Fatalf("wrong node picked")
+	}
+
+	// Since the other task group doesn't have the constraint, both nodes should
+	// be feasible.
+	proposed.SetTaskGroup(tg2)
+	proposed.Reset()
+
+	out = collectFeasible(proposed)
+	if len(out) != 3 {
+		t.Fatalf("Bad: %#v", out)
 	}
 }
 

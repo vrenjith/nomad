@@ -10,9 +10,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/hashicorp/consul/tlsutil"
 	"github.com/hashicorp/net-rpc-msgpackrpc"
-	"github.com/hashicorp/nomad/client/rpcproxy"
+	"github.com/hashicorp/nomad/helper/tlsutil"
 	"github.com/hashicorp/yamux"
 )
 
@@ -130,7 +129,7 @@ type ConnPool struct {
 	limiter map[string]chan struct{}
 
 	// TLS wrapper
-	tlsWrap tlsutil.DCWrapper
+	tlsWrap tlsutil.RegionWrapper
 
 	// Used to indicate the pool is shutdown
 	shutdown   bool
@@ -142,7 +141,7 @@ type ConnPool struct {
 // Set maxTime to 0 to disable reaping. maxStreams is used to control
 // the number of idle streams allowed.
 // If TLS settings are provided outgoing connections use TLS.
-func NewPool(logOutput io.Writer, maxTime time.Duration, maxStreams int, tlsWrap tlsutil.DCWrapper) *ConnPool {
+func NewPool(logOutput io.Writer, maxTime time.Duration, maxStreams int, tlsWrap tlsutil.RegionWrapper) *ConnPool {
 	pool := &ConnPool{
 		logOutput:  logOutput,
 		maxTime:    maxTime,
@@ -180,7 +179,7 @@ func (p *ConnPool) Shutdown() error {
 // pooled or to return a new connection
 func (p *ConnPool) acquire(region string, addr net.Addr, version int) (*Conn, error) {
 	// Check to see if there's a pooled connection available. This is up
-	// here since it should the the vastly more common case than the rest
+	// here since it should the vastly more common case than the rest
 	// of the code here.
 	p.Lock()
 	c := p.pool[addr.String()]
@@ -372,30 +371,6 @@ func (p *ConnPool) RPC(region string, addr net.Addr, version int, method string,
 	conn.returnClient(sc)
 	p.releaseConn(conn)
 	return nil
-}
-
-// PingNomadServer sends a Status.Ping message to the specified server and
-// returns true if healthy, false if an error occurred
-func (p *ConnPool) PingNomadServer(region string, apiMajorVersion int, s *rpcproxy.ServerEndpoint) (bool, error) {
-	// Get a usable client
-	conn, sc, err := p.getClient(region, s.Addr, apiMajorVersion)
-	if err != nil {
-		return false, err
-	}
-
-	// Make the RPC call
-	var out struct{}
-	err = msgpackrpc.CallWithCodec(sc.codec, "Status.Ping", struct{}{}, &out)
-	if err != nil {
-		sc.Close()
-		p.releaseConn(conn)
-		return false, err
-	}
-
-	// Done with the connection
-	conn.returnClient(sc)
-	p.releaseConn(conn)
-	return true, nil
 }
 
 // Reap is used to close conns open over maxTime

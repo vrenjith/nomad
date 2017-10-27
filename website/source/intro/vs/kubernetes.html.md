@@ -8,9 +8,8 @@ description: |-
 
 # Nomad vs. Kubernetes
 
-Kubernetes is an orchestration system for Docker developed by the Cloud Native
-Computing Foundation (CNCF). Kubernetes aims to provide all the features
-needed to run Docker based applications including cluster management,
+Kubernetes is an orchestration system for containers originally designed by Google, now governed by the Cloud Native
+Computing Foundation (CNCF) and developed by Google, Red Hat, CoreOS and many others. Kubernetes aims to provide all the features needed to run Docker or Rkt-based applications including cluster management,
 scheduling, service discovery, monitoring, secrets management and more.
 
 Nomad only aims to provide cluster management and scheduling and is designed
@@ -35,7 +34,7 @@ Nomad combines a lightweight resource manager and a sophisticated scheduler
 into a single system. By default, Nomad is distributed, highly available,
 and operationally simple.
 
-Kubernetes documentation states they can support clusters greater than 1,000 nodes
+Kubernetes documentation states they can support clusters greater than 5,000 nodes
 and they support a multi-AZ/multi-region configuration. Nomad has been tested
 on clusters up to 5,000 nodes, but is expected to work on much larger clusters as
 well. Nomad also supports multi-datacenter and multi-region configurations.

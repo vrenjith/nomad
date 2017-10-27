@@ -1,19 +1,23 @@
 package command
 
 import (
+	"fmt"
 	"io/ioutil"
 	"os"
 	"strings"
 	"testing"
 
+	"github.com/hashicorp/nomad/testutil"
 	"github.com/mitchellh/cli"
 )
 
 func TestRunCommand_Implements(t *testing.T) {
+	t.Parallel()
 	var _ cli.Command = &RunCommand{}
 }
 
 func TestRunCommand_Output_Json(t *testing.T) {
+	t.Parallel()
 	ui := new(cli.MockUi)
 	cmd := &RunCommand{Meta: Meta{Ui: ui}}
 
@@ -32,7 +36,6 @@ job "job1" {
 			driver = "exec"
 			resources = {
 				cpu = 1000
-				disk = 150
 				memory = 512
 			}
 		}
@@ -44,14 +47,20 @@ job "job1" {
 	if code := cmd.Run([]string{"-output", fh.Name()}); code != 0 {
 		t.Fatalf("expected exit code 0, got: %d", code)
 	}
-	if out := ui.OutputWriter.String(); !strings.Contains(out, `"Region": "global",`) {
+	if out := ui.OutputWriter.String(); !strings.Contains(out, `"Type": "service",`) {
 		t.Fatalf("Expected JSON output: %v", out)
 	}
 }
 
 func TestRunCommand_Fails(t *testing.T) {
+	t.Parallel()
 	ui := new(cli.MockUi)
 	cmd := &RunCommand{Meta: Meta{Ui: ui}}
+
+	// Create a server
+	s := testutil.NewTestServer(t, nil)
+	defer s.Stop()
+	os.Setenv("NOMAD_ADDR", fmt.Sprintf("http://%s", s.HTTPAddr))
 
 	// Fails on misuse
 	if code := cmd.Run([]string{"some", "bad", "args"}); code != 1 {
@@ -66,8 +75,8 @@ func TestRunCommand_Fails(t *testing.T) {
 	if code := cmd.Run([]string{"/unicorns/leprechauns"}); code != 1 {
 		t.Fatalf("expect exit 1, got: %d", code)
 	}
-	if out := ui.ErrorWriter.String(); !strings.Contains(out, "Error opening") {
-		t.Fatalf("expect parsing error, got: %s", out)
+	if out := ui.ErrorWriter.String(); !strings.Contains(out, "Error getting job struct") {
+		t.Fatalf("expect getting job struct error, got: %s", out)
 	}
 	ui.ErrorWriter.Reset()
 
@@ -83,8 +92,8 @@ func TestRunCommand_Fails(t *testing.T) {
 	if code := cmd.Run([]string{fh1.Name()}); code != 1 {
 		t.Fatalf("expect exit 1, got: %d", code)
 	}
-	if out := ui.ErrorWriter.String(); !strings.Contains(out, "Error parsing") {
-		t.Fatalf("expect parsing error, got: %s", err)
+	if out := ui.ErrorWriter.String(); !strings.Contains(out, "Error getting job struct") {
+		t.Fatalf("expect parsing error, got: %s", out)
 	}
 	ui.ErrorWriter.Reset()
 
@@ -100,7 +109,7 @@ func TestRunCommand_Fails(t *testing.T) {
 	if code := cmd.Run([]string{fh2.Name()}); code != 1 {
 		t.Fatalf("expect exit 1, got: %d", code)
 	}
-	if out := ui.ErrorWriter.String(); !strings.Contains(out, "Error validating") {
+	if out := ui.ErrorWriter.String(); !strings.Contains(out, "Error submitting job") {
 		t.Fatalf("expect validation error, got: %s", out)
 	}
 	ui.ErrorWriter.Reset()
@@ -121,7 +130,6 @@ job "job1" {
 			driver = "exec"
 			resources = {
 				cpu = 1000
-				disk = 150
 				memory = 512
 			}
 		}
@@ -149,6 +157,7 @@ job "job1" {
 }
 
 func TestRunCommand_From_STDIN(t *testing.T) {
+	t.Parallel()
 	stdinR, stdinW, err := os.Pipe()
 	if err != nil {
 		t.Fatalf("err: %s", err)
@@ -157,7 +166,7 @@ func TestRunCommand_From_STDIN(t *testing.T) {
 	ui := new(cli.MockUi)
 	cmd := &RunCommand{
 		Meta:      Meta{Ui: ui},
-		testStdin: stdinR,
+		JobGetter: JobGetter{testStdin: stdinR},
 	}
 
 	go func() {
@@ -171,7 +180,6 @@ job "job1" {
 			driver = "exec"
 			resources = {
 				cpu = 1000
-				disk = 150
 				memory = 512
 			}
 		}
@@ -180,13 +188,30 @@ job "job1" {
 		stdinW.Close()
 	}()
 
-	args := []string{"-"}
+	args := []string{"-address=nope", "-"}
 	if code := cmd.Run(args); code != 1 {
 		t.Fatalf("expected exit code 1, got %d: %q", code, ui.ErrorWriter.String())
 	}
 
-	if out := ui.ErrorWriter.String(); !strings.Contains(out, "connection refused") {
-		t.Fatalf("expected runtime error, got: %s", out)
+	if out := ui.ErrorWriter.String(); !strings.Contains(out, "Error submitting job") {
+		t.Fatalf("expected submission error, got: %s", out)
 	}
 	ui.ErrorWriter.Reset()
+}
+
+func TestRunCommand_From_URL(t *testing.T) {
+	t.Parallel()
+	ui := new(cli.MockUi)
+	cmd := &RunCommand{
+		Meta: Meta{Ui: ui},
+	}
+
+	args := []string{"https://example.com/foo/bar"}
+	if code := cmd.Run(args); code != 1 {
+		t.Fatalf("expected exit code 1, got %d: %q", code, ui.ErrorWriter.String())
+	}
+
+	if out := ui.ErrorWriter.String(); !strings.Contains(out, "Error getting jobfile") {
+		t.Fatalf("expected error getting jobfile, got: %s", out)
+	}
 }

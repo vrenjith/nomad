@@ -11,11 +11,11 @@ const (
 	// serviceJobAntiAffinityPenalty is the penalty applied
 	// to the score for placing an alloc on a node that
 	// already has an alloc for this job.
-	serviceJobAntiAffinityPenalty = 10.0
+	serviceJobAntiAffinityPenalty = 20.0
 
 	// batchJobAntiAffinityPenalty is the same as the
 	// serviceJobAntiAffinityPenalty but for batch type jobs.
-	batchJobAntiAffinityPenalty = 5.0
+	batchJobAntiAffinityPenalty = 10.0
 )
 
 // Stack is a chained collection of iterators. The stack is used to
@@ -40,15 +40,17 @@ type GenericStack struct {
 	source *StaticIterator
 
 	wrappedChecks       *FeasibilityWrapper
+	quota               FeasibleIterator
 	jobConstraint       *ConstraintChecker
 	taskGroupDrivers    *DriverChecker
 	taskGroupConstraint *ConstraintChecker
 
-	proposedAllocConstraint *ProposedAllocConstraintIterator
-	binPack                 *BinPackIterator
-	jobAntiAff              *JobAntiAffinityIterator
-	limit                   *LimitIterator
-	maxScore                *MaxScoreIterator
+	distinctHostsConstraint    *DistinctHostsIterator
+	distinctPropertyConstraint *DistinctPropertyIterator
+	binPack                    *BinPackIterator
+	jobAntiAff                 *JobAntiAffinityIterator
+	limit                      *LimitIterator
+	maxScore                   *MaxScoreIterator
 }
 
 // NewGenericStack constructs a stack used for selecting service placements
@@ -63,6 +65,10 @@ func NewGenericStack(batch bool, ctx Context) *GenericStack {
 	// to reduce collisions between schedulers and to do a basic load
 	// balancing across eligible nodes.
 	s.source = NewRandomIterator(ctx, nil)
+
+	// Create the quota iterator to determine if placements would result in the
+	// quota attached to the namespace of the job to go over.
+	s.quota = NewQuotaIterator(ctx, s.source)
 
 	// Attach the job constraints. The job is filled in later.
 	s.jobConstraint = NewConstraintChecker(ctx, nil)
@@ -79,13 +85,16 @@ func NewGenericStack(batch bool, ctx Context) *GenericStack {
 	// checks that only needs to examine the single node to determine feasibility.
 	jobs := []FeasibilityChecker{s.jobConstraint}
 	tgs := []FeasibilityChecker{s.taskGroupDrivers, s.taskGroupConstraint}
-	s.wrappedChecks = NewFeasibilityWrapper(ctx, s.source, jobs, tgs)
+	s.wrappedChecks = NewFeasibilityWrapper(ctx, s.quota, jobs, tgs)
 
-	// Filter on constraints that are affected by propsed allocations.
-	s.proposedAllocConstraint = NewProposedAllocConstraintIterator(ctx, s.wrappedChecks)
+	// Filter on distinct host constraints.
+	s.distinctHostsConstraint = NewDistinctHostsIterator(ctx, s.wrappedChecks)
+
+	// Filter on distinct property constraints.
+	s.distinctPropertyConstraint = NewDistinctPropertyIterator(ctx, s.distinctHostsConstraint)
 
 	// Upgrade from feasible to rank iterator
-	rankSource := NewFeasibleRankIterator(ctx, s.proposedAllocConstraint)
+	rankSource := NewFeasibleRankIterator(ctx, s.distinctPropertyConstraint)
 
 	// Apply the bin packing, this depends on the resources needed
 	// by a particular task group. Only enable eviction for the service
@@ -134,10 +143,15 @@ func (s *GenericStack) SetNodes(baseNodes []*structs.Node) {
 
 func (s *GenericStack) SetJob(job *structs.Job) {
 	s.jobConstraint.SetConstraints(job.Constraints)
-	s.proposedAllocConstraint.SetJob(job)
+	s.distinctHostsConstraint.SetJob(job)
+	s.distinctPropertyConstraint.SetJob(job)
 	s.binPack.SetPriority(job.Priority)
 	s.jobAntiAff.SetJob(job.ID)
 	s.ctx.Eligibility().SetJob(job)
+
+	if contextual, ok := s.quota.(ContextualIterator); ok {
+		contextual.SetJob(job)
+	}
 }
 
 func (s *GenericStack) Select(tg *structs.TaskGroup) (*RankedNode, *structs.Resources) {
@@ -152,9 +166,14 @@ func (s *GenericStack) Select(tg *structs.TaskGroup) (*RankedNode, *structs.Reso
 	// Update the parameters of iterators
 	s.taskGroupDrivers.SetDrivers(tgConstr.drivers)
 	s.taskGroupConstraint.SetConstraints(tgConstr.constraints)
-	s.proposedAllocConstraint.SetTaskGroup(tg)
+	s.distinctHostsConstraint.SetTaskGroup(tg)
+	s.distinctPropertyConstraint.SetTaskGroup(tg)
 	s.wrappedChecks.SetTaskGroup(tg.Name)
-	s.binPack.SetTasks(tg.Tasks)
+	s.binPack.SetTaskGroup(tg)
+
+	if contextual, ok := s.quota.(ContextualIterator); ok {
+		contextual.SetTaskGroup(tg)
+	}
 
 	// Find the node with the max score
 	option := s.maxScore.Next()
@@ -171,16 +190,31 @@ func (s *GenericStack) Select(tg *structs.TaskGroup) (*RankedNode, *structs.Reso
 	return option, tgConstr.size
 }
 
+// SelectPreferredNode returns a node where an allocation of the task group can
+// be placed, the node passed to it is preferred over the other available nodes
+func (s *GenericStack) SelectPreferringNodes(tg *structs.TaskGroup, nodes []*structs.Node) (*RankedNode, *structs.Resources) {
+	originalNodes := s.source.nodes
+	s.source.SetNodes(nodes)
+	if option, resources := s.Select(tg); option != nil {
+		s.source.SetNodes(originalNodes)
+		return option, resources
+	}
+	s.source.SetNodes(originalNodes)
+	return s.Select(tg)
+}
+
 // SystemStack is the Stack used for the System scheduler. It is designed to
 // attempt to make placements on all nodes.
 type SystemStack struct {
-	ctx                 Context
-	source              *StaticIterator
-	wrappedChecks       *FeasibilityWrapper
-	jobConstraint       *ConstraintChecker
-	taskGroupDrivers    *DriverChecker
-	taskGroupConstraint *ConstraintChecker
-	binPack             *BinPackIterator
+	ctx                        Context
+	source                     *StaticIterator
+	wrappedChecks              *FeasibilityWrapper
+	quota                      FeasibleIterator
+	jobConstraint              *ConstraintChecker
+	taskGroupDrivers           *DriverChecker
+	taskGroupConstraint        *ConstraintChecker
+	distinctPropertyConstraint *DistinctPropertyIterator
+	binPack                    *BinPackIterator
 }
 
 // NewSystemStack constructs a stack used for selecting service placements
@@ -191,6 +225,10 @@ func NewSystemStack(ctx Context) *SystemStack {
 	// Create the source iterator. We visit nodes in a linear order because we
 	// have to evaluate on all nodes.
 	s.source = NewStaticIterator(ctx, nil)
+
+	// Create the quota iterator to determine if placements would result in the
+	// quota attached to the namespace of the job to go over.
+	s.quota = NewQuotaIterator(ctx, s.source)
 
 	// Attach the job constraints. The job is filled in later.
 	s.jobConstraint = NewConstraintChecker(ctx, nil)
@@ -207,10 +245,13 @@ func NewSystemStack(ctx Context) *SystemStack {
 	// checks that only needs to examine the single node to determine feasibility.
 	jobs := []FeasibilityChecker{s.jobConstraint}
 	tgs := []FeasibilityChecker{s.taskGroupDrivers, s.taskGroupConstraint}
-	s.wrappedChecks = NewFeasibilityWrapper(ctx, s.source, jobs, tgs)
+	s.wrappedChecks = NewFeasibilityWrapper(ctx, s.quota, jobs, tgs)
+
+	// Filter on distinct property constraints.
+	s.distinctPropertyConstraint = NewDistinctPropertyIterator(ctx, s.wrappedChecks)
 
 	// Upgrade from feasible to rank iterator
-	rankSource := NewFeasibleRankIterator(ctx, s.wrappedChecks)
+	rankSource := NewFeasibleRankIterator(ctx, s.distinctPropertyConstraint)
 
 	// Apply the bin packing, this depends on the resources needed
 	// by a particular task group. Enable eviction as system jobs are high
@@ -226,8 +267,13 @@ func (s *SystemStack) SetNodes(baseNodes []*structs.Node) {
 
 func (s *SystemStack) SetJob(job *structs.Job) {
 	s.jobConstraint.SetConstraints(job.Constraints)
+	s.distinctPropertyConstraint.SetJob(job)
 	s.binPack.SetPriority(job.Priority)
 	s.ctx.Eligibility().SetJob(job)
+
+	if contextual, ok := s.quota.(ContextualIterator); ok {
+		contextual.SetJob(job)
+	}
 }
 
 func (s *SystemStack) Select(tg *structs.TaskGroup) (*RankedNode, *structs.Resources) {
@@ -242,8 +288,13 @@ func (s *SystemStack) Select(tg *structs.TaskGroup) (*RankedNode, *structs.Resou
 	// Update the parameters of iterators
 	s.taskGroupDrivers.SetDrivers(tgConstr.drivers)
 	s.taskGroupConstraint.SetConstraints(tgConstr.constraints)
-	s.binPack.SetTasks(tg.Tasks)
 	s.wrappedChecks.SetTaskGroup(tg.Name)
+	s.distinctPropertyConstraint.SetTaskGroup(tg)
+	s.binPack.SetTaskGroup(tg)
+
+	if contextual, ok := s.quota.(ContextualIterator); ok {
+		contextual.SetTaskGroup(tg)
+	}
 
 	// Get the next option that satisfies the constraints.
 	option := s.binPack.Next()

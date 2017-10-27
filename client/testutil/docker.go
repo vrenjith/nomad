@@ -1,12 +1,20 @@
 package testutil
 
 import (
-	docker "github.com/fsouza/go-dockerclient"
+	"runtime"
 	"testing"
+
+	docker "github.com/fsouza/go-dockerclient"
+	"github.com/hashicorp/nomad/testutil"
 )
 
 // DockerIsConnected checks to see if a docker daemon is available (local or remote)
 func DockerIsConnected(t *testing.T) bool {
+	// We have docker on travis so we should try to test
+	if testutil.IsTravis() && runtime.GOOS == "linux" {
+		return true
+	}
+
 	client, err := docker.NewClientFromEnv()
 	if err != nil {
 		return false

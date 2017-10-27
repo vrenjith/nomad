@@ -15,15 +15,21 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/armon/go-metrics"
+	metrics "github.com/armon/go-metrics"
+	"github.com/armon/go-metrics/circonus"
+	"github.com/armon/go-metrics/datadog"
+	"github.com/armon/go-metrics/prometheus"
 	"github.com/hashicorp/consul/lib"
-	"github.com/hashicorp/go-checkpoint"
-	"github.com/hashicorp/go-syslog"
+	checkpoint "github.com/hashicorp/go-checkpoint"
+	gsyslog "github.com/hashicorp/go-syslog"
 	"github.com/hashicorp/logutils"
-	"github.com/hashicorp/nomad/helper/flag-slice"
+	"github.com/hashicorp/nomad/helper/flag-helpers"
 	"github.com/hashicorp/nomad/helper/gated-writer"
+	"github.com/hashicorp/nomad/nomad/structs/config"
+	"github.com/hashicorp/nomad/version"
 	"github.com/hashicorp/scada-client/scada"
 	"github.com/mitchellh/cli"
+	"github.com/posener/complete"
 )
 
 // gracefulTimeout controls how long we wait before forcefully terminating
@@ -34,11 +40,9 @@ const gracefulTimeout = 5 * time.Second
 // ShutdownCh. If two messages are sent on the ShutdownCh it will forcibly
 // exit.
 type Command struct {
-	Revision          string
-	Version           string
-	VersionPrerelease string
-	Ui                cli.Ui
-	ShutdownCh        <-chan struct{}
+	Version    *version.VersionInfo
+	Ui         cli.Ui
+	ShutdownCh <-chan struct{}
 
 	args           []string
 	agent          *Agent
@@ -61,8 +65,11 @@ func (c *Command) readConfig() *Config {
 	cmdConfig := &Config{
 		Atlas:  &AtlasConfig{},
 		Client: &ClientConfig{},
+		Consul: &config.ConsulConfig{},
 		Ports:  &Ports{},
 		Server: &ServerConfig{},
+		Vault:  &config.VaultConfig{},
+		ACL:    &ACLConfig{},
 	}
 
 	flags := flag.NewFlagSet("agent", flag.ContinueOnError)
@@ -76,22 +83,23 @@ func (c *Command) readConfig() *Config {
 	// Server-only options
 	flags.IntVar(&cmdConfig.Server.BootstrapExpect, "bootstrap-expect", 0, "")
 	flags.BoolVar(&cmdConfig.Server.RejoinAfterLeave, "rejoin", false, "")
-	flags.Var((*sliceflag.StringFlag)(&cmdConfig.Server.StartJoin), "join", "")
-	flags.Var((*sliceflag.StringFlag)(&cmdConfig.Server.RetryJoin), "retry-join", "")
+	flags.Var((*flaghelper.StringFlag)(&cmdConfig.Server.StartJoin), "join", "")
+	flags.Var((*flaghelper.StringFlag)(&cmdConfig.Server.RetryJoin), "retry-join", "")
 	flags.IntVar(&cmdConfig.Server.RetryMaxAttempts, "retry-max", 0, "")
 	flags.StringVar(&cmdConfig.Server.RetryInterval, "retry-interval", "", "")
+	flags.StringVar(&cmdConfig.Server.EncryptKey, "encrypt", "", "gossip encryption key")
 
 	// Client-only options
 	flags.StringVar(&cmdConfig.Client.StateDir, "state-dir", "", "")
 	flags.StringVar(&cmdConfig.Client.AllocDir, "alloc-dir", "", "")
 	flags.StringVar(&cmdConfig.Client.NodeClass, "node-class", "", "")
 	flags.StringVar(&servers, "servers", "", "")
-	flags.Var((*sliceflag.StringFlag)(&meta), "meta", "")
+	flags.Var((*flaghelper.StringFlag)(&meta), "meta", "")
 	flags.StringVar(&cmdConfig.Client.NetworkInterface, "network-interface", "", "")
 	flags.IntVar(&cmdConfig.Client.NetworkSpeed, "network-speed", 0, "")
 
 	// General options
-	flags.Var((*sliceflag.StringFlag)(&configPath), "config", "config")
+	flags.Var((*flaghelper.StringFlag)(&configPath), "config", "config")
 	flags.StringVar(&cmdConfig.BindAddr, "bind", "", "")
 	flags.StringVar(&cmdConfig.Region, "region", "", "")
 	flags.StringVar(&cmdConfig.DataDir, "data-dir", "", "")
@@ -103,6 +111,65 @@ func (c *Command) readConfig() *Config {
 	flags.StringVar(&cmdConfig.Atlas.Infrastructure, "atlas", "", "")
 	flags.BoolVar(&cmdConfig.Atlas.Join, "atlas-join", false, "")
 	flags.StringVar(&cmdConfig.Atlas.Token, "atlas-token", "", "")
+
+	// Consul options
+	flags.StringVar(&cmdConfig.Consul.Auth, "consul-auth", "", "")
+	flags.Var((flaghelper.FuncBoolVar)(func(b bool) error {
+		cmdConfig.Consul.AutoAdvertise = &b
+		return nil
+	}), "consul-auto-advertise", "")
+	flags.StringVar(&cmdConfig.Consul.CAFile, "consul-ca-file", "", "")
+	flags.StringVar(&cmdConfig.Consul.CertFile, "consul-cert-file", "", "")
+	flags.Var((flaghelper.FuncBoolVar)(func(b bool) error {
+		cmdConfig.Consul.ChecksUseAdvertise = &b
+		return nil
+	}), "consul-checks-use-advertise", "")
+	flags.Var((flaghelper.FuncBoolVar)(func(b bool) error {
+		cmdConfig.Consul.ClientAutoJoin = &b
+		return nil
+	}), "consul-client-auto-join", "")
+	flags.StringVar(&cmdConfig.Consul.ClientServiceName, "consul-client-service-name", "", "")
+	flags.StringVar(&cmdConfig.Consul.KeyFile, "consul-key-file", "", "")
+	flags.StringVar(&cmdConfig.Consul.ServerServiceName, "consul-server-service-name", "", "")
+	flags.Var((flaghelper.FuncBoolVar)(func(b bool) error {
+		cmdConfig.Consul.ServerAutoJoin = &b
+		return nil
+	}), "consul-server-auto-join", "")
+	flags.Var((flaghelper.FuncBoolVar)(func(b bool) error {
+		cmdConfig.Consul.EnableSSL = &b
+		return nil
+	}), "consul-ssl", "")
+	flags.StringVar(&cmdConfig.Consul.Token, "consul-token", "", "")
+	flags.Var((flaghelper.FuncBoolVar)(func(b bool) error {
+		cmdConfig.Consul.VerifySSL = &b
+		return nil
+	}), "consul-verify-ssl", "")
+
+	// Vault options
+	flags.Var((flaghelper.FuncBoolVar)(func(b bool) error {
+		cmdConfig.Vault.Enabled = &b
+		return nil
+	}), "vault-enabled", "")
+	flags.Var((flaghelper.FuncBoolVar)(func(b bool) error {
+		cmdConfig.Vault.AllowUnauthenticated = &b
+		return nil
+	}), "vault-allow-unauthenticated", "")
+	flags.StringVar(&cmdConfig.Vault.Token, "vault-token", "", "")
+	flags.StringVar(&cmdConfig.Vault.Addr, "vault-address", "", "")
+	flags.StringVar(&cmdConfig.Vault.Role, "vault-create-from-role", "", "")
+	flags.StringVar(&cmdConfig.Vault.TLSCaFile, "vault-ca-file", "", "")
+	flags.StringVar(&cmdConfig.Vault.TLSCaPath, "vault-ca-path", "", "")
+	flags.StringVar(&cmdConfig.Vault.TLSCertFile, "vault-cert-file", "", "")
+	flags.StringVar(&cmdConfig.Vault.TLSKeyFile, "vault-key-file", "", "")
+	flags.Var((flaghelper.FuncBoolVar)(func(b bool) error {
+		cmdConfig.Vault.TLSSkipVerify = &b
+		return nil
+	}), "vault-tls-skip-verify", "")
+	flags.StringVar(&cmdConfig.Vault.TLSServerName, "vault-tls-server-name", "", "")
+
+	// ACL options
+	flags.BoolVar(&cmdConfig.ACL.Enabled, "acl-enabled", false, "")
+	flags.StringVar(&cmdConfig.ACL.ReplicationToken, "acl-replication-token", "", "")
 
 	if err := flags.Parse(c.args); err != nil {
 		return nil
@@ -171,13 +238,35 @@ func (c *Command) readConfig() *Config {
 	config = config.Merge(cmdConfig)
 
 	// Set the version info
-	config.Revision = c.Revision
 	config.Version = c.Version
-	config.VersionPrerelease = c.VersionPrerelease
+
+	// Normalize binds, ports, addresses, and advertise
+	if err := config.normalizeAddrs(); err != nil {
+		c.Ui.Error(err.Error())
+		return nil
+	}
+
+	// Check to see if we should read the Vault token from the environment
+	if config.Vault.Token == "" {
+		if token, ok := os.LookupEnv("VAULT_TOKEN"); ok {
+			config.Vault.Token = token
+		}
+	}
 
 	if dev {
 		// Skip validation for dev mode
 		return config
+	}
+
+	if config.Server.EncryptKey != "" {
+		if _, err := config.Server.EncryptBytes(); err != nil {
+			c.Ui.Error(fmt.Sprintf("Invalid encryption key: %s", err))
+			return nil
+		}
+		keyfile := filepath.Join(config.DataDir, serfKeyring)
+		if _, err := os.Stat(keyfile); err == nil {
+			c.Ui.Warn("WARNING: keyring exists but -encrypt given, using keyring")
+		}
 	}
 
 	// Parse the RetryInterval.
@@ -282,9 +371,9 @@ func (c *Command) setupLoggers(config *Config) (*gatedwriter.Writer, *logWriter,
 }
 
 // setupAgent is used to start the agent and various interfaces
-func (c *Command) setupAgent(config *Config, logOutput io.Writer) error {
+func (c *Command) setupAgent(config *Config, logOutput io.Writer, inmem *metrics.InmemSink) error {
 	c.Ui.Output("Starting Nomad agent...")
-	agent, err := NewAgent(config, logOutput)
+	agent, err := NewAgent(config, logOutput, inmem)
 	if err != nil {
 		c.Ui.Error(fmt.Sprintf("Error starting agent: %s", err))
 		return err
@@ -299,7 +388,7 @@ func (c *Command) setupAgent(config *Config, logOutput io.Writer) error {
 	}
 
 	// Setup the HTTP server
-	http, err := NewHTTPServer(agent, config, logOutput)
+	http, err := NewHTTPServer(agent, config)
 	if err != nil {
 		agent.Shutdown()
 		c.Ui.Error(fmt.Sprintf("Error starting http server: %s", err))
@@ -309,9 +398,9 @@ func (c *Command) setupAgent(config *Config, logOutput io.Writer) error {
 
 	// Setup update checking
 	if !config.DisableUpdateCheck {
-		version := config.Version
-		if config.VersionPrerelease != "" {
-			version += fmt.Sprintf("-%s", config.VersionPrerelease)
+		version := config.Version.Version
+		if config.Version.VersionPrerelease != "" {
+			version += fmt.Sprintf("-%s", config.Version.VersionPrerelease)
 		}
 		updateParams := &checkpoint.CheckParams{
 			Product: "nomad",
@@ -340,12 +429,7 @@ func (c *Command) checkpointResults(results *checkpoint.CheckResponse, err error
 		return
 	}
 	if results.Outdated {
-		versionStr := c.Version
-		if c.VersionPrerelease != "" {
-			versionStr += fmt.Sprintf("-%s", c.VersionPrerelease)
-		}
-
-		c.Ui.Error(fmt.Sprintf("Newer Nomad version available: %s (currently running: %s)", results.CurrentVersion, versionStr))
+		c.Ui.Error(fmt.Sprintf("Newer Nomad version available: %s (currently running: %s)", results.CurrentVersion, c.Version.VersionNumber()))
 	}
 	for _, alert := range results.Alerts {
 		switch alert.Level {
@@ -355,6 +439,20 @@ func (c *Command) checkpointResults(results *checkpoint.CheckResponse, err error
 			c.Ui.Error(fmt.Sprintf("Bulletin [%s]: %s (%s)", alert.Level, alert.Message, alert.URL))
 		}
 	}
+}
+
+func (c *Command) AutocompleteFlags() complete.Flags {
+	configFilePredictor := complete.PredictOr(
+		complete.PredictFiles("*.json"),
+		complete.PredictFiles("*.hcl"))
+
+	return map[string]complete.Predictor{
+		"-config": configFilePredictor,
+	}
+}
+
+func (c *Command) AutocompleteArgs() complete.Predictor {
+	return nil
 }
 
 func (c *Command) Run(args []string) int {
@@ -386,13 +484,15 @@ func (c *Command) Run(args []string) int {
 	}
 
 	// Initialize the telemetry
-	if err := c.setupTelementry(config); err != nil {
+	inmem, err := c.setupTelemetry(config)
+	if err != nil {
 		c.Ui.Error(fmt.Sprintf("Error initializing telemetry: %s", err))
 		return 1
 	}
 
 	// Create the agent
-	if err := c.setupAgent(config, logOutput); err != nil {
+	if err := c.setupAgent(config, logOutput, inmem); err != nil {
+		logGate.Flush()
 		return 1
 	}
 	defer c.agent.Shutdown()
@@ -418,16 +518,11 @@ func (c *Command) Run(args []string) int {
 
 	// Compile agent information for output later
 	info := make(map[string]string)
+	info["version"] = config.Version.VersionNumber()
 	info["client"] = strconv.FormatBool(config.Client.Enabled)
 	info["log level"] = config.LogLevel
 	info["server"] = strconv.FormatBool(config.Server.Enabled)
 	info["region"] = fmt.Sprintf("%s (DC: %s)", config.Region, config.Datacenter)
-	if config.Atlas != nil && config.Atlas.Infrastructure != "" {
-		info["atlas"] = fmt.Sprintf("(Infrastructure: '%s' Join: %v)",
-			config.Atlas.Infrastructure, config.Atlas.Join)
-	} else {
-		info["atlas"] = "<disabled>"
-	}
 
 	// Sort the keys for output
 	infoKeys := make([]string, 0, len(info))
@@ -465,7 +560,7 @@ func (c *Command) Run(args []string) int {
 // handleSignals blocks until we get an exit-causing signal
 func (c *Command) handleSignals(config *Config) int {
 	signalCh := make(chan os.Signal, 4)
-	signal.Notify(signalCh, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	signal.Notify(signalCh, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGPIPE)
 
 	// Wait for a signal
 WAIT:
@@ -480,10 +575,15 @@ WAIT:
 	}
 	c.Ui.Output(fmt.Sprintf("Caught signal: %v", sig))
 
+	// Skip any SIGPIPE signal (See issue #1798)
+	if sig == syscall.SIGPIPE {
+		goto WAIT
+	}
+
 	// Check if this is a SIGHUP
 	if sig == syscall.SIGHUP {
 		if conf := c.handleReload(config); conf != nil {
-			config = conf
+			*config = *conf
 		}
 		goto WAIT
 	}
@@ -544,11 +644,23 @@ func (c *Command) handleReload(config *Config) *Config {
 		// Keep the current log level
 		newConf.LogLevel = config.LogLevel
 	}
+
+	if s := c.agent.Server(); s != nil {
+		sconf, err := convertServerConfig(newConf, c.logOutput)
+		if err != nil {
+			c.agent.logger.Printf("[ERR] agent: failed to convert server config: %v", err)
+		} else {
+			if err := s.Reload(sconf); err != nil {
+				c.agent.logger.Printf("[ERR] agent: reloading server config failed: %v", err)
+			}
+		}
+	}
+
 	return newConf
 }
 
-// setupTelementry is used ot setup the telemetry sub-systems
-func (c *Command) setupTelementry(config *Config) error {
+// setupTelemetry is used ot setup the telemetry sub-systems
+func (c *Command) setupTelemetry(config *Config) (*metrics.InmemSink, error) {
 	/* Setup telemetry
 	Aggregate on 10 second intervals for 1 minute. Expose the
 	metrics over stderr when there is a SIGUSR1 received.
@@ -565,13 +677,17 @@ func (c *Command) setupTelementry(config *Config) error {
 
 	metricsConf := metrics.DefaultConfig("nomad")
 	metricsConf.EnableHostname = !telConfig.DisableHostname
+	if telConfig.UseNodeName {
+		metricsConf.HostName = config.NodeName
+		metricsConf.EnableHostname = true
+	}
 
 	// Configure the statsite sink
 	var fanout metrics.FanoutSink
 	if telConfig.StatsiteAddr != "" {
 		sink, err := metrics.NewStatsiteSink(telConfig.StatsiteAddr)
 		if err != nil {
-			return err
+			return inm, err
 		}
 		fanout = append(fanout, sink)
 	}
@@ -580,8 +696,63 @@ func (c *Command) setupTelementry(config *Config) error {
 	if telConfig.StatsdAddr != "" {
 		sink, err := metrics.NewStatsdSink(telConfig.StatsdAddr)
 		if err != nil {
-			return err
+			return inm, err
 		}
+		fanout = append(fanout, sink)
+	}
+
+	// Configure the prometheus sink
+	if telConfig.PrometheusMetrics {
+		promSink, err := prometheus.NewPrometheusSink()
+		if err != nil {
+			return inm, err
+		}
+		fanout = append(fanout, promSink)
+	}
+
+	// Configure the datadog sink
+	if telConfig.DataDogAddr != "" {
+		sink, err := datadog.NewDogStatsdSink(telConfig.DataDogAddr, config.NodeName)
+		if err != nil {
+			return inm, err
+		}
+		fanout = append(fanout, sink)
+	}
+
+	// Configure the Circonus sink
+	if telConfig.CirconusAPIToken != "" || telConfig.CirconusCheckSubmissionURL != "" {
+		cfg := &circonus.Config{}
+		cfg.Interval = telConfig.CirconusSubmissionInterval
+		cfg.CheckManager.API.TokenKey = telConfig.CirconusAPIToken
+		cfg.CheckManager.API.TokenApp = telConfig.CirconusAPIApp
+		cfg.CheckManager.API.URL = telConfig.CirconusAPIURL
+		cfg.CheckManager.Check.SubmissionURL = telConfig.CirconusCheckSubmissionURL
+		cfg.CheckManager.Check.ID = telConfig.CirconusCheckID
+		cfg.CheckManager.Check.ForceMetricActivation = telConfig.CirconusCheckForceMetricActivation
+		cfg.CheckManager.Check.InstanceID = telConfig.CirconusCheckInstanceID
+		cfg.CheckManager.Check.SearchTag = telConfig.CirconusCheckSearchTag
+		cfg.CheckManager.Check.Tags = telConfig.CirconusCheckTags
+		cfg.CheckManager.Check.DisplayName = telConfig.CirconusCheckDisplayName
+		cfg.CheckManager.Broker.ID = telConfig.CirconusBrokerID
+		cfg.CheckManager.Broker.SelectTag = telConfig.CirconusBrokerSelectTag
+
+		if cfg.CheckManager.Check.DisplayName == "" {
+			cfg.CheckManager.Check.DisplayName = "Nomad"
+		}
+
+		if cfg.CheckManager.API.TokenApp == "" {
+			cfg.CheckManager.API.TokenApp = "nomad"
+		}
+
+		if cfg.CheckManager.Check.SearchTag == "" {
+			cfg.CheckManager.Check.SearchTag = "service:nomad"
+		}
+
+		sink, err := circonus.NewCirconusSink(cfg)
+		if err != nil {
+			return inm, err
+		}
+		sink.Start()
 		fanout = append(fanout, sink)
 	}
 
@@ -593,7 +764,7 @@ func (c *Command) setupTelementry(config *Config) error {
 		metricsConf.EnableHostname = false
 		metrics.NewGlobal(metricsConf, inm)
 	}
-	return nil
+	return inm, nil
 }
 
 // setupSCADA is used to start a new SCADA provider and listener,
@@ -617,7 +788,7 @@ func (c *Command) setupSCADA(config *Config) error {
 
 	scadaConfig := &scada.Config{
 		Service:      "nomad",
-		Version:      fmt.Sprintf("%s%s", config.Version, config.VersionPrerelease),
+		Version:      config.Version.VersionNumber(),
 		ResourceType: "nomad-cluster",
 		Meta: map[string]string{
 			"auto-join":  strconv.FormatBool(config.Atlas.Join),
@@ -761,6 +932,9 @@ Server Options:
     bootstrapping the cluster. Once <num> servers have joined eachother,
     Nomad initiates the bootstrap process.
 
+  -encrypt=<key>
+    Provides the gossip encryption key
+
   -join=<address>
     Address of an agent to join at start time. Can be specified
     multiple times.
@@ -814,6 +988,118 @@ Client Options:
   -network-speed
     The default speed for network interfaces in MBits if the link speed can not
     be determined dynamically.
+
+ACL Options:
+
+  -acl-enabled
+    Specifies whether the agent should enable ACLs.
+
+  -acl-replication-token
+    The replication token for servers to use when replicating from the
+    authoratative region. The token must be a valid management token from the
+    authoratative region.
+
+Consul Options:
+
+  -consul-address=<addr>
+    Specifies the address to the local Consul agent, given in the format host:port.
+    Supports Unix sockets with the format: unix:///tmp/consul/consul.sock
+
+  -consul-auth=<auth>
+    Specifies the HTTP Basic Authentication information to use for access to the
+    Consul Agent, given in the format username:password.
+
+  -consul-auto-advertise
+    Specifies if Nomad should advertise its services in Consul. The services
+    are named according to server_service_name and client_service_name. Nomad
+    servers and clients advertise their respective services, each tagged
+    appropriately with either http or rpc tag. Nomad servers also advertise a
+    serf tagged service.
+
+  -consul-ca-file=<path>
+    Specifies an optional path to the CA certificate used for Consul communication.
+    This defaults to the system bundle if unspecified.
+
+  -consul-cert-file=<path>
+    Specifies the path to the certificate used for Consul communication. If this
+    is set then you need to also set key_file.
+
+  -consul-checks-use-advertise
+    Specifies if Consul heath checks should bind to the advertise address. By
+    default, this is the bind address.
+
+  -consul-client-auto-join
+    Specifies if the Nomad clients should automatically discover servers in the
+    same region by searching for the Consul service name defined in the
+    server_service_name option.
+
+  -consul-client-service-name=<name>
+    Specifies the name of the service in Consul for the Nomad clients.
+
+  -consul-key-file=<path>
+    Specifies the path to the private key used for Consul communication. If this
+    is set then you need to also set cert_file.
+
+  -consul-server-service-name=<name>
+    Specifies the name of the service in Consul for the Nomad servers.
+
+  -consul-server-auto-join
+    Specifies if the Nomad servers should automatically discover and join other
+    Nomad servers by searching for the Consul service name defined in the
+    server_service_name option. This search only happens if the server does not
+    have a leader.
+
+  -consul-ssl
+    Specifies if the transport scheme should use HTTPS to communicate with the
+    Consul agent.
+
+  -consul-token=<token>
+    Specifies the token used to provide a per-request ACL token.
+
+  -consul-verify-ssl
+    Specifies if SSL peer verification should be used when communicating to the
+    Consul API client over HTTPS.
+
+Vault Options:
+
+  -vault-enabled
+    Whether to enable or disable Vault integration.
+
+  -vault-address=<addr>
+    The address to communicate with Vault. This should be provided with the http://
+    or https:// prefix.
+
+  -vault-token=<token>
+    The Vault token used to derive tokens from Vault on behalf of clients.
+    This only needs to be set on Servers. Overrides the Vault token read from
+    the VAULT_TOKEN environment variable.
+
+  -vault-create-from-role=<role>
+    The role name to create tokens for tasks from.
+
+  -vault-allow-unauthenticated
+    Whether to allow jobs to be sumbitted that request Vault Tokens but do not
+    authentication. The flag only applies to Servers.
+
+  -vault-ca-file=<path>
+    The path to a PEM-encoded CA cert file to use to verify the Vault server SSL
+    certificate.
+
+  -vault-ca-path=<path>
+    The path to a directory of PEM-encoded CA cert files to verify the Vault server
+    certificate.
+
+  -vault-cert-file=<token>
+    The path to the certificate for Vault communication.
+
+  -vault-key-file=<addr>
+    The path to the private key for Vault communication.
+
+  -vault-tls-skip-verify=<token>
+    Enables or disables SSL certificate verification.
+
+  -vault-tls-server-name=<token>
+    Used to set the SNI host when connecting over TLS.
 
 Atlas Options:
 

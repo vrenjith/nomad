@@ -3,9 +3,11 @@ package scheduler
 import (
 	"fmt"
 	"log"
+	"time"
 
-	"github.com/davecgh/go-spew/spew"
+	memdb "github.com/hashicorp/go-memdb"
 	"github.com/hashicorp/go-multierror"
+	"github.com/hashicorp/nomad/helper/uuid"
 	"github.com/hashicorp/nomad/nomad/structs"
 )
 
@@ -26,6 +28,9 @@ const (
 
 	// allocUpdating is the status used when a job requires an update
 	allocUpdating = "alloc is being updated due to job update"
+
+	// allocLost is the status used when an allocation is lost
+	allocLost = "alloc is lost since its node is down"
 
 	// allocInPlace is the status used when speculating on an in-place update
 	allocInPlace = "alloc updating in-place"
@@ -67,11 +72,14 @@ type GenericScheduler struct {
 	ctx        *EvalContext
 	stack      *GenericStack
 
-	limitReached bool
-	nextEval     *structs.Evaluation
+	followupEvalWait time.Duration
+	nextEval         *structs.Evaluation
+
+	deployment *structs.Deployment
 
 	blocked        *structs.Evaluation
 	failedTGAllocs map[string]*structs.AllocMetric
+	queuedAllocs   map[string]int
 }
 
 // NewServiceScheduler is a factory function to instantiate a new service scheduler
@@ -105,12 +113,14 @@ func (s *GenericScheduler) Process(eval *structs.Evaluation) error {
 	switch eval.TriggeredBy {
 	case structs.EvalTriggerJobRegister, structs.EvalTriggerNodeUpdate,
 		structs.EvalTriggerJobDeregister, structs.EvalTriggerRollingUpdate,
-		structs.EvalTriggerPeriodicJob, structs.EvalTriggerMaxPlans:
+		structs.EvalTriggerPeriodicJob, structs.EvalTriggerMaxPlans,
+		structs.EvalTriggerDeploymentWatcher:
 	default:
 		desc := fmt.Sprintf("scheduler cannot handle '%s' evaluation reason",
 			eval.TriggeredBy)
 		return setStatus(s.logger, s.planner, s.eval, s.nextEval, s.blocked,
-			s.failedTGAllocs, structs.EvalStatusFailed, desc)
+			s.failedTGAllocs, structs.EvalStatusFailed, desc, s.queuedAllocs,
+			s.deployment.GetID())
 	}
 
 	// Retry up to the maxScheduleAttempts and reset if progress is made.
@@ -128,7 +138,8 @@ func (s *GenericScheduler) Process(eval *structs.Evaluation) error {
 				mErr.Errors = append(mErr.Errors, err)
 			}
 			if err := setStatus(s.logger, s.planner, s.eval, s.nextEval, s.blocked,
-				s.failedTGAllocs, statusErr.EvalStatus, err.Error()); err != nil {
+				s.failedTGAllocs, statusErr.EvalStatus, err.Error(),
+				s.queuedAllocs, s.deployment.GetID()); err != nil {
 				mErr.Errors = append(mErr.Errors, err)
 			}
 			return mErr.ErrorOrNil()
@@ -143,12 +154,14 @@ func (s *GenericScheduler) Process(eval *structs.Evaluation) error {
 		newEval := s.eval.Copy()
 		newEval.EscapedComputedClass = e.HasEscaped()
 		newEval.ClassEligibility = e.GetClasses()
+		newEval.QuotaLimitReached = e.QuotaLimitReached()
 		return s.planner.ReblockEval(newEval)
 	}
 
 	// Update the status to complete
 	return setStatus(s.logger, s.planner, s.eval, s.nextEval, s.blocked,
-		s.failedTGAllocs, structs.EvalStatusComplete, "")
+		s.failedTGAllocs, structs.EvalStatusComplete, "", s.queuedAllocs,
+		s.deployment.GetID())
 }
 
 // createBlockedEval creates a blocked eval and submits it to the planner. If
@@ -163,7 +176,7 @@ func (s *GenericScheduler) createBlockedEval(planFailure bool) error {
 		classEligibility = e.GetClasses()
 	}
 
-	s.blocked = s.eval.CreateBlockedEval(classEligibility, escaped)
+	s.blocked = s.eval.CreateBlockedEval(classEligibility, escaped, e.QuotaLimitReached())
 	if planFailure {
 		s.blocked.TriggeredBy = structs.EvalTriggerMaxPlans
 		s.blocked.StatusDescription = blockedEvalMaxPlanDesc
@@ -179,14 +192,29 @@ func (s *GenericScheduler) createBlockedEval(planFailure bool) error {
 func (s *GenericScheduler) process() (bool, error) {
 	// Lookup the Job by ID
 	var err error
-	s.job, err = s.state.JobByID(s.eval.JobID)
+	ws := memdb.NewWatchSet()
+	s.job, err = s.state.JobByID(ws, s.eval.Namespace, s.eval.JobID)
 	if err != nil {
-		return false, fmt.Errorf("failed to get job '%s': %v",
-			s.eval.JobID, err)
+		return false, fmt.Errorf("failed to get job %q: %v", s.eval.JobID, err)
 	}
+
+	numTaskGroups := 0
+	stopped := s.job.Stopped()
+	if !stopped {
+		numTaskGroups = len(s.job.TaskGroups)
+	}
+	s.queuedAllocs = make(map[string]int, numTaskGroups)
 
 	// Create a plan
 	s.plan = s.eval.MakePlan(s.job)
+
+	if !s.batch {
+		// Get any existing deployment
+		s.deployment, err = s.state.LatestDeploymentByJobID(ws, s.eval.Namespace, s.eval.JobID)
+		if err != nil {
+			return false, fmt.Errorf("failed to get job deployment %q: %v", s.eval.JobID, err)
+		}
+	}
 
 	// Reset the failed allocations
 	s.failedTGAllocs = nil
@@ -196,7 +224,7 @@ func (s *GenericScheduler) process() (bool, error) {
 
 	// Construct the placement stack
 	s.stack = NewGenericStack(s.batch, s.ctx)
-	if s.job != nil {
+	if !s.job.Stopped() {
 		s.stack.SetJob(s.job)
 	}
 
@@ -223,15 +251,14 @@ func (s *GenericScheduler) process() (bool, error) {
 		return true, nil
 	}
 
-	// If the limit of placements was reached we need to create an evaluation
-	// to pickup from here after the stagger period.
-	if s.limitReached && s.nextEval == nil {
-		s.nextEval = s.eval.NextRollingEval(s.job.Update.Stagger)
+	// If we need a followup eval and we haven't created one, do so.
+	if s.followupEvalWait != 0 && s.nextEval == nil {
+		s.nextEval = s.eval.NextRollingEval(s.followupEvalWait)
 		if err := s.planner.CreateEval(s.nextEval); err != nil {
-			s.logger.Printf("[ERR] sched: %#v failed to make next eval for rolling update: %v", s.eval, err)
+			s.logger.Printf("[ERR] sched: %#v failed to make next eval for rolling migration: %v", s.eval, err)
 			return false, err
 		}
-		s.logger.Printf("[DEBUG] sched: %#v: rolling update limit reached, next eval '%s' created", s.eval, s.nextEval.ID)
+		s.logger.Printf("[DEBUG] sched: %#v: rolling migration limit reached, next eval '%s' created", s.eval, s.nextEval.ID)
 	}
 
 	// Submit the plan and store the results.
@@ -240,6 +267,10 @@ func (s *GenericScheduler) process() (bool, error) {
 	if err != nil {
 		return false, err
 	}
+
+	// Decrement the number of allocations pending per task group based on the
+	// number of allocations successfully placed
+	adjustQueuedAllocations(s.logger, result, s.queuedAllocs)
 
 	// If we got a state refresh, try again since we have stale data
 	if newState != nil {
@@ -293,32 +324,26 @@ func (s *GenericScheduler) filterCompleteAllocs(allocs []*structs.Allocation) []
 	n := len(allocs)
 	for i := 0; i < n; i++ {
 		if filter(allocs[i]) {
+			// Remove the allocation
 			allocs[i], allocs[n-1] = allocs[n-1], nil
 			i--
 			n--
 		}
 	}
+
 	return allocs[:n]
 }
 
 // computeJobAllocs is used to reconcile differences between the job,
 // existing allocations and node status to update the allocations.
 func (s *GenericScheduler) computeJobAllocs() error {
-	// Materialize all the task groups, job could be missing if deregistered
-	var groups map[string]*structs.TaskGroup
-	if s.job != nil {
-		groups = materializeTaskGroups(s.job)
-	}
-
 	// Lookup the allocations by JobID
-	allocs, err := s.state.AllocsByJob(s.eval.JobID)
+	ws := memdb.NewWatchSet()
+	allocs, err := s.state.AllocsByJob(ws, s.eval.Namespace, s.eval.JobID, true)
 	if err != nil {
 		return fmt.Errorf("failed to get allocs for job '%s': %v",
 			s.eval.JobID, err)
 	}
-
-	// Filter out the allocations in a terminal state
-	allocs = s.filterCompleteAllocs(allocs)
 
 	// Determine the tainted nodes containing job allocs
 	tainted, err := taintedNodes(s.state, allocs)
@@ -327,117 +352,209 @@ func (s *GenericScheduler) computeJobAllocs() error {
 			s.eval.JobID, err)
 	}
 
-	// Diff the required and existing allocations
-	diff := diffAllocs(s.job, tainted, groups, allocs)
-	s.logger.Printf("[DEBUG] sched: %#v: %#v", s.eval, diff)
+	// Update the allocations which are in pending/running state on tainted
+	// nodes to lost
+	updateNonTerminalAllocsToLost(s.plan, tainted, allocs)
 
-	// XXX: For debugging purposes only. An issue was observed where a job had a
-	// task group with count > 0 that produced a diff where no action would be
-	// taken (every slice was empty). Below we dump debug information if this
-	// condition is hit.
-	diffSum := len(diff.stop) + len(diff.place) + len(diff.ignore) +
-		len(diff.update) + len(diff.migrate)
-	if diffSum == 0 && len(groups) != 0 {
-		s.logger.Printf("[ERR] sched: %d tasks to schedule but scheduler believes there is no work", len(groups))
+	// Filter out the allocations in a terminal state
+	allocs = s.filterCompleteAllocs(allocs)
 
-		// Get the original set of allocations for the job.
-		jobAllocs, err := s.state.AllocsByJob(s.eval.JobID)
-		if err != nil {
-			return fmt.Errorf("failed to get allocs for job '%s': %v", s.eval.JobID, err)
-		}
-		s.logger.Printf("[DEBUG] sched: job: %s", spew.Sdump(s.job))
-		s.logger.Printf("[DEBUG] sched: materializeTaskGroups() returned: %s", spew.Sdump(groups))
-		s.logger.Printf("[DEBUG] sched: AllocsByJob(%q) returned: %s", s.eval.JobID, spew.Sdump(jobAllocs))
-		s.logger.Printf("[DEBUG] sched: filterCompleteAllocs(): %s", spew.Sdump(allocs))
-		s.logger.Printf("[DEBUG] sched: taintedNodes(): %s", spew.Sdump(tainted))
-	}
-
-	// Add all the allocs to stop
-	for _, e := range diff.stop {
-		s.plan.AppendUpdate(e.Alloc, structs.AllocDesiredStatusStop, allocNotNeeded)
-	}
-
-	// Attempt to do the upgrades in place
-	destructiveUpdates, inplaceUpdates := inplaceUpdate(s.ctx, s.eval, s.job, s.stack, diff.update)
-	diff.update = destructiveUpdates
+	reconciler := NewAllocReconciler(s.ctx.Logger(),
+		genericAllocUpdateFn(s.ctx, s.stack, s.eval.ID),
+		s.batch, s.eval.JobID, s.job, s.deployment, allocs, tainted)
+	results := reconciler.Compute()
+	s.logger.Printf("[DEBUG] sched: %#v: %#v", s.eval, results)
 
 	if s.eval.AnnotatePlan {
 		s.plan.Annotations = &structs.PlanAnnotations{
-			DesiredTGUpdates: desiredUpdates(diff, inplaceUpdates, destructiveUpdates),
+			DesiredTGUpdates: results.desiredTGUpdates,
 		}
 	}
 
-	// Check if a rolling upgrade strategy is being used
-	limit := len(diff.update) + len(diff.migrate)
-	if s.job != nil && s.job.Update.Rolling() {
-		limit = s.job.Update.MaxParallel
+	// Add the deployment changes to the plan
+	s.plan.Deployment = results.deployment
+	s.plan.DeploymentUpdates = results.deploymentUpdates
+
+	// Store the the follow up eval wait duration. If set this will trigger a
+	// follow up eval to handle node draining.
+	s.followupEvalWait = results.followupEvalWait
+
+	// Update the stored deployment
+	if results.deployment != nil {
+		s.deployment = results.deployment
 	}
 
-	// Treat migrations as an eviction and a new placement.
-	s.limitReached = evictAndPlace(s.ctx, diff, diff.migrate, allocMigrating, &limit)
+	// Handle the stop
+	for _, stop := range results.stop {
+		s.plan.AppendUpdate(stop.alloc, structs.AllocDesiredStatusStop, stop.statusDescription, stop.clientStatus)
+	}
 
-	// Treat non in-place updates as an eviction and new placement.
-	s.limitReached = s.limitReached || evictAndPlace(s.ctx, diff, diff.update, allocUpdating, &limit)
+	// Handle the in-place updates
+	for _, update := range results.inplaceUpdate {
+		if update.DeploymentID != s.deployment.GetID() {
+			update.DeploymentID = s.deployment.GetID()
+			update.DeploymentStatus = nil
+		}
+		s.ctx.Plan().AppendAlloc(update)
+	}
 
 	// Nothing remaining to do if placement is not required
-	if len(diff.place) == 0 {
+	if len(results.place)+len(results.destructiveUpdate) == 0 {
+		if !s.job.Stopped() {
+			for _, tg := range s.job.TaskGroups {
+				s.queuedAllocs[tg.Name] = 0
+			}
+		}
 		return nil
 	}
 
+	// Record the number of allocations that needs to be placed per Task Group
+	for _, place := range results.place {
+		s.queuedAllocs[place.taskGroup.Name] += 1
+	}
+	for _, destructive := range results.destructiveUpdate {
+		s.queuedAllocs[destructive.placeTaskGroup.Name] += 1
+	}
+
 	// Compute the placements
-	return s.computePlacements(diff.place)
+	place := make([]placementResult, 0, len(results.place))
+	for _, p := range results.place {
+		place = append(place, p)
+	}
+
+	destructive := make([]placementResult, 0, len(results.destructiveUpdate))
+	for _, p := range results.destructiveUpdate {
+		destructive = append(destructive, p)
+	}
+	return s.computePlacements(destructive, place)
 }
 
-// computePlacements computes placements for allocations
-func (s *GenericScheduler) computePlacements(place []allocTuple) error {
+// computePlacements computes placements for allocations. It is given the set of
+// destructive updates to place and the set of new placements to place.
+func (s *GenericScheduler) computePlacements(destructive, place []placementResult) error {
 	// Get the base nodes
 	nodes, byDC, err := readyNodesInDCs(s.state, s.job.Datacenters)
 	if err != nil {
 		return err
 	}
 
+	var deploymentID string
+	if s.deployment != nil {
+		deploymentID = s.deployment.ID
+	}
+
 	// Update the set of placement ndoes
 	s.stack.SetNodes(nodes)
 
-	for _, missing := range place {
-		// Check if this task group has already failed
-		if metric, ok := s.failedTGAllocs[missing.TaskGroup.Name]; ok {
-			metric.CoalescedFailures += 1
-			continue
-		}
+	// Have to handle destructive changes first as we need to discount their
+	// resources. To understand this imagine the resources were reduced and the
+	// count was scaled up.
+	for _, results := range [][]placementResult{destructive, place} {
+		for _, missing := range results {
+			// Get the task group
+			tg := missing.TaskGroup()
 
-		// Attempt to match the task group
-		option, _ := s.stack.Select(missing.TaskGroup)
-
-		// Store the available nodes by datacenter
-		s.ctx.Metrics().NodesAvailable = byDC
-
-		// Set fields based on if we found an allocation option
-		if option != nil {
-			// Create an allocation for this
-			alloc := &structs.Allocation{
-				ID:            structs.GenerateUUID(),
-				EvalID:        s.eval.ID,
-				Name:          missing.Name,
-				JobID:         s.job.ID,
-				TaskGroup:     missing.TaskGroup.Name,
-				Metrics:       s.ctx.Metrics(),
-				NodeID:        option.Node.ID,
-				TaskResources: option.TaskResources,
-				DesiredStatus: structs.AllocDesiredStatusRun,
-				ClientStatus:  structs.AllocClientStatusPending,
+			// Check if this task group has already failed
+			if metric, ok := s.failedTGAllocs[tg.Name]; ok {
+				metric.CoalescedFailures += 1
+				continue
 			}
 
-			s.plan.AppendAlloc(alloc)
-		} else {
-			// Lazy initialize the failed map
-			if s.failedTGAllocs == nil {
-				s.failedTGAllocs = make(map[string]*structs.AllocMetric)
+			// Find the preferred node
+			preferredNode, err := s.findPreferredNode(missing)
+			if err != nil {
+				return err
 			}
 
-			s.failedTGAllocs[missing.TaskGroup.Name] = s.ctx.Metrics()
+			// Check if we should stop the previous allocation upon successful
+			// placement of its replacement. This allow atomic placements/stops. We
+			// stop the allocation before trying to find a replacement because this
+			// frees the resources currently used by the previous allocation.
+			stopPrevAlloc, stopPrevAllocDesc := missing.StopPreviousAlloc()
+			if stopPrevAlloc {
+				s.plan.AppendUpdate(missing.PreviousAllocation(), structs.AllocDesiredStatusStop, stopPrevAllocDesc, "")
+			}
+
+			// Attempt to match the task group
+			var option *RankedNode
+			if preferredNode != nil {
+				option, _ = s.stack.SelectPreferringNodes(tg, []*structs.Node{preferredNode})
+			} else {
+				option, _ = s.stack.Select(tg)
+			}
+
+			// Store the available nodes by datacenter
+			s.ctx.Metrics().NodesAvailable = byDC
+
+			// Set fields based on if we found an allocation option
+			if option != nil {
+				// Create an allocation for this
+				alloc := &structs.Allocation{
+					ID:            uuid.Generate(),
+					Namespace:     s.job.Namespace,
+					EvalID:        s.eval.ID,
+					Name:          missing.Name(),
+					JobID:         s.job.ID,
+					TaskGroup:     tg.Name,
+					Metrics:       s.ctx.Metrics(),
+					NodeID:        option.Node.ID,
+					DeploymentID:  deploymentID,
+					TaskResources: option.TaskResources,
+					DesiredStatus: structs.AllocDesiredStatusRun,
+					ClientStatus:  structs.AllocClientStatusPending,
+
+					SharedResources: &structs.Resources{
+						DiskMB: tg.EphemeralDisk.SizeMB,
+					},
+				}
+
+				// If the new allocation is replacing an older allocation then we
+				// set the record the older allocation id so that they are chained
+				if prev := missing.PreviousAllocation(); prev != nil {
+					alloc.PreviousAllocation = prev.ID
+				}
+
+				// If we are placing a canary and we found a match, add the canary
+				// to the deployment state object.
+				if missing.Canary() {
+					if state, ok := s.deployment.TaskGroups[tg.Name]; ok {
+						state.PlacedCanaries = append(state.PlacedCanaries, alloc.ID)
+					}
+				}
+
+				// Track the placement
+				s.plan.AppendAlloc(alloc)
+
+			} else {
+				// Lazy initialize the failed map
+				if s.failedTGAllocs == nil {
+					s.failedTGAllocs = make(map[string]*structs.AllocMetric)
+				}
+
+				// Track the fact that we didn't find a placement
+				s.failedTGAllocs[tg.Name] = s.ctx.Metrics()
+
+				// If we weren't able to find a replacement for the allocation, back
+				// out the fact that we asked to stop the allocation.
+				if stopPrevAlloc {
+					s.plan.PopUpdate(missing.PreviousAllocation())
+				}
+			}
 		}
 	}
 
 	return nil
+}
+
+// findPreferredNode finds the preferred node for an allocation
+func (s *GenericScheduler) findPreferredNode(place placementResult) (node *structs.Node, err error) {
+	if prev := place.PreviousAllocation(); prev != nil && place.TaskGroup().EphemeralDisk.Sticky == true {
+		var preferredNode *structs.Node
+		ws := memdb.NewWatchSet()
+		preferredNode, err = s.state.NodeByID(ws, prev.NodeID)
+		if preferredNode.Ready() {
+			node = preferredNode
+		}
+	}
+	return
 }

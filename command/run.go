@@ -1,11 +1,8 @@
 package command
 
 import (
-	"bytes"
-	"encoding/gob"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"regexp"
 	"strconv"
@@ -13,8 +10,8 @@ import (
 	"time"
 
 	"github.com/hashicorp/nomad/api"
-	"github.com/hashicorp/nomad/jobspec"
-	"github.com/hashicorp/nomad/nomad/structs"
+	"github.com/hashicorp/nomad/helper"
+	"github.com/posener/complete"
 )
 
 var (
@@ -24,9 +21,7 @@ var (
 
 type RunCommand struct {
 	Meta
-
-	// The fields below can be overwritten for tests
-	testStdin io.Reader
+	JobGetter
 }
 
 func (c *RunCommand) Help() string {
@@ -38,7 +33,8 @@ Usage: nomad run [options] <path>
   used to interact with Nomad.
 
   If the supplied path is "-", the jobfile is read from stdin. Otherwise
-  it is read from the file at the supplied path.
+  it is read from the file at the supplied path or downloaded and
+  read from URL specified.
 
   Upon successful job submission, this command will immediately
   enter an interactive monitor. This is useful to watch Nomad's
@@ -53,7 +49,11 @@ Usage: nomad run [options] <path>
   issues or internal errors, are indicated by exit code 1.
 
   If the job has specified the region, the -region flag and NOMAD_REGION
-  environment variable are overridden and the the job's region is used.
+  environment variable are overridden and the job's region is used.
+
+  The run command will set the vault_token of the job based on the following
+  precedence, going from highest to lowest: the -vault-token flag, the
+  $VAULT_TOKEN environment variable and finally the value in the job file.
 
 General Options:
 
@@ -62,24 +62,33 @@ General Options:
 Run Options:
 
   -check-index
-	If set, the job is only registered or updated if the the passed
-	job modify index matches the server side version. If a check-index value of
-	zero is passed, the job is only registered if it does not yet exist. If a
-	non-zero value is passed, it ensures that the job is being updated from a
-	known state. The use of this flag is most common in conjunction with plan
-	command.
+    If set, the job is only registered or updated if the passed
+    job modify index matches the server side version. If a check-index value of
+    zero is passed, the job is only registered if it does not yet exist. If a
+    non-zero value is passed, it ensures that the job is being updated from a
+    known state. The use of this flag is most common in conjunction with plan
+    command.
 
   -detach
-	Return immediately instead of entering monitor mode. After job submission,
-	the evaluation ID will be printed to the screen, which can be used to
-	examine the evaluation using the eval-status command.
-
-  -verbose
-    Display full information.
+    Return immediately instead of entering monitor mode. After job submission,
+    the evaluation ID will be printed to the screen, which can be used to
+    examine the evaluation using the eval-status command.
 
   -output
     Output the JSON that would be submitted to the HTTP API without submitting
     the job.
+
+  -policy-override
+    Sets the flag to force override any soft mandatory Sentinel policies.
+
+  -vault-token
+    If set, the passed Vault token is stored in the job before sending to the
+    Nomad servers. This allows passing the Vault token without storing it in
+    the job file. This overrides the token found in $VAULT_TOKEN environment
+    variable and that found in the job.
+
+  -verbose
+    Display full information.
 `
 	return strings.TrimSpace(helpText)
 }
@@ -88,16 +97,34 @@ func (c *RunCommand) Synopsis() string {
 	return "Run a new job or update an existing job"
 }
 
+func (c *RunCommand) AutocompleteFlags() complete.Flags {
+	return mergeAutocompleteFlags(c.Meta.AutocompleteFlags(FlagSetClient),
+		complete.Flags{
+			"-check-index":     complete.PredictNothing,
+			"-detach":          complete.PredictNothing,
+			"-verbose":         complete.PredictNothing,
+			"-vault-token":     complete.PredictAnything,
+			"-output":          complete.PredictNothing,
+			"-policy-override": complete.PredictNothing,
+		})
+}
+
+func (c *RunCommand) AutocompleteArgs() complete.Predictor {
+	return complete.PredictOr(complete.PredictFiles("*.nomad"), complete.PredictFiles("*.hcl"))
+}
+
 func (c *RunCommand) Run(args []string) int {
-	var detach, verbose, output bool
-	var checkIndexStr string
+	var detach, verbose, output, override bool
+	var checkIndexStr, vaultToken string
 
 	flags := c.Meta.FlagSet("run", FlagSetClient)
 	flags.Usage = func() { c.Ui.Output(c.Help()) }
 	flags.BoolVar(&detach, "detach", false, "")
 	flags.BoolVar(&verbose, "verbose", false, "")
 	flags.BoolVar(&output, "output", false, "")
+	flags.BoolVar(&override, "policy-override", false, "")
 	flags.StringVar(&checkIndexStr, "check-index", "", "")
+	flags.StringVar(&vaultToken, "vault-token", "", "")
 
 	if err := flags.Parse(args); err != nil {
 		return 1
@@ -109,6 +136,13 @@ func (c *RunCommand) Run(args []string) int {
 		length = fullId
 	}
 
+	// Check that we got exactly one argument
+	args = flags.Args()
+	if len(args) != 1 {
+		c.Ui.Error(c.Help())
+		return 1
+	}
+
 	// Check that we got exactly one node
 	args = flags.Args()
 	if len(args) != 1 {
@@ -116,63 +150,11 @@ func (c *RunCommand) Run(args []string) int {
 		return 1
 	}
 
-	// Read the Jobfile
-	path := args[0]
-
-	var f io.Reader
-	switch path {
-	case "-":
-		if c.testStdin != nil {
-			f = c.testStdin
-		} else {
-			f = os.Stdin
-		}
-	default:
-		file, err := os.Open(path)
-		defer file.Close()
-		if err != nil {
-			c.Ui.Error(fmt.Sprintf("Error opening file %q: %v", path, err))
-			return 1
-		}
-		f = file
-	}
-
-	// Parse the JobFile
-	job, err := jobspec.Parse(f)
+	// Get Job struct from Jobfile
+	job, err := c.JobGetter.ApiJob(args[0])
 	if err != nil {
-		c.Ui.Error(fmt.Sprintf("Error parsing job file %s: %v", f, err))
+		c.Ui.Error(fmt.Sprintf("Error getting job struct: %s", err))
 		return 1
-	}
-
-	// Initialize any fields that need to be.
-	job.InitFields()
-
-	// Check that the job is valid
-	if err := job.Validate(); err != nil {
-		c.Ui.Error(fmt.Sprintf("Error validating job: %v", err))
-		return 1
-	}
-
-	// Check if the job is periodic.
-	periodic := job.IsPeriodic()
-
-	// Convert it to something we can use
-	apiJob, err := convertStructJob(job)
-	if err != nil {
-		c.Ui.Error(fmt.Sprintf("Error converting job: %s", err))
-		return 1
-	}
-
-	if output {
-		req := api.RegisterJobRequest{Job: apiJob}
-		buf, err := json.MarshalIndent(req, "", "    ")
-		if err != nil {
-			c.Ui.Error(fmt.Sprintf("Error converting job: %s", err))
-			return 1
-		}
-
-		c.Ui.Output(string(buf))
-		return 0
 	}
 
 	// Get the HTTP client
@@ -183,8 +165,39 @@ func (c *RunCommand) Run(args []string) int {
 	}
 
 	// Force the region to be that of the job.
-	if r := job.Region; r != "" {
-		client.SetRegion(r)
+	if r := job.Region; r != nil {
+		client.SetRegion(*r)
+	}
+
+	// Force the namespace to be that of the job.
+	if n := job.Namespace; n != nil {
+		client.SetNamespace(*n)
+	}
+
+	// Check if the job is periodic or is a parameterized job
+	periodic := job.IsPeriodic()
+	paramjob := job.IsParameterized()
+
+	// Parse the Vault token
+	if vaultToken == "" {
+		// Check the environment variable
+		vaultToken = os.Getenv("VAULT_TOKEN")
+	}
+
+	if vaultToken != "" {
+		job.VaultToken = helper.StringToPtr(vaultToken)
+	}
+
+	if output {
+		req := api.RegisterJobRequest{Job: job}
+		buf, err := json.MarshalIndent(req, "", "    ")
+		if err != nil {
+			c.Ui.Error(fmt.Sprintf("Error converting job: %s", err))
+			return 1
+		}
+
+		c.Ui.Output(string(buf))
+		return 0
 	}
 
 	// Parse the check-index
@@ -194,13 +207,18 @@ func (c *RunCommand) Run(args []string) int {
 		return 1
 	}
 
-	// Submit the job
-	var evalID string
+	// Set the register options
+	opts := &api.RegisterOptions{}
 	if enforce {
-		evalID, _, err = client.Jobs().EnforceRegister(apiJob, checkIndex, nil)
-	} else {
-		evalID, _, err = client.Jobs().Register(apiJob, nil)
+		opts.EnforceIndex = true
+		opts.ModifyIndex = checkIndex
 	}
+	if override {
+		opts.PolicyOverride = true
+	}
+
+	// Submit the job
+	resp, _, err := client.Jobs().RegisterOpts(job, opts, nil)
 	if err != nil {
 		if strings.Contains(err.Error(), api.RegisterEnforceIndexErrPrefix) {
 			// Format the error specially if the error is due to index
@@ -217,15 +235,26 @@ func (c *RunCommand) Run(args []string) int {
 		return 1
 	}
 
+	// Print any warnings if there are any
+	if resp.Warnings != "" {
+		c.Ui.Output(
+			c.Colorize().Color(fmt.Sprintf("[bold][yellow]Job Warnings:\n%s[reset]\n", resp.Warnings)))
+	}
+
+	evalID := resp.EvalID
+
 	// Check if we should enter monitor mode
-	if detach || periodic {
+	if detach || periodic || paramjob {
 		c.Ui.Output("Job registration successful")
-		if periodic {
-			now := time.Now().UTC()
-			next := job.Periodic.Next(now)
-			c.Ui.Output(fmt.Sprintf("Approximate next launch time: %s (%s from now)",
-				formatTime(next), formatTimeDifference(now, next, time.Second)))
-		} else {
+		if periodic && !paramjob {
+			loc, err := job.Periodic.GetLocation()
+			if err == nil {
+				now := time.Now().In(loc)
+				next := job.Periodic.Next(now)
+				c.Ui.Output(fmt.Sprintf("Approximate next launch time: %s (%s from now)",
+					formatTime(next), formatTimeDifference(now, next, time.Second)))
+			}
+		} else if !paramjob {
 			c.Ui.Output("Evaluation ID: " + evalID)
 		}
 
@@ -247,20 +276,4 @@ func parseCheckIndex(input string) (uint64, bool, error) {
 
 	u, err := strconv.ParseUint(input, 10, 64)
 	return u, true, err
-}
-
-// convertStructJob is used to take a *structs.Job and convert it to an *api.Job.
-// This function is just a hammer and probably needs to be revisited.
-func convertStructJob(in *structs.Job) (*api.Job, error) {
-	gob.Register([]map[string]interface{}{})
-	gob.Register([]interface{}{})
-	var apiJob *api.Job
-	buf := new(bytes.Buffer)
-	if err := gob.NewEncoder(buf).Encode(in); err != nil {
-		return nil, err
-	}
-	if err := gob.NewDecoder(buf).Decode(&apiJob); err != nil {
-		return nil, err
-	}
-	return apiJob, nil
 }

@@ -1,9 +1,11 @@
 job "binstore-storagelocker" {
-  region      = "global"
-  type        = "service"
-  priority    = 50
+  region      = "fooregion"
+  namespace   = "foonamespace"
+  type        = "batch"
+  priority    = 52
   all_at_once = true
   datacenters = ["us2", "eu1"]
+  vault_token = "foo"
 
   meta {
     foo = "bar"
@@ -17,6 +19,11 @@ job "binstore-storagelocker" {
   update {
     stagger      = "60s"
     max_parallel = 2
+    health_check = "manual"
+    min_healthy_time = "10s"
+    healthy_deadline = "10m"
+    auto_revert = true
+    canary = 1
   }
 
   task "outside" {
@@ -41,9 +48,24 @@ job "binstore-storagelocker" {
       mode     = "delay"
     }
 
+    ephemeral_disk {
+        sticky = true
+        size = 150
+    }
+
+    update {
+        max_parallel = 3
+        health_check = "checks"
+        min_healthy_time = "1s"
+        healthy_deadline = "1m"
+        auto_revert = false
+        canary = 2
+    }
+
     task "binstore" {
       driver = "docker"
       user   = "bob"
+      leader = true
 
       config {
         image = "hashicorp/binstore"
@@ -54,8 +76,8 @@ job "binstore-storagelocker" {
       }
 
       logs {
-        max_files     = 10
-        max_file_size = 100
+        max_files     = 14
+        max_file_size = 101
       }
 
       env {
@@ -73,6 +95,12 @@ job "binstore-storagelocker" {
           interval = "10s"
           timeout  = "2s"
           port     = "admin"
+
+          check_restart {
+            limit = 3
+            grace = "10s"
+            ignore_warnings = true
+          }
         }
       }
 
@@ -108,6 +136,8 @@ job "binstore-storagelocker" {
 
       kill_timeout = "22s"
 
+      shutdown_delay = "11s"
+
       artifact {
         source = "http://foo.com/artifact"
 
@@ -118,10 +148,34 @@ job "binstore-storagelocker" {
 
       artifact {
         source = "http://bar.com/artifact"
+        destination = "test/foo/"
+        mode = "file"
 
         options {
           checksum = "md5:ff1cc0d3432dad54d607c1505fb7245c"
         }
+      }
+
+      vault {
+        policies = ["foo", "bar"]
+      }
+
+      template {
+        source = "foo"
+        destination = "foo"
+        change_mode = "foo"
+        change_signal = "foo"
+        splay = "10s"
+        env = true
+        vault_grace = "33s"
+      }
+
+      template {
+        source = "bar"
+        destination = "bar"
+        perms = "777"
+        left_delimiter = "--"
+        right_delimiter = "__"
       }
     }
 
@@ -141,6 +195,13 @@ job "binstore-storagelocker" {
       constraint {
         attribute = "kernel.arch"
         value     = "amd64"
+      }
+
+      vault {
+        policies = ["foo", "bar"]
+        env = false
+        change_mode = "signal"
+        change_signal = "SIGUSR1"
       }
     }
 

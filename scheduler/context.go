@@ -1,10 +1,10 @@
 package scheduler
 
 import (
-	"fmt"
 	"log"
 	"regexp"
 
+	memdb "github.com/hashicorp/go-memdb"
 	"github.com/hashicorp/go-version"
 	"github.com/hashicorp/nomad/nomad/structs"
 )
@@ -108,7 +108,8 @@ func (e *EvalContext) Reset() {
 
 func (e *EvalContext) ProposedAllocs(nodeID string) ([]*structs.Allocation, error) {
 	// Get the existing allocations that are non-terminal
-	existingAlloc, err := e.state.AllocsByNodeTerminal(nodeID, false)
+	ws := memdb.NewWatchSet()
+	existingAlloc, err := e.state.AllocsByNodeTerminal(ws, nodeID, false)
 	if err != nil {
 		return nil, err
 	}
@@ -184,6 +185,10 @@ type EvalEligibility struct {
 	// tgEscapedConstraints is a map of task groups to whether constraints have
 	// escaped.
 	tgEscapedConstraints map[string]bool
+
+	// quotaReached marks that the quota limit has been reached for the given
+	// quota
+	quotaReached string
 }
 
 // NewEvalEligibility returns an eligibility tracker for the context of an evaluation.
@@ -269,7 +274,6 @@ func (e *EvalEligibility) JobStatus(class string) ComputedClassFeasibility {
 	// will not have a computed class. The safest value to return is the escaped
 	// case, since it disables any optimization.
 	if e.jobEscaped || class == "" {
-		fmt.Println(e.jobEscaped, class)
 		return EvalComputedClassEscaped
 	}
 
@@ -327,4 +331,15 @@ func (e *EvalEligibility) SetTaskGroupEligibility(eligible bool, tg, class strin
 	} else {
 		e.taskGroups[tg] = map[string]ComputedClassFeasibility{class: eligibility}
 	}
+}
+
+// SetQuotaLimitReached marks that the quota limit has been reached for the
+// given quota
+func (e *EvalEligibility) SetQuotaLimitReached(quota string) {
+	e.quotaReached = quota
+}
+
+// QuotaLimitReached returns the quota name if the quota limit has been reached.
+func (e *EvalEligibility) QuotaLimitReached() string {
+	return e.quotaReached
 }

@@ -5,6 +5,8 @@ import (
 	"time"
 
 	"github.com/armon/go-metrics"
+	memdb "github.com/hashicorp/go-memdb"
+	"github.com/hashicorp/nomad/acl"
 	"github.com/hashicorp/nomad/nomad/structs"
 )
 
@@ -20,6 +22,13 @@ func (p *Periodic) Force(args *structs.PeriodicForceRequest, reply *structs.Peri
 	}
 	defer metrics.MeasureSince([]string{"nomad", "periodic", "force"}, time.Now())
 
+	// Check for write-job permissions
+	if aclObj, err := p.srv.ResolveToken(args.AuthToken); err != nil {
+		return err
+	} else if aclObj != nil && !aclObj.AllowNsOp(args.RequestNamespace(), acl.NamespaceCapabilitySubmitJob) {
+		return structs.ErrPermissionDenied
+	}
+
 	// Validate the arguments
 	if args.JobID == "" {
 		return fmt.Errorf("missing job ID for evaluation")
@@ -30,7 +39,9 @@ func (p *Periodic) Force(args *structs.PeriodicForceRequest, reply *structs.Peri
 	if err != nil {
 		return err
 	}
-	job, err := snap.JobByID(args.JobID)
+
+	ws := memdb.NewWatchSet()
+	job, err := snap.JobByID(ws, args.RequestNamespace(), args.JobID)
 	if err != nil {
 		return err
 	}
@@ -43,7 +54,7 @@ func (p *Periodic) Force(args *structs.PeriodicForceRequest, reply *structs.Peri
 	}
 
 	// Force run the job.
-	eval, err := p.srv.periodicDispatcher.ForceRun(job.ID)
+	eval, err := p.srv.periodicDispatcher.ForceRun(args.RequestNamespace(), job.ID)
 	if err != nil {
 		return fmt.Errorf("force launch for job %q failed: %v", job.ID, err)
 	}

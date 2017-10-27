@@ -12,6 +12,8 @@ import (
 
 	humanize "github.com/dustin/go-humanize"
 	"github.com/hashicorp/nomad/api"
+	"github.com/hashicorp/nomad/api/contexts"
+	"github.com/posener/complete"
 )
 
 const (
@@ -21,7 +23,7 @@ const (
 	bytesToLines int64 = 120
 
 	// defaultTailLines is the number of lines to tail by default if the value
-	// is not overriden.
+	// is not overridden.
 	defaultTailLines int64 = 10
 )
 
@@ -31,7 +33,7 @@ type FSCommand struct {
 
 func (f *FSCommand) Help() string {
 	helpText := `
-Usage: nomad fs <alloc-id> <path>
+Usage: nomad fs [options] <allocation> <path>
 
   fs displays either the contents of an allocation directory for the passed allocation,
   or displays the file at the given path. The path is relative to the root of the alloc
@@ -50,26 +52,25 @@ FS Specific Options:
     Show full information.
 
   -job <job-id>
-    Use a random allocation from a specified job-id.
+    Use a random allocation from the specified job ID.
 
   -stat
     Show file stat information instead of displaying the file, or listing the directory.
 
-  -tail 
-	Show the files contents with offsets relative to the end of the file. If no
-	offset is given, -n is defaulted to 10.
+  -f
+    Causes the output to not stop when the end of the file is reached, but rather to
+    wait for additional output.
+
+  -tail
+    Show the files contents with offsets relative to the end of the file. If no
+    offset is given, -n is defaulted to 10.
 
   -n
-	Sets the tail location in best-efforted number of lines relative to the end
-	of the file.
+    Sets the tail location in best-efforted number of lines relative to the end
+    of the file.
 
   -c
-	Sets the tail location in number of bytes relative to the end of the file.
-
-  -f
-	Causes the output to not stop when the end of the file is reached, but
-	rather to wait for additional output. 
-
+    Sets the tail location in number of bytes relative to the end of the file.
 `
 	return strings.TrimSpace(helpText)
 }
@@ -78,11 +79,40 @@ func (f *FSCommand) Synopsis() string {
 	return "Inspect the contents of an allocation directory"
 }
 
+func (c *FSCommand) AutocompleteFlags() complete.Flags {
+	return mergeAutocompleteFlags(c.Meta.AutocompleteFlags(FlagSetClient),
+		complete.Flags{
+			"-H":       complete.PredictNothing,
+			"-verbose": complete.PredictNothing,
+			"-job":     complete.PredictAnything,
+			"-stat":    complete.PredictNothing,
+			"-f":       complete.PredictNothing,
+			"-tail":    complete.PredictNothing,
+			"-n":       complete.PredictAnything,
+			"-c":       complete.PredictAnything,
+		})
+}
+
+func (f *FSCommand) AutocompleteArgs() complete.Predictor {
+	return complete.PredictFunc(func(a complete.Args) []string {
+		client, err := f.Meta.Client()
+		if err != nil {
+			return nil
+		}
+
+		resp, _, err := client.Search().PrefixSearch(a.Last, contexts.Allocs, nil)
+		if err != nil {
+			return []string{}
+		}
+		return resp.Matches[contexts.Allocs]
+	})
+}
+
 func (f *FSCommand) Run(args []string) int {
 	var verbose, machine, job, stat, tail, follow bool
 	var numLines, numBytes int64
 
-	flags := f.Meta.FlagSet("fs-list", FlagSetClient)
+	flags := f.Meta.FlagSet("fs", FlagSetClient)
 	flags.Usage = func() { f.Ui.Output(f.Help()) }
 	flags.BoolVar(&verbose, "verbose", false, "")
 	flags.BoolVar(&machine, "H", false, "")
@@ -104,7 +134,11 @@ func (f *FSCommand) Run(args []string) int {
 		} else {
 			f.Ui.Error("allocation ID is required")
 		}
+		return 1
+	}
 
+	if len(args) > 2 {
+		f.Ui.Error(f.Help())
 		return 1
 	}
 
@@ -139,12 +173,8 @@ func (f *FSCommand) Run(args []string) int {
 		f.Ui.Error(fmt.Sprintf("Alloc ID must contain at least two characters."))
 		return 1
 	}
-	if len(allocID)%2 == 1 {
-		// Identifiers must be of even length, so we strip off the last byte
-		// to provide a consistent user experience.
-		allocID = allocID[:len(allocID)-1]
-	}
 
+	allocID = sanatizeUUIDPrefix(allocID)
 	allocs, _, err := client.Allocations().PrefixList(allocID)
 	if err != nil {
 		f.Ui.Error(fmt.Sprintf("Error querying allocation: %v", err))
@@ -156,34 +186,15 @@ func (f *FSCommand) Run(args []string) int {
 	}
 	if len(allocs) > 1 {
 		// Format the allocs
-		out := make([]string, len(allocs)+1)
-		out[0] = "ID|Eval ID|Job ID|Task Group|Desired Status|Client Status"
-		for i, alloc := range allocs {
-			out[i+1] = fmt.Sprintf("%s|%s|%s|%s|%s|%s",
-				limit(alloc.ID, length),
-				limit(alloc.EvalID, length),
-				alloc.JobID,
-				alloc.TaskGroup,
-				alloc.DesiredStatus,
-				alloc.ClientStatus,
-			)
-		}
-		f.Ui.Output(fmt.Sprintf("Prefix matched multiple allocations\n\n%s", formatList(out)))
-		return 0
+		out := formatAllocListStubs(allocs, verbose, length)
+		f.Ui.Error(fmt.Sprintf("Prefix matched multiple allocations\n\n%s", out))
+		return 1
 	}
 	// Prefix lookup matched a single allocation
 	alloc, _, err := client.Allocations().Info(allocs[0].ID, nil)
 	if err != nil {
 		f.Ui.Error(fmt.Sprintf("Error querying allocation: %s", err))
 		return 1
-	}
-
-	if alloc.DesiredStatus == "failed" {
-		allocID := limit(alloc.ID, length)
-		msg := fmt.Sprintf(`The allocation %q failed to be placed. To see the cause, run:
-nomad alloc-status %s`, allocID, allocID)
-		f.Ui.Error(msg)
-		return 0
 	}
 
 	// Get file stat info
@@ -256,7 +267,7 @@ nomad alloc-status %s`, allocID, allocID)
 		if follow {
 			r, readErr = f.followFile(client, alloc, path, api.OriginStart, 0, -1)
 		} else {
-			r, _, readErr = client.AllocFS().Cat(alloc, path, nil)
+			r, readErr = client.AllocFS().Cat(alloc, path, nil)
 		}
 
 		if readErr != nil {
@@ -267,7 +278,10 @@ nomad alloc-status %s`, allocID, allocID)
 		var offset int64 = defaultTailLines * bytesToLines
 
 		if nLines, nBytes := numLines != -1, numBytes != -1; nLines && nBytes {
-			f.Ui.Error("Both -n and -c set")
+			f.Ui.Error("Both -n and -c are not allowed")
+			return 1
+		} else if numLines < -1 || numBytes < -1 {
+			f.Ui.Error("Invalid size is specified")
 			return 1
 		} else if nLines {
 			offset = numLines * bytesToLines
@@ -287,11 +301,11 @@ nomad alloc-status %s`, allocID, allocID)
 			// This offset needs to be relative from the front versus the follow
 			// is relative to the end
 			offset = file.Size - offset
-			r, _, readErr = client.AllocFS().ReadAt(alloc, path, offset, -1, nil)
+			r, readErr = client.AllocFS().ReadAt(alloc, path, offset, -1, nil)
 
 			// If numLines is set, wrap the reader
 			if numLines != -1 {
-				r = NewLineLimitReader(r, int(numLines), int(numLines*bytesToLines))
+				r = NewLineLimitReader(r, int(numLines), int(numLines*bytesToLines), 1*time.Second)
 			}
 		}
 
@@ -300,13 +314,20 @@ nomad alloc-status %s`, allocID, allocID)
 		}
 	}
 
-	defer r.Close()
+	if r != nil {
+		defer r.Close()
+	}
 	if readErr != nil {
 		f.Ui.Error(readErr.Error())
 		return 1
 	}
 
-	io.Copy(os.Stdout, r)
+	_, err = io.Copy(os.Stdout, r)
+	if err != nil {
+		f.Ui.Error(fmt.Sprintf("error tailing file: %s", err))
+		return 1
+	}
+
 	return 0
 }
 
@@ -316,21 +337,24 @@ func (f *FSCommand) followFile(client *api.Client, alloc *api.Allocation,
 	path, origin string, offset, numLines int64) (io.ReadCloser, error) {
 
 	cancel := make(chan struct{})
-	frames, _, err := client.AllocFS().Stream(alloc, path, origin, offset, cancel, nil)
-	if err != nil {
+	frames, errCh := client.AllocFS().Stream(alloc, path, origin, offset, cancel, nil)
+	select {
+	case err := <-errCh:
 		return nil, err
+	default:
 	}
 	signalCh := make(chan os.Signal, 1)
 	signal.Notify(signalCh, os.Interrupt, syscall.SIGTERM)
 
 	// Create a reader
 	var r io.ReadCloser
-	frameReader := api.NewFrameReader(frames, cancel)
+	frameReader := api.NewFrameReader(frames, errCh, cancel)
+	frameReader.SetUnblockTime(500 * time.Millisecond)
 	r = frameReader
 
 	// If numLines is set, wrap the reader
 	if numLines != -1 {
-		r = NewLineLimitReader(r, int(numLines), int(numLines*bytesToLines))
+		r = NewLineLimitReader(r, int(numLines), int(numLines*bytesToLines), 1*time.Second)
 	}
 
 	go func() {
@@ -338,9 +362,6 @@ func (f *FSCommand) followFile(client *api.Client, alloc *api.Allocation,
 
 		// End the streaming
 		r.Close()
-
-		// Output the last offset
-		f.Ui.Output(fmt.Sprintf("\nLast outputted offset (bytes): %d", frameReader.Offset()))
 	}()
 
 	return r, nil
@@ -350,7 +371,7 @@ func (f *FSCommand) followFile(client *api.Client, alloc *api.Allocation,
 // but use a dead allocation if no running allocations are found
 func getRandomJobAlloc(client *api.Client, jobID string) (string, error) {
 	var runningAllocs []*api.AllocationListStub
-	allocs, _, err := client.Jobs().Allocations(jobID, nil)
+	allocs, _, err := client.Jobs().Allocations(jobID, false, nil)
 
 	// Check that the job actually has allocations
 	if len(allocs) == 0 {

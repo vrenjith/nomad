@@ -3,13 +3,17 @@ package agent
 import (
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/hashicorp/nomad/helper"
 	"github.com/hashicorp/nomad/nomad/structs/config"
+	"github.com/kr/pretty"
 )
 
 func TestConfig_Parse(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		File   string
 		Result *Config
@@ -53,8 +57,13 @@ func TestConfig_Parse(t *testing.T) {
 						"foo": "bar",
 						"baz": "zip",
 					},
+					ChrootEnv: map[string]string{
+						"/opt/myapp/etc": "/etc",
+						"/opt/myapp/bin": "/bin",
+					},
 					NetworkInterface: "eth0",
 					NetworkSpeed:     100,
+					CpuCompute:       4444,
 					MaxKillTimeout:   "10s",
 					ClientMinPort:    1000,
 					ClientMaxPort:    2000,
@@ -66,28 +75,53 @@ func TestConfig_Parse(t *testing.T) {
 						ReservedPorts:       "1,100,10-12",
 						ParsedReservedPorts: []int{1, 10, 11, 12, 100},
 					},
+					GCInterval:            6 * time.Second,
+					GCParallelDestroys:    6,
+					GCDiskUsageThreshold:  82,
+					GCInodeUsageThreshold: 91,
+					GCMaxAllocs:           50,
+					NoHostUUID:            helper.BoolToPtr(false),
 				},
 				Server: &ServerConfig{
-					Enabled:           true,
-					BootstrapExpect:   5,
-					DataDir:           "/tmp/data",
-					ProtocolVersion:   3,
-					NumSchedulers:     2,
-					EnabledSchedulers: []string{"test"},
-					NodeGCThreshold:   "12h",
-					HeartbeatGrace:    "30s",
-					RetryJoin:         []string{"1.1.1.1", "2.2.2.2"},
-					StartJoin:         []string{"1.1.1.1", "2.2.2.2"},
-					RetryInterval:     "15s",
-					RejoinAfterLeave:  true,
-					RetryMaxAttempts:  3,
+					Enabled:                true,
+					AuthoritativeRegion:    "foobar",
+					BootstrapExpect:        5,
+					DataDir:                "/tmp/data",
+					ProtocolVersion:        3,
+					NumSchedulers:          2,
+					EnabledSchedulers:      []string{"test"},
+					NodeGCThreshold:        "12h",
+					EvalGCThreshold:        "12h",
+					JobGCThreshold:         "12h",
+					DeploymentGCThreshold:  "12h",
+					HeartbeatGrace:         30 * time.Second,
+					MinHeartbeatTTL:        33 * time.Second,
+					MaxHeartbeatsPerSecond: 11.0,
+					RetryJoin:              []string{"1.1.1.1", "2.2.2.2"},
+					StartJoin:              []string{"1.1.1.1", "2.2.2.2"},
+					RetryInterval:          "15s",
+					RejoinAfterLeave:       true,
+					RetryMaxAttempts:       3,
+					EncryptKey:             "abc",
+				},
+				ACL: &ACLConfig{
+					Enabled:          true,
+					TokenTTL:         60 * time.Second,
+					PolicyTTL:        60 * time.Second,
+					ReplicationToken: "foobar",
 				},
 				Telemetry: &Telemetry{
-					StatsiteAddr:       "127.0.0.1:1234",
-					StatsdAddr:         "127.0.0.1:2345",
-					DisableHostname:    true,
-					CollectionInterval: "3s",
-					collectionInterval: 3 * time.Second,
+					StatsiteAddr:               "127.0.0.1:1234",
+					StatsdAddr:                 "127.0.0.1:2345",
+					PrometheusMetrics:          true,
+					DisableHostname:            true,
+					UseNodeName:                false,
+					CollectionInterval:         "3s",
+					collectionInterval:         3 * time.Second,
+					PublishAllocationMetrics:   true,
+					PublishNodeMetrics:         true,
+					DisableTaggedMetrics:       true,
+					BackwardsCompatibleMetrics: true,
 				},
 				LeaveOnInt:                true,
 				LeaveOnTerm:               true,
@@ -102,22 +136,60 @@ func TestConfig_Parse(t *testing.T) {
 					Endpoint:       "127.0.0.1:1234",
 				},
 				Consul: &config.ConsulConfig{
-					ServerServiceName: "nomad",
-					ClientServiceName: "nomad-client",
-					Addr:              "127.0.0.1:9500",
-					Token:             "token1",
-					Auth:              "username:pass",
-					EnableSSL:         true,
-					VerifySSL:         false,
-					CAFile:            "/path/to/ca/file",
-					CertFile:          "/path/to/cert/file",
-					KeyFile:           "/path/to/key/file",
-					ServerAutoJoin:    false,
-					ClientAutoJoin:    false,
-					AutoAdvertise:     false,
+					ServerServiceName:  "nomad",
+					ClientServiceName:  "nomad-client",
+					Addr:               "127.0.0.1:9500",
+					Token:              "token1",
+					Auth:               "username:pass",
+					EnableSSL:          &trueValue,
+					VerifySSL:          &trueValue,
+					CAFile:             "/path/to/ca/file",
+					CertFile:           "/path/to/cert/file",
+					KeyFile:            "/path/to/key/file",
+					ServerAutoJoin:     &trueValue,
+					ClientAutoJoin:     &trueValue,
+					AutoAdvertise:      &trueValue,
+					ChecksUseAdvertise: &trueValue,
+				},
+				Vault: &config.VaultConfig{
+					Addr:                 "127.0.0.1:9500",
+					AllowUnauthenticated: &trueValue,
+					Enabled:              &falseValue,
+					Role:                 "test_role",
+					TLSCaFile:            "/path/to/ca/file",
+					TLSCaPath:            "/path/to/ca",
+					TLSCertFile:          "/path/to/cert/file",
+					TLSKeyFile:           "/path/to/key/file",
+					TLSServerName:        "foobar",
+					TLSSkipVerify:        &trueValue,
+					TaskTokenTTL:         "1s",
+					Token:                "12345",
+				},
+				TLSConfig: &config.TLSConfig{
+					EnableHTTP:           true,
+					EnableRPC:            true,
+					VerifyServerHostname: true,
+					CAFile:               "foo",
+					CertFile:             "bar",
+					KeyFile:              "pipe",
+					VerifyHTTPSClient:    true,
 				},
 				HTTPAPIResponseHeaders: map[string]string{
 					"Access-Control-Allow-Origin": "*",
+				},
+				Sentinel: &config.SentinelConfig{
+					Imports: []*config.SentinelImport{
+						{
+							Name: "foo",
+							Path: "foo",
+							Args: []string{"a", "b", "c"},
+						},
+						{
+							Name: "bar",
+							Path: "bar",
+							Args: []string{"x", "y", "z"},
+						},
+					},
 				},
 			},
 			false,
@@ -125,22 +197,20 @@ func TestConfig_Parse(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		t.Logf("Testing parse: %s", tc.File)
+		t.Run(tc.File, func(t *testing.T) {
+			path, err := filepath.Abs(filepath.Join("./config-test-fixtures", tc.File))
+			if err != nil {
+				t.Fatalf("file: %s\n\n%s", tc.File, err)
+			}
 
-		path, err := filepath.Abs(filepath.Join("./config-test-fixtures", tc.File))
-		if err != nil {
-			t.Fatalf("file: %s\n\n%s", tc.File, err)
-			continue
-		}
+			actual, err := ParseConfigFile(path)
+			if (err != nil) != tc.Err {
+				t.Fatalf("file: %s\n\n%s", tc.File, err)
+			}
 
-		actual, err := ParseConfigFile(path)
-		if (err != nil) != tc.Err {
-			t.Fatalf("file: %s\n\n%s", tc.File, err)
-			continue
-		}
-
-		if !reflect.DeepEqual(actual, tc.Result) {
-			t.Fatalf("file: %s\n\n%#v\n\n%#v", tc.File, actual, tc.Result)
-		}
+			if !reflect.DeepEqual(actual, tc.Result) {
+				t.Errorf("file: %s  diff: (actual vs expected)\n\n%s", tc.File, strings.Join(pretty.Diff(actual, tc.Result), "\n"))
+			}
+		})
 	}
 }

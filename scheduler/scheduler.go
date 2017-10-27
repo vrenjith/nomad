@@ -5,7 +5,16 @@ import (
 	"log"
 
 	"github.com/hashicorp/go-memdb"
+	"github.com/hashicorp/nomad/nomad/state"
 	"github.com/hashicorp/nomad/nomad/structs"
+)
+
+const (
+	// SchedulerVersion is the version of the scheduler. Changes to the
+	// scheduler that are incompatible with prior schedulers will increment this
+	// version. It is used to disallow dequeueing when the versions do not match
+	// across the leader and the dequeueing scheduler.
+	SchedulerVersion uint16 = 1
 )
 
 // BuiltinSchedulers contains the built in registered schedulers
@@ -53,24 +62,31 @@ type Scheduler interface {
 // and to enforce complex constraints that require more information than
 // is available to a local state scheduler.
 type State interface {
+	// Config returns the configuration of the state store
+	Config() *state.StateStoreConfig
+
 	// Nodes returns an iterator over all the nodes.
 	// The type of each result is *structs.Node
-	Nodes() (memdb.ResultIterator, error)
+	Nodes(ws memdb.WatchSet) (memdb.ResultIterator, error)
 
 	// AllocsByJob returns the allocations by JobID
-	AllocsByJob(jobID string) ([]*structs.Allocation, error)
+	AllocsByJob(ws memdb.WatchSet, namespace, jobID string, all bool) ([]*structs.Allocation, error)
 
 	// AllocsByNode returns all the allocations by node
-	AllocsByNode(node string) ([]*structs.Allocation, error)
+	AllocsByNode(ws memdb.WatchSet, node string) ([]*structs.Allocation, error)
 
 	// AllocsByNodeTerminal returns all the allocations by node filtering by terminal status
-	AllocsByNodeTerminal(node string, terminal bool) ([]*structs.Allocation, error)
+	AllocsByNodeTerminal(ws memdb.WatchSet, node string, terminal bool) ([]*structs.Allocation, error)
 
 	// GetNodeByID is used to lookup a node by ID
-	NodeByID(nodeID string) (*structs.Node, error)
+	NodeByID(ws memdb.WatchSet, nodeID string) (*structs.Node, error)
 
 	// GetJobByID is used to lookup a job by ID
-	JobByID(id string) (*structs.Job, error)
+	JobByID(ws memdb.WatchSet, namespace, id string) (*structs.Job, error)
+
+	// LatestDeploymentByJobID returns the latest deployment matching the given
+	// job ID
+	LatestDeploymentByJobID(ws memdb.WatchSet, namespace, jobID string) (*structs.Deployment, error)
 }
 
 // Planner interface is used to submit a task allocation plan.

@@ -21,13 +21,14 @@ const (
 // evalState is used to store the current "state of the world"
 // in the context of monitoring an evaluation.
 type evalState struct {
-	status string
-	desc   string
-	node   string
-	job    string
-	allocs map[string]*allocState
-	wait   time.Duration
-	index  uint64
+	status     string
+	desc       string
+	node       string
+	deployment string
+	job        string
+	allocs     map[string]*allocState
+	wait       time.Duration
+	index      uint64
 }
 
 // newEvalState creates and initializes a new monitorState
@@ -48,11 +49,6 @@ type allocState struct {
 	client      string
 	clientDesc  string
 	index       uint64
-
-	// full is the allocation struct with full details. This
-	// must be queried for explicitly so it is only included
-	// if there is important error information inside.
-	full *api.Allocation
 }
 
 // monitor wraps an evaluation monitor and holds metadata and
@@ -109,6 +105,11 @@ func (m *monitor) update(update *evalState) {
 	// Check if the evaluation was triggered by a job
 	if existing.job == "" && update.job != "" {
 		m.ui.Output(fmt.Sprintf("Evaluation triggered by job %q", update.job))
+	}
+
+	// Check if the evaluation was triggered by a deployment
+	if existing.deployment == "" && update.deployment != "" {
+		m.ui.Output(fmt.Sprintf("Evaluation within deployment: %q", limit(update.deployment, m.length)))
 	}
 
 	// Check the allocations
@@ -188,12 +189,8 @@ func (m *monitor) monitor(evalID string, allowPrefix bool) int {
 				m.ui.Error(fmt.Sprintf("Identifier must contain at least two characters."))
 				return 1
 			}
-			if len(evalID)%2 == 1 {
-				// Identifiers must be of even length, so we strip off the last byte
-				// to provide a consistent user experience.
-				evalID = evalID[:len(evalID)-1]
-			}
 
+			evalID = sanatizeUUIDPrefix(evalID)
 			evals, _, err := m.client.Evaluations().PrefixList(evalID)
 			if err != nil {
 				m.ui.Error(fmt.Sprintf("Error reading evaluation: %s", err))
@@ -236,6 +233,7 @@ func (m *monitor) monitor(evalID string, allowPrefix bool) int {
 		state.desc = eval.StatusDescription
 		state.node = eval.NodeID
 		state.job = eval.JobID
+		state.deployment = eval.DeploymentID
 		state.wait = eval.Wait
 		state.index = eval.CreateIndex
 
@@ -325,17 +323,6 @@ func (m *monitor) monitor(evalID string, allowPrefix bool) int {
 	return 0
 }
 
-// dumpAllocStatus is a helper to generate a more user-friendly error message
-// for scheduling failures, displaying a high level status of why the job
-// could not be scheduled out.
-func dumpAllocStatus(ui cli.Ui, alloc *api.Allocation, length int) {
-	// Print filter stats
-	ui.Output(fmt.Sprintf("Allocation %q status %q (%d/%d nodes filtered)",
-		limit(alloc.ID, length), alloc.ClientStatus,
-		alloc.Metrics.NodesFiltered, alloc.Metrics.NodesEvaluated))
-	ui.Output(formatAllocMetrics(alloc.Metrics, true, "  "))
-}
-
 func formatAllocMetrics(metrics *api.AllocationMetric, scores bool, prefix string) string {
 	// Print a helpful message if we have an eligibility problem
 	var out string
@@ -368,6 +355,11 @@ func formatAllocMetrics(metrics *api.AllocationMetric, scores bool, prefix strin
 	}
 	for dim, num := range metrics.DimensionExhausted {
 		out += fmt.Sprintf("%s* Dimension %q exhausted on %d nodes\n", prefix, dim, num)
+	}
+
+	// Print quota info
+	for _, dim := range metrics.QuotaExhausted {
+		out += fmt.Sprintf("%s* Quota limit hit %q\n", prefix, dim)
 	}
 
 	// Print scores

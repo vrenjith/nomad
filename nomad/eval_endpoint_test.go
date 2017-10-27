@@ -1,17 +1,26 @@
 package nomad
 
 import (
+	"encoding/base64"
+	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
+	memdb "github.com/hashicorp/go-memdb"
 	"github.com/hashicorp/net-rpc-msgpackrpc"
+	"github.com/hashicorp/nomad/acl"
+	"github.com/hashicorp/nomad/helper/uuid"
 	"github.com/hashicorp/nomad/nomad/mock"
 	"github.com/hashicorp/nomad/nomad/structs"
+	"github.com/hashicorp/nomad/scheduler"
 	"github.com/hashicorp/nomad/testutil"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestEvalEndpoint_GetEval(t *testing.T) {
+	t.Parallel()
 	s1 := testServer(t, nil)
 	defer s1.Shutdown()
 	codec := rpcClient(t, s1)
@@ -39,7 +48,7 @@ func TestEvalEndpoint_GetEval(t *testing.T) {
 	}
 
 	// Lookup non-existing node
-	get.EvalID = structs.GenerateUUID()
+	get.EvalID = uuid.Generate()
 	if err := msgpackrpc.CallWithCodec(codec, "Eval.GetEval", get, &resp); err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -51,7 +60,68 @@ func TestEvalEndpoint_GetEval(t *testing.T) {
 	}
 }
 
+func TestEvalEndpoint_GetEval_ACL(t *testing.T) {
+	t.Parallel()
+	s1, root := testACLServer(t, nil)
+	defer s1.Shutdown()
+	codec := rpcClient(t, s1)
+	testutil.WaitForLeader(t, s1.RPC)
+	assert := assert.New(t)
+
+	// Create the register request
+	eval1 := mock.Eval()
+	state := s1.fsm.State()
+	state.UpsertEvals(1000, []*structs.Evaluation{eval1})
+
+	// Create ACL tokens
+	validToken := mock.CreatePolicyAndToken(t, state, 1003, "test-valid",
+		mock.NamespacePolicy(structs.DefaultNamespace, "", []string{acl.NamespaceCapabilityReadJob}))
+	invalidToken := mock.CreatePolicyAndToken(t, state, 1001, "test-invalid",
+		mock.NamespacePolicy(structs.DefaultNamespace, "", []string{acl.NamespaceCapabilityListJobs}))
+
+	get := &structs.EvalSpecificRequest{
+		EvalID:       eval1.ID,
+		QueryOptions: structs.QueryOptions{Region: "global"},
+	}
+
+	// Try with no token and expect permission denied
+	{
+		var resp structs.SingleEvalResponse
+		err := msgpackrpc.CallWithCodec(codec, "Eval.GetEval", get, &resp)
+		assert.NotNil(err)
+		assert.Contains(err.Error(), structs.ErrPermissionDenied.Error())
+	}
+
+	// Try with an invalid token and expect permission denied
+	{
+		get.AuthToken = invalidToken.SecretID
+		var resp structs.SingleEvalResponse
+		err := msgpackrpc.CallWithCodec(codec, "Eval.GetEval", get, &resp)
+		assert.NotNil(err)
+		assert.Contains(err.Error(), structs.ErrPermissionDenied.Error())
+	}
+
+	// Lookup the eval using a valid token
+	{
+		get.AuthToken = validToken.SecretID
+		var resp structs.SingleEvalResponse
+		assert.Nil(msgpackrpc.CallWithCodec(codec, "Eval.GetEval", get, &resp))
+		assert.Equal(uint64(1000), resp.Index, "Bad index: %d %d", resp.Index, 1000)
+		assert.Equal(eval1, resp.Eval)
+	}
+
+	// Lookup the eval using a root token
+	{
+		get.AuthToken = root.SecretID
+		var resp structs.SingleEvalResponse
+		assert.Nil(msgpackrpc.CallWithCodec(codec, "Eval.GetEval", get, &resp))
+		assert.Equal(uint64(1000), resp.Index, "Bad index: %d %d", resp.Index, 1000)
+		assert.Equal(eval1, resp.Eval)
+	}
+}
+
 func TestEvalEndpoint_GetEval_Blocking(t *testing.T) {
+	t.Parallel()
 	s1 := testServer(t, nil)
 	defer s1.Shutdown()
 	state := s1.fsm.State()
@@ -83,7 +153,7 @@ func TestEvalEndpoint_GetEval_Blocking(t *testing.T) {
 		EvalID: eval2.ID,
 		QueryOptions: structs.QueryOptions{
 			Region:        "global",
-			MinQueryIndex: 50,
+			MinQueryIndex: 150,
 		},
 	}
 	var resp structs.SingleEvalResponse
@@ -129,6 +199,7 @@ func TestEvalEndpoint_GetEval_Blocking(t *testing.T) {
 }
 
 func TestEvalEndpoint_Dequeue(t *testing.T) {
+	t.Parallel()
 	s1 := testServer(t, func(c *Config) {
 		c.NumSchedulers = 0 // Prevent automatic dequeue
 	})
@@ -142,8 +213,9 @@ func TestEvalEndpoint_Dequeue(t *testing.T) {
 
 	// Dequeue the eval
 	get := &structs.EvalDequeueRequest{
-		Schedulers:   defaultSched,
-		WriteRequest: structs.WriteRequest{Region: "global"},
+		Schedulers:       defaultSched,
+		SchedulerVersion: scheduler.SchedulerVersion,
+		WriteRequest:     structs.WriteRequest{Region: "global"},
 	}
 	var resp structs.EvalDequeueResponse
 	if err := msgpackrpc.CallWithCodec(codec, "Eval.Dequeue", get, &resp); err != nil {
@@ -162,9 +234,86 @@ func TestEvalEndpoint_Dequeue(t *testing.T) {
 	if token != resp.Token {
 		t.Fatalf("bad token: %#v %#v", token, resp.Token)
 	}
+
+	if resp.WaitIndex != eval1.ModifyIndex {
+		t.Fatalf("bad wait index; got %d; want %d", resp.WaitIndex, eval1.ModifyIndex)
+	}
+}
+
+func TestEvalEndpoint_Dequeue_WaitIndex(t *testing.T) {
+	t.Parallel()
+	s1 := testServer(t, func(c *Config) {
+		c.NumSchedulers = 0 // Prevent automatic dequeue
+	})
+	defer s1.Shutdown()
+	codec := rpcClient(t, s1)
+	testutil.WaitForLeader(t, s1.RPC)
+
+	// Create the register request
+	eval1 := mock.Eval()
+	eval2 := mock.Eval()
+	eval2.JobID = eval1.JobID
+	s1.fsm.State().UpsertEvals(1000, []*structs.Evaluation{eval1})
+	s1.evalBroker.Enqueue(eval1)
+	s1.fsm.State().UpsertEvals(1001, []*structs.Evaluation{eval2})
+
+	// Dequeue the eval
+	get := &structs.EvalDequeueRequest{
+		Schedulers:       defaultSched,
+		SchedulerVersion: scheduler.SchedulerVersion,
+		WriteRequest:     structs.WriteRequest{Region: "global"},
+	}
+	var resp structs.EvalDequeueResponse
+	if err := msgpackrpc.CallWithCodec(codec, "Eval.Dequeue", get, &resp); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	if !reflect.DeepEqual(eval1, resp.Eval) {
+		t.Fatalf("bad: %v %v", eval1, resp.Eval)
+	}
+
+	// Ensure outstanding
+	token, ok := s1.evalBroker.Outstanding(eval1.ID)
+	if !ok {
+		t.Fatalf("should be outstanding")
+	}
+	if token != resp.Token {
+		t.Fatalf("bad token: %#v %#v", token, resp.Token)
+	}
+
+	if resp.WaitIndex != 1001 {
+		t.Fatalf("bad wait index; got %d; want %d", resp.WaitIndex, 1001)
+	}
+}
+
+func TestEvalEndpoint_Dequeue_Version_Mismatch(t *testing.T) {
+	t.Parallel()
+	s1 := testServer(t, func(c *Config) {
+		c.NumSchedulers = 0 // Prevent automatic dequeue
+	})
+	defer s1.Shutdown()
+	codec := rpcClient(t, s1)
+	testutil.WaitForLeader(t, s1.RPC)
+
+	// Create the register request
+	eval1 := mock.Eval()
+	s1.evalBroker.Enqueue(eval1)
+
+	// Dequeue the eval
+	get := &structs.EvalDequeueRequest{
+		Schedulers:       defaultSched,
+		SchedulerVersion: 0,
+		WriteRequest:     structs.WriteRequest{Region: "global"},
+	}
+	var resp structs.EvalDequeueResponse
+	err := msgpackrpc.CallWithCodec(codec, "Eval.Dequeue", get, &resp)
+	if err == nil || !strings.Contains(err.Error(), "scheduler version is 0") {
+		t.Fatalf("err: %v", err)
+	}
 }
 
 func TestEvalEndpoint_Ack(t *testing.T) {
+	t.Parallel()
 	s1 := testServer(t, nil)
 	defer s1.Shutdown()
 	codec := rpcClient(t, s1)
@@ -204,6 +353,7 @@ func TestEvalEndpoint_Ack(t *testing.T) {
 }
 
 func TestEvalEndpoint_Nack(t *testing.T) {
+	t.Parallel()
 	s1 := testServer(t, func(c *Config) {
 		// Disable all of the schedulers so we can manually dequeue
 		// evals and check the queue status
@@ -243,13 +393,20 @@ func TestEvalEndpoint_Nack(t *testing.T) {
 	}
 
 	// Should get it back
-	out2, _, _ := s1.evalBroker.Dequeue(defaultSched, time.Second)
-	if out2 != out {
-		t.Fatalf("nack failed")
-	}
+	testutil.WaitForResult(func() (bool, error) {
+		out2, _, _ := s1.evalBroker.Dequeue(defaultSched, time.Second)
+		if out2 != out {
+			return false, fmt.Errorf("nack failed")
+		}
+
+		return true, nil
+	}, func(err error) {
+		t.Fatal(err)
+	})
 }
 
 func TestEvalEndpoint_Update(t *testing.T) {
+	t.Parallel()
 	s1 := testServer(t, nil)
 	defer s1.Shutdown()
 	codec := rpcClient(t, s1)
@@ -286,7 +443,8 @@ func TestEvalEndpoint_Update(t *testing.T) {
 	}
 
 	// Ensure updated
-	outE, err := s1.fsm.State().EvalByID(eval2.ID)
+	ws := memdb.NewWatchSet()
+	outE, err := s1.fsm.State().EvalByID(ws, eval2.ID)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -296,6 +454,7 @@ func TestEvalEndpoint_Update(t *testing.T) {
 }
 
 func TestEvalEndpoint_Create(t *testing.T) {
+	t.Parallel()
 	s1 := testServer(t, func(c *Config) {
 		c.NumSchedulers = 0 // Prevent automatic dequeue
 	})
@@ -333,7 +492,8 @@ func TestEvalEndpoint_Create(t *testing.T) {
 	}
 
 	// Ensure created
-	outE, err := s1.fsm.State().EvalByID(eval1.ID)
+	ws := memdb.NewWatchSet()
+	outE, err := s1.fsm.State().EvalByID(ws, eval1.ID)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -346,6 +506,7 @@ func TestEvalEndpoint_Create(t *testing.T) {
 }
 
 func TestEvalEndpoint_Reap(t *testing.T) {
+	t.Parallel()
 	s1 := testServer(t, nil)
 	defer s1.Shutdown()
 	codec := rpcClient(t, s1)
@@ -369,7 +530,8 @@ func TestEvalEndpoint_Reap(t *testing.T) {
 	}
 
 	// Ensure deleted
-	outE, err := s1.fsm.State().EvalByID(eval1.ID)
+	ws := memdb.NewWatchSet()
+	outE, err := s1.fsm.State().EvalByID(ws, eval1.ID)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -379,6 +541,7 @@ func TestEvalEndpoint_Reap(t *testing.T) {
 }
 
 func TestEvalEndpoint_List(t *testing.T) {
+	t.Parallel()
 	s1 := testServer(t, nil)
 	defer s1.Shutdown()
 	codec := rpcClient(t, s1)
@@ -393,7 +556,10 @@ func TestEvalEndpoint_List(t *testing.T) {
 
 	// Lookup the eval
 	get := &structs.EvalListRequest{
-		QueryOptions: structs.QueryOptions{Region: "global"},
+		QueryOptions: structs.QueryOptions{
+			Region:    "global",
+			Namespace: structs.DefaultNamespace,
+		},
 	}
 	var resp structs.EvalListResponse
 	if err := msgpackrpc.CallWithCodec(codec, "Eval.List", get, &resp); err != nil {
@@ -409,7 +575,11 @@ func TestEvalEndpoint_List(t *testing.T) {
 
 	// Lookup the eval by prefix
 	get = &structs.EvalListRequest{
-		QueryOptions: structs.QueryOptions{Region: "global", Prefix: "aaaabb"},
+		QueryOptions: structs.QueryOptions{
+			Region:    "global",
+			Namespace: structs.DefaultNamespace,
+			Prefix:    "aaaabb",
+		},
 	}
 	var resp2 structs.EvalListResponse
 	if err := msgpackrpc.CallWithCodec(codec, "Eval.List", get, &resp2); err != nil {
@@ -425,7 +595,73 @@ func TestEvalEndpoint_List(t *testing.T) {
 
 }
 
+func TestEvalEndpoint_List_ACL(t *testing.T) {
+	t.Parallel()
+	s1, root := testACLServer(t, nil)
+	defer s1.Shutdown()
+	codec := rpcClient(t, s1)
+	testutil.WaitForLeader(t, s1.RPC)
+	assert := assert.New(t)
+
+	// Create the register request
+	eval1 := mock.Eval()
+	eval1.ID = "aaaaaaaa-3350-4b4b-d185-0e1992ed43e9"
+	eval2 := mock.Eval()
+	eval2.ID = "aaaabbbb-3350-4b4b-d185-0e1992ed43e9"
+	state := s1.fsm.State()
+	assert.Nil(state.UpsertEvals(1000, []*structs.Evaluation{eval1, eval2}))
+
+	// Create ACL tokens
+	validToken := mock.CreatePolicyAndToken(t, state, 1003, "test-valid",
+		mock.NamespacePolicy(structs.DefaultNamespace, "", []string{acl.NamespaceCapabilityReadJob}))
+	invalidToken := mock.CreatePolicyAndToken(t, state, 1001, "test-invalid",
+		mock.NamespacePolicy(structs.DefaultNamespace, "", []string{acl.NamespaceCapabilityListJobs}))
+
+	get := &structs.EvalListRequest{
+		QueryOptions: structs.QueryOptions{
+			Region:    "global",
+			Namespace: structs.DefaultNamespace,
+		},
+	}
+
+	// Try without a token and expect permission denied
+	{
+		var resp structs.EvalListResponse
+		err := msgpackrpc.CallWithCodec(codec, "Eval.List", get, &resp)
+		assert.NotNil(err)
+		assert.Contains(err.Error(), structs.ErrPermissionDenied.Error())
+	}
+
+	// Try with an invalid token and expect permission denied
+	{
+		get.AuthToken = invalidToken.SecretID
+		var resp structs.EvalListResponse
+		err := msgpackrpc.CallWithCodec(codec, "Eval.List", get, &resp)
+		assert.NotNil(err)
+		assert.Contains(err.Error(), structs.ErrPermissionDenied.Error())
+	}
+
+	// List evals with a valid token
+	{
+		get.AuthToken = validToken.SecretID
+		var resp structs.EvalListResponse
+		assert.Nil(msgpackrpc.CallWithCodec(codec, "Eval.List", get, &resp))
+		assert.Equal(uint64(1000), resp.Index, "Bad index: %d %d", resp.Index, 1000)
+		assert.Lenf(resp.Evaluations, 2, "bad: %#v", resp.Evaluations)
+	}
+
+	// List evals with a root token
+	{
+		get.AuthToken = root.SecretID
+		var resp structs.EvalListResponse
+		assert.Nil(msgpackrpc.CallWithCodec(codec, "Eval.List", get, &resp))
+		assert.Equal(uint64(1000), resp.Index, "Bad index: %d %d", resp.Index, 1000)
+		assert.Lenf(resp.Evaluations, 2, "bad: %#v", resp.Evaluations)
+	}
+}
+
 func TestEvalEndpoint_List_Blocking(t *testing.T) {
+	t.Parallel()
 	s1 := testServer(t, nil)
 	defer s1.Shutdown()
 	state := s1.fsm.State()
@@ -445,6 +681,7 @@ func TestEvalEndpoint_List_Blocking(t *testing.T) {
 	req := &structs.EvalListRequest{
 		QueryOptions: structs.QueryOptions{
 			Region:        "global",
+			Namespace:     structs.DefaultNamespace,
 			MinQueryIndex: 1,
 		},
 	}
@@ -490,6 +727,7 @@ func TestEvalEndpoint_List_Blocking(t *testing.T) {
 }
 
 func TestEvalEndpoint_Allocations(t *testing.T) {
+	t.Parallel()
 	s1 := testServer(t, nil)
 	defer s1.Shutdown()
 	codec := rpcClient(t, s1)
@@ -500,6 +738,8 @@ func TestEvalEndpoint_Allocations(t *testing.T) {
 	alloc2 := mock.Alloc()
 	alloc2.EvalID = alloc1.EvalID
 	state := s1.fsm.State()
+	state.UpsertJobSummary(998, mock.JobSummary(alloc1.JobID))
+	state.UpsertJobSummary(999, mock.JobSummary(alloc2.JobID))
 	err := state.UpsertAllocs(1000,
 		[]*structs.Allocation{alloc1, alloc2})
 	if err != nil {
@@ -524,7 +764,72 @@ func TestEvalEndpoint_Allocations(t *testing.T) {
 	}
 }
 
+func TestEvalEndpoint_Allocations_ACL(t *testing.T) {
+	t.Parallel()
+	s1, root := testACLServer(t, nil)
+	defer s1.Shutdown()
+	codec := rpcClient(t, s1)
+	testutil.WaitForLeader(t, s1.RPC)
+	assert := assert.New(t)
+
+	// Create the register request
+	alloc1 := mock.Alloc()
+	alloc2 := mock.Alloc()
+	alloc2.EvalID = alloc1.EvalID
+	state := s1.fsm.State()
+	assert.Nil(state.UpsertJobSummary(998, mock.JobSummary(alloc1.JobID)))
+	assert.Nil(state.UpsertJobSummary(999, mock.JobSummary(alloc2.JobID)))
+	assert.Nil(state.UpsertAllocs(1000, []*structs.Allocation{alloc1, alloc2}))
+
+	// Create ACL tokens
+	validToken := mock.CreatePolicyAndToken(t, state, 1003, "test-valid",
+		mock.NamespacePolicy(structs.DefaultNamespace, "", []string{acl.NamespaceCapabilityReadJob}))
+	invalidToken := mock.CreatePolicyAndToken(t, state, 1001, "test-invalid",
+		mock.NamespacePolicy(structs.DefaultNamespace, "", []string{acl.NamespaceCapabilityListJobs}))
+
+	get := &structs.EvalSpecificRequest{
+		EvalID:       alloc1.EvalID,
+		QueryOptions: structs.QueryOptions{Region: "global"},
+	}
+
+	// Try with no token and expect permission denied
+	{
+		var resp structs.EvalAllocationsResponse
+		err := msgpackrpc.CallWithCodec(codec, "Eval.Allocations", get, &resp)
+		assert.NotNil(err)
+		assert.Contains(err.Error(), structs.ErrPermissionDenied.Error())
+	}
+
+	// Try with an invalid token and expect permission denied
+	{
+		get.AuthToken = invalidToken.SecretID
+		var resp structs.EvalAllocationsResponse
+		err := msgpackrpc.CallWithCodec(codec, "Eval.Allocations", get, &resp)
+		assert.NotNil(err)
+		assert.Contains(err.Error(), structs.ErrPermissionDenied.Error())
+	}
+
+	// Lookup the eval with a valid token
+	{
+		get.AuthToken = validToken.SecretID
+		var resp structs.EvalAllocationsResponse
+		assert.Nil(msgpackrpc.CallWithCodec(codec, "Eval.Allocations", get, &resp))
+		assert.Equal(uint64(1000), resp.Index, "Bad index: %d %d", resp.Index, 1000)
+		assert.Lenf(resp.Allocations, 2, "bad: %#v", resp.Allocations)
+	}
+
+	// Lookup the eval with a root token
+	{
+		get.AuthToken = root.SecretID
+		var resp structs.EvalAllocationsResponse
+		assert.Nil(msgpackrpc.CallWithCodec(codec, "Eval.Allocations", get, &resp))
+		assert.Equal(uint64(1000), resp.Index, "Bad index: %d %d", resp.Index, 1000)
+		assert.Lenf(resp.Allocations, 2, "bad: %#v", resp.Allocations)
+	}
+}
+
 func TestEvalEndpoint_Allocations_Blocking(t *testing.T) {
+	t.Parallel()
 	s1 := testServer(t, nil)
 	defer s1.Shutdown()
 	state := s1.fsm.State()
@@ -537,6 +842,7 @@ func TestEvalEndpoint_Allocations_Blocking(t *testing.T) {
 
 	// Upsert an unrelated alloc first
 	time.AfterFunc(100*time.Millisecond, func() {
+		state.UpsertJobSummary(99, mock.JobSummary(alloc1.JobID))
 		err := state.UpsertAllocs(100, []*structs.Allocation{alloc1})
 		if err != nil {
 			t.Fatalf("err: %v", err)
@@ -545,6 +851,7 @@ func TestEvalEndpoint_Allocations_Blocking(t *testing.T) {
 
 	// Upsert an alloc which will trigger the watch later
 	time.AfterFunc(200*time.Millisecond, func() {
+		state.UpsertJobSummary(199, mock.JobSummary(alloc2.JobID))
 		err := state.UpsertAllocs(200, []*structs.Allocation{alloc2})
 		if err != nil {
 			t.Fatalf("err: %v", err)
@@ -556,7 +863,7 @@ func TestEvalEndpoint_Allocations_Blocking(t *testing.T) {
 		EvalID: alloc2.EvalID,
 		QueryOptions: structs.QueryOptions{
 			Region:        "global",
-			MinQueryIndex: 50,
+			MinQueryIndex: 150,
 		},
 	}
 	var resp structs.EvalAllocationsResponse
@@ -577,6 +884,7 @@ func TestEvalEndpoint_Allocations_Blocking(t *testing.T) {
 }
 
 func TestEvalEndpoint_Reblock_NonExistent(t *testing.T) {
+	t.Parallel()
 	s1 := testServer(t, func(c *Config) {
 		c.NumSchedulers = 0 // Prevent automatic dequeue
 	})
@@ -612,6 +920,7 @@ func TestEvalEndpoint_Reblock_NonExistent(t *testing.T) {
 }
 
 func TestEvalEndpoint_Reblock_NonBlocked(t *testing.T) {
+	t.Parallel()
 	s1 := testServer(t, func(c *Config) {
 		c.NumSchedulers = 0 // Prevent automatic dequeue
 	})
@@ -648,11 +957,12 @@ func TestEvalEndpoint_Reblock_NonBlocked(t *testing.T) {
 	}
 	var resp structs.GenericResponse
 	if err := msgpackrpc.CallWithCodec(codec, "Eval.Reblock", get, &resp); err == nil {
-		t.Fatalf("should error since eval was not in blocked state", err)
+		t.Fatalf("should error since eval was not in blocked state: %v", err)
 	}
 }
 
 func TestEvalEndpoint_Reblock(t *testing.T) {
+	t.Parallel()
 	s1 := testServer(t, func(c *Config) {
 		c.NumSchedulers = 0 // Prevent automatic dequeue
 	})
@@ -698,4 +1008,26 @@ func TestEvalEndpoint_Reblock(t *testing.T) {
 	if bStats.TotalBlocked+bStats.TotalEscaped == 0 {
 		t.Fatalf("ReblockEval didn't insert eval into the blocked eval tracker")
 	}
+}
+
+// TestGenerateMigrateToken asserts the migrate token is valid for use in HTTP
+// headers and CompareMigrateToken works as expected.
+func TestGenerateMigrateToken(t *testing.T) {
+	assert := assert.New(t)
+	allocID := uuid.Generate()
+	nodeSecret := uuid.Generate()
+	token, err := GenerateMigrateToken(allocID, nodeSecret)
+	assert.Nil(err)
+	_, err = base64.URLEncoding.DecodeString(token)
+	assert.Nil(err)
+
+	assert.True(CompareMigrateToken(allocID, nodeSecret, token))
+	assert.False(CompareMigrateToken("x", nodeSecret, token))
+	assert.False(CompareMigrateToken(allocID, "x", token))
+	assert.False(CompareMigrateToken(allocID, nodeSecret, "x"))
+
+	token2, err := GenerateMigrateToken("x", nodeSecret)
+	assert.Nil(err)
+	assert.False(CompareMigrateToken(allocID, nodeSecret, token2))
+	assert.True(CompareMigrateToken("x", nodeSecret, token2))
 }

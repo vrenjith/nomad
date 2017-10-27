@@ -9,11 +9,13 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/hcl"
 	"github.com/hashicorp/hcl/hcl/ast"
-	"github.com/hashicorp/nomad/client/driver"
+	"github.com/hashicorp/nomad/api"
+	"github.com/hashicorp/nomad/helper"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/mitchellh/mapstructure"
 )
@@ -25,7 +27,7 @@ var errPortLabel = fmt.Errorf("Port label does not conform to naming requirement
 //
 // Due to current internal limitations, the entire contents of the
 // io.Reader will be copied into memory first before parsing.
-func Parse(r io.Reader) (*structs.Job, error) {
+func Parse(r io.Reader) (*api.Job, error) {
 	// Copy the reader into an in-memory buffer first since HCL requires it.
 	var buf bytes.Buffer
 	if _, err := io.Copy(&buf, r); err != nil {
@@ -49,11 +51,11 @@ func Parse(r io.Reader) (*structs.Job, error) {
 	valid := []string{
 		"job",
 	}
-	if err := checkHCLKeys(list, valid); err != nil {
+	if err := helper.CheckHCLKeys(list, valid); err != nil {
 		return nil, err
 	}
 
-	var job structs.Job
+	var job api.Job
 
 	// Parse the job out
 	matches := list.Filter("job")
@@ -68,7 +70,7 @@ func Parse(r io.Reader) (*structs.Job, error) {
 }
 
 // ParseFile parses the given path as a job spec.
-func ParseFile(path string) (*structs.Job, error) {
+func ParseFile(path string) (*api.Job, error) {
 	path, err := filepath.Abs(path)
 	if err != nil {
 		return nil, err
@@ -83,10 +85,13 @@ func ParseFile(path string) (*structs.Job, error) {
 	return Parse(f)
 }
 
-func parseJob(result *structs.Job, list *ast.ObjectList) error {
-	list = list.Children()
+func parseJob(result *api.Job, list *ast.ObjectList) error {
 	if len(list.Items) != 1 {
 		return fmt.Errorf("only one 'job' block allowed")
+	}
+	list = list.Children()
+	if len(list.Items) != 1 {
+		return fmt.Errorf("'job' block missing name")
 	}
 
 	// Get our job object
@@ -101,15 +106,12 @@ func parseJob(result *structs.Job, list *ast.ObjectList) error {
 	delete(m, "meta")
 	delete(m, "update")
 	delete(m, "periodic")
+	delete(m, "vault")
+	delete(m, "parameterized")
 
 	// Set the ID and name to the object key
-	result.ID = obj.Keys[0].Token.Value().(string)
-	result.Name = result.ID
-
-	// Defaults
-	result.Priority = 50
-	result.Region = "global"
-	result.Type = "service"
+	result.ID = helper.StringToPtr(obj.Keys[0].Token.Value().(string))
+	result.Name = helper.StringToPtr(*result.ID)
 
 	// Decode the rest
 	if err := mapstructure.WeakDecode(m, result); err != nil {
@@ -121,26 +123,30 @@ func parseJob(result *structs.Job, list *ast.ObjectList) error {
 	if ot, ok := obj.Val.(*ast.ObjectType); ok {
 		listVal = ot.List
 	} else {
-		return fmt.Errorf("job '%s' value: should be an object", result.ID)
+		return fmt.Errorf("job '%s' value: should be an object", *result.ID)
 	}
 
 	// Check for invalid keys
 	valid := []string{
-		"id",
-		"name",
-		"region",
 		"all_at_once",
-		"type",
-		"priority",
-		"datacenters",
 		"constraint",
-		"update",
-		"periodic",
-		"meta",
-		"task",
+		"datacenters",
+		"parameterized",
 		"group",
+		"id",
+		"meta",
+		"name",
+		"namespace",
+		"periodic",
+		"priority",
+		"region",
+		"task",
+		"type",
+		"update",
+		"vault",
+		"vault_token",
 	}
-	if err := checkHCLKeys(listVal, valid); err != nil {
+	if err := helper.CheckHCLKeys(listVal, valid); err != nil {
 		return multierror.Prefix(err, "job:")
 	}
 
@@ -165,6 +171,13 @@ func parseJob(result *structs.Job, list *ast.ObjectList) error {
 		}
 	}
 
+	// If we have a parameterized definition, then parse that
+	if o := listVal.Filter("parameterized"); len(o.Items) > 0 {
+		if err := parseParameterizedJob(&result.ParameterizedJob, o); err != nil {
+			return multierror.Prefix(err, "parameterized ->")
+		}
+	}
+
 	// Parse out meta fields. These are in HCL as a list so we need
 	// to iterate over them and merge them.
 	if metaO := listVal.Filter("meta"); len(metaO.Items) > 0 {
@@ -181,17 +194,16 @@ func parseJob(result *structs.Job, list *ast.ObjectList) error {
 
 	// If we have tasks outside, create TaskGroups for them
 	if o := listVal.Filter("task"); len(o.Items) > 0 {
-		var tasks []*structs.Task
-		if err := parseTasks(result.Name, "", &tasks, o); err != nil {
+		var tasks []*api.Task
+		if err := parseTasks(*result.Name, "", &tasks, o); err != nil {
 			return multierror.Prefix(err, "task:")
 		}
 
-		result.TaskGroups = make([]*structs.TaskGroup, len(tasks), len(tasks)*2)
+		result.TaskGroups = make([]*api.TaskGroup, len(tasks), len(tasks)*2)
 		for i, t := range tasks {
-			result.TaskGroups[i] = &structs.TaskGroup{
-				Name:  t.Name,
-				Count: 1,
-				Tasks: []*structs.Task{t},
+			result.TaskGroups[i] = &api.TaskGroup{
+				Name:  helper.StringToPtr(t.Name),
+				Tasks: []*api.Task{t},
 			}
 		}
 	}
@@ -203,17 +215,38 @@ func parseJob(result *structs.Job, list *ast.ObjectList) error {
 		}
 	}
 
+	// If we have a vault block, then parse that
+	if o := listVal.Filter("vault"); len(o.Items) > 0 {
+		jobVault := &api.Vault{
+			Env:        helper.BoolToPtr(true),
+			ChangeMode: helper.StringToPtr("restart"),
+		}
+
+		if err := parseVault(jobVault, o); err != nil {
+			return multierror.Prefix(err, "vault ->")
+		}
+
+		// Go through the task groups/tasks and if they don't have a Vault block, set it
+		for _, tg := range result.TaskGroups {
+			for _, task := range tg.Tasks {
+				if task.Vault == nil {
+					task.Vault = jobVault
+				}
+			}
+		}
+	}
+
 	return nil
 }
 
-func parseGroups(result *structs.Job, list *ast.ObjectList) error {
+func parseGroups(result *api.Job, list *ast.ObjectList) error {
 	list = list.Children()
 	if len(list.Items) == 0 {
 		return nil
 	}
 
 	// Go through each object and turn it into an actual result.
-	collection := make([]*structs.TaskGroup, 0, len(list.Items))
+	collection := make([]*api.TaskGroup, 0, len(list.Items))
 	seen := make(map[string]struct{})
 	for _, item := range list.Items {
 		n := item.Keys[0].Token.Value().(string)
@@ -239,8 +272,11 @@ func parseGroups(result *structs.Job, list *ast.ObjectList) error {
 			"restart",
 			"meta",
 			"task",
+			"ephemeral_disk",
+			"update",
+			"vault",
 		}
-		if err := checkHCLKeys(listVal, valid); err != nil {
+		if err := helper.CheckHCLKeys(listVal, valid); err != nil {
 			return multierror.Prefix(err, fmt.Sprintf("'%s' ->", n))
 		}
 
@@ -252,15 +288,13 @@ func parseGroups(result *structs.Job, list *ast.ObjectList) error {
 		delete(m, "meta")
 		delete(m, "task")
 		delete(m, "restart")
-
-		// Default count to 1 if not specified
-		if _, ok := m["count"]; !ok {
-			m["count"] = 1
-		}
+		delete(m, "ephemeral_disk")
+		delete(m, "update")
+		delete(m, "vault")
 
 		// Build the group with the basic decode
-		var g structs.TaskGroup
-		g.Name = n
+		var g api.TaskGroup
+		g.Name = helper.StringToPtr(n)
 		if err := mapstructure.WeakDecode(m, &g); err != nil {
 			return err
 		}
@@ -276,6 +310,21 @@ func parseGroups(result *structs.Job, list *ast.ObjectList) error {
 		if o := listVal.Filter("restart"); len(o.Items) > 0 {
 			if err := parseRestartPolicy(&g.RestartPolicy, o); err != nil {
 				return multierror.Prefix(err, fmt.Sprintf("'%s', restart ->", n))
+			}
+		}
+
+		// Parse ephemeral disk
+		if o := listVal.Filter("ephemeral_disk"); len(o.Items) > 0 {
+			g.EphemeralDisk = &api.EphemeralDisk{}
+			if err := parseEphemeralDisk(&g.EphemeralDisk, o); err != nil {
+				return multierror.Prefix(err, fmt.Sprintf("'%s', ephemeral_disk ->", n))
+			}
+		}
+
+		// If we have an update strategy, then parse that
+		if o := listVal.Filter("update"); len(o.Items) > 0 {
+			if err := parseUpdate(&g.Update, o); err != nil {
+				return multierror.Prefix(err, "update ->")
 			}
 		}
 
@@ -295,8 +344,27 @@ func parseGroups(result *structs.Job, list *ast.ObjectList) error {
 
 		// Parse tasks
 		if o := listVal.Filter("task"); len(o.Items) > 0 {
-			if err := parseTasks(result.Name, g.Name, &g.Tasks, o); err != nil {
+			if err := parseTasks(*result.Name, *g.Name, &g.Tasks, o); err != nil {
 				return multierror.Prefix(err, fmt.Sprintf("'%s', task:", n))
+			}
+		}
+
+		// If we have a vault block, then parse that
+		if o := listVal.Filter("vault"); len(o.Items) > 0 {
+			tgVault := &api.Vault{
+				Env:        helper.BoolToPtr(true),
+				ChangeMode: helper.StringToPtr("restart"),
+			}
+
+			if err := parseVault(tgVault, o); err != nil {
+				return multierror.Prefix(err, fmt.Sprintf("'%s', vault ->", n))
+			}
+
+			// Go through the tasks and if they don't have a Vault block, set it
+			for _, task := range g.Tasks {
+				if task.Vault == nil {
+					task.Vault = tgVault
+				}
 			}
 		}
 
@@ -307,7 +375,7 @@ func parseGroups(result *structs.Job, list *ast.ObjectList) error {
 	return nil
 }
 
-func parseRestartPolicy(final **structs.RestartPolicy, list *ast.ObjectList) error {
+func parseRestartPolicy(final **api.RestartPolicy, list *ast.ObjectList) error {
 	list = list.Elem()
 	if len(list.Items) > 1 {
 		return fmt.Errorf("only one 'restart' block allowed")
@@ -323,7 +391,7 @@ func parseRestartPolicy(final **structs.RestartPolicy, list *ast.ObjectList) err
 		"delay",
 		"mode",
 	}
-	if err := checkHCLKeys(obj.Val, valid); err != nil {
+	if err := helper.CheckHCLKeys(obj.Val, valid); err != nil {
 		return err
 	}
 
@@ -332,7 +400,7 @@ func parseRestartPolicy(final **structs.RestartPolicy, list *ast.ObjectList) err
 		return err
 	}
 
-	var result structs.RestartPolicy
+	var result api.RestartPolicy
 	dec, err := mapstructure.NewDecoder(&mapstructure.DecoderConfig{
 		DecodeHook:       mapstructure.StringToTimeDurationHookFunc(),
 		WeaklyTypedInput: true,
@@ -349,18 +417,20 @@ func parseRestartPolicy(final **structs.RestartPolicy, list *ast.ObjectList) err
 	return nil
 }
 
-func parseConstraints(result *[]*structs.Constraint, list *ast.ObjectList) error {
+func parseConstraints(result *[]*api.Constraint, list *ast.ObjectList) error {
 	for _, o := range list.Elem().Items {
 		// Check for invalid keys
 		valid := []string{
 			"attribute",
+			"distinct_hosts",
+			"distinct_property",
 			"operator",
+			"regexp",
+			"set_contains",
 			"value",
 			"version",
-			"regexp",
-			"distinct_hosts",
 		}
-		if err := checkHCLKeys(o.Val, valid); err != nil {
+		if err := helper.CheckHCLKeys(o.Val, valid); err != nil {
 			return err
 		}
 
@@ -387,6 +457,13 @@ func parseConstraints(result *[]*structs.Constraint, list *ast.ObjectList) error
 			m["RTarget"] = constraint
 		}
 
+		// If "set_contains" is provided, set the operand
+		// to "set_contains" and the value to the "RTarget"
+		if constraint, ok := m[structs.ConstraintSetContains]; ok {
+			m["Operand"] = structs.ConstraintSetContains
+			m["RTarget"] = constraint
+		}
+
 		if value, ok := m[structs.ConstraintDistinctHosts]; ok {
 			enabled, err := parseBool(value)
 			if err != nil {
@@ -401,8 +478,13 @@ func parseConstraints(result *[]*structs.Constraint, list *ast.ObjectList) error
 			m["Operand"] = structs.ConstraintDistinctHosts
 		}
 
+		if property, ok := m[structs.ConstraintDistinctProperty]; ok {
+			m["Operand"] = structs.ConstraintDistinctProperty
+			m["LTarget"] = property
+		}
+
 		// Build the constraint
-		var c structs.Constraint
+		var c api.Constraint
 		if err := mapstructure.WeakDecode(m, &c); err != nil {
 			return err
 		}
@@ -412,6 +494,39 @@ func parseConstraints(result *[]*structs.Constraint, list *ast.ObjectList) error
 
 		*result = append(*result, &c)
 	}
+
+	return nil
+}
+
+func parseEphemeralDisk(result **api.EphemeralDisk, list *ast.ObjectList) error {
+	list = list.Elem()
+	if len(list.Items) > 1 {
+		return fmt.Errorf("only one 'ephemeral_disk' block allowed")
+	}
+
+	// Get our ephemeral_disk object
+	obj := list.Items[0]
+
+	// Check for invalid keys
+	valid := []string{
+		"sticky",
+		"size",
+		"migrate",
+	}
+	if err := helper.CheckHCLKeys(obj.Val, valid); err != nil {
+		return err
+	}
+
+	var m map[string]interface{}
+	if err := hcl.DecodeObject(&m, obj.Val); err != nil {
+		return err
+	}
+
+	var ephemeralDisk api.EphemeralDisk
+	if err := mapstructure.WeakDecode(m, &ephemeralDisk); err != nil {
+		return err
+	}
+	*result = &ephemeralDisk
 
 	return nil
 }
@@ -433,7 +548,7 @@ func parseBool(value interface{}) (bool, error) {
 	return enabled, err
 }
 
-func parseTasks(jobName string, taskGroupName string, result *[]*structs.Task, list *ast.ObjectList) error {
+func parseTasks(jobName string, taskGroupName string, result *[]*api.Task, list *ast.ObjectList) error {
 	list = list.Children()
 	if len(list.Items) == 0 {
 		return nil
@@ -460,19 +575,24 @@ func parseTasks(jobName string, taskGroupName string, result *[]*structs.Task, l
 
 		// Check for invalid keys
 		valid := []string{
-			"driver",
-			"user",
-			"env",
-			"service",
+			"artifact",
 			"config",
 			"constraint",
+			"dispatch_payload",
+			"driver",
+			"env",
+			"kill_timeout",
+			"leader",
+			"logs",
 			"meta",
 			"resources",
-			"logs",
-			"kill_timeout",
-			"artifact",
+			"service",
+			"shutdown_delay",
+			"template",
+			"user",
+			"vault",
 		}
-		if err := checkHCLKeys(listVal, valid); err != nil {
+		if err := helper.CheckHCLKeys(listVal, valid); err != nil {
 			return multierror.Prefix(err, fmt.Sprintf("'%s' ->", n))
 		}
 
@@ -480,17 +600,20 @@ func parseTasks(jobName string, taskGroupName string, result *[]*structs.Task, l
 		if err := hcl.DecodeObject(&m, item.Val); err != nil {
 			return err
 		}
+		delete(m, "artifact")
 		delete(m, "config")
-		delete(m, "env")
 		delete(m, "constraint")
-		delete(m, "service")
+		delete(m, "dispatch_payload")
+		delete(m, "env")
+		delete(m, "logs")
 		delete(m, "meta")
 		delete(m, "resources")
-		delete(m, "logs")
-		delete(m, "artifact")
+		delete(m, "service")
+		delete(m, "template")
+		delete(m, "vault")
 
 		// Build the task
-		var t structs.Task
+		var t api.Task
 		t.Name = n
 		if taskGroupName == "" {
 			taskGroupName = n
@@ -538,22 +661,6 @@ func parseTasks(jobName string, taskGroupName string, result *[]*structs.Task, l
 					return err
 				}
 			}
-
-			// Instantiate a driver to validate the configuration
-			d, err := driver.NewDriver(
-				t.Driver,
-				driver.NewEmptyDriverContext(),
-			)
-
-			if err != nil {
-				return multierror.Prefix(err,
-					fmt.Sprintf("'%s', config ->", n))
-			}
-
-			if err := d.Validate(t.Config); err != nil {
-				return multierror.Prefix(err,
-					fmt.Sprintf("'%s', config ->", n))
-			}
 		}
 
 		// Parse constraints
@@ -580,7 +687,7 @@ func parseTasks(jobName string, taskGroupName string, result *[]*structs.Task, l
 
 		// If we have resources, then parse that
 		if o := listVal.Filter("resources"); len(o.Items) > 0 {
-			var r structs.Resources
+			var r api.Resources
 			if err := parseResources(&r, o); err != nil {
 				return multierror.Prefix(err, fmt.Sprintf("'%s',", n))
 			}
@@ -589,7 +696,6 @@ func parseTasks(jobName string, taskGroupName string, result *[]*structs.Task, l
 		}
 
 		// If we have logs then parse that
-		logConfig := structs.DefaultLogConfig()
 		if o := listVal.Filter("logs"); len(o.Items) > 0 {
 			if len(o.Items) > 1 {
 				return fmt.Errorf("only one logs block is allowed in a Task. Number of logs block found: %d", len(o.Items))
@@ -602,7 +708,7 @@ func parseTasks(jobName string, taskGroupName string, result *[]*structs.Task, l
 				"max_files",
 				"max_file_size",
 			}
-			if err := checkHCLKeys(logsBlock.Val, valid); err != nil {
+			if err := helper.CheckHCLKeys(logsBlock.Val, valid); err != nil {
 				return multierror.Prefix(err, fmt.Sprintf("'%s', logs ->", n))
 			}
 
@@ -610,16 +716,65 @@ func parseTasks(jobName string, taskGroupName string, result *[]*structs.Task, l
 				return err
 			}
 
-			if err := mapstructure.WeakDecode(m, &logConfig); err != nil {
+			var log api.LogConfig
+			if err := mapstructure.WeakDecode(m, &log); err != nil {
 				return err
 			}
+
+			t.LogConfig = &log
 		}
-		t.LogConfig = logConfig
 
 		// Parse artifacts
 		if o := listVal.Filter("artifact"); len(o.Items) > 0 {
 			if err := parseArtifacts(&t.Artifacts, o); err != nil {
 				return multierror.Prefix(err, fmt.Sprintf("'%s', artifact ->", n))
+			}
+		}
+
+		// Parse templates
+		if o := listVal.Filter("template"); len(o.Items) > 0 {
+			if err := parseTemplates(&t.Templates, o); err != nil {
+				return multierror.Prefix(err, fmt.Sprintf("'%s', template ->", n))
+			}
+		}
+
+		// If we have a vault block, then parse that
+		if o := listVal.Filter("vault"); len(o.Items) > 0 {
+			v := &api.Vault{
+				Env:        helper.BoolToPtr(true),
+				ChangeMode: helper.StringToPtr("restart"),
+			}
+
+			if err := parseVault(v, o); err != nil {
+				return multierror.Prefix(err, fmt.Sprintf("'%s', vault ->", n))
+			}
+
+			t.Vault = v
+		}
+
+		// If we have a dispatch_payload block parse that
+		if o := listVal.Filter("dispatch_payload"); len(o.Items) > 0 {
+			if len(o.Items) > 1 {
+				return fmt.Errorf("only one dispatch_payload block is allowed in a task. Number of dispatch_payload blocks found: %d", len(o.Items))
+			}
+			var m map[string]interface{}
+			dispatchBlock := o.Items[0]
+
+			// Check for invalid keys
+			valid := []string{
+				"file",
+			}
+			if err := helper.CheckHCLKeys(dispatchBlock.Val, valid); err != nil {
+				return multierror.Prefix(err, fmt.Sprintf("'%s', dispatch_payload ->", n))
+			}
+
+			if err := hcl.DecodeObject(&m, dispatchBlock.Val); err != nil {
+				return err
+			}
+
+			t.DispatchPayload = &api.DispatchPayloadConfig{}
+			if err := mapstructure.WeakDecode(m, t.DispatchPayload); err != nil {
+				return err
 			}
 		}
 
@@ -629,15 +784,16 @@ func parseTasks(jobName string, taskGroupName string, result *[]*structs.Task, l
 	return nil
 }
 
-func parseArtifacts(result *[]*structs.TaskArtifact, list *ast.ObjectList) error {
+func parseArtifacts(result *[]*api.TaskArtifact, list *ast.ObjectList) error {
 	for _, o := range list.Elem().Items {
 		// Check for invalid keys
 		valid := []string{
 			"source",
 			"options",
+			"mode",
 			"destination",
 		}
-		if err := checkHCLKeys(o.Val, valid); err != nil {
+		if err := helper.CheckHCLKeys(o.Val, valid); err != nil {
 			return err
 		}
 
@@ -648,12 +804,7 @@ func parseArtifacts(result *[]*structs.TaskArtifact, list *ast.ObjectList) error
 
 		delete(m, "options")
 
-		// Default to downloading to the local directory.
-		if _, ok := m["destination"]; !ok {
-			m["destination"] = "local/"
-		}
-
-		var ta structs.TaskArtifact
+		var ta api.TaskArtifact
 		if err := mapstructure.WeakDecode(m, &ta); err != nil {
 			return err
 		}
@@ -700,9 +851,57 @@ func parseArtifactOption(result map[string]string, list *ast.ObjectList) error {
 	return nil
 }
 
-func parseServices(jobName string, taskGroupName string, task *structs.Task, serviceObjs *ast.ObjectList) error {
-	task.Services = make([]*structs.Service, len(serviceObjs.Items))
-	var defaultServiceName bool
+func parseTemplates(result *[]*api.Template, list *ast.ObjectList) error {
+	for _, o := range list.Elem().Items {
+		// Check for invalid keys
+		valid := []string{
+			"change_mode",
+			"change_signal",
+			"data",
+			"destination",
+			"left_delimiter",
+			"perms",
+			"right_delimiter",
+			"source",
+			"splay",
+			"env",
+			"vault_grace",
+		}
+		if err := helper.CheckHCLKeys(o.Val, valid); err != nil {
+			return err
+		}
+
+		var m map[string]interface{}
+		if err := hcl.DecodeObject(&m, o.Val); err != nil {
+			return err
+		}
+
+		templ := &api.Template{
+			ChangeMode: helper.StringToPtr("restart"),
+			Splay:      helper.TimeToPtr(5 * time.Second),
+			Perms:      helper.StringToPtr("0644"),
+		}
+
+		dec, err := mapstructure.NewDecoder(&mapstructure.DecoderConfig{
+			DecodeHook:       mapstructure.StringToTimeDurationHookFunc(),
+			WeaklyTypedInput: true,
+			Result:           templ,
+		})
+		if err != nil {
+			return err
+		}
+		if err := dec.Decode(m); err != nil {
+			return err
+		}
+
+		*result = append(*result, templ)
+	}
+
+	return nil
+}
+
+func parseServices(jobName string, taskGroupName string, task *api.Task, serviceObjs *ast.ObjectList) error {
+	task.Services = make([]*api.Service, len(serviceObjs.Items))
 	for idx, o := range serviceObjs.Items {
 		// Check for invalid keys
 		valid := []string{
@@ -710,30 +909,23 @@ func parseServices(jobName string, taskGroupName string, task *structs.Task, ser
 			"tags",
 			"port",
 			"check",
+			"address_mode",
 		}
-		if err := checkHCLKeys(o.Val, valid); err != nil {
+		if err := helper.CheckHCLKeys(o.Val, valid); err != nil {
 			return multierror.Prefix(err, fmt.Sprintf("service (%d) ->", idx))
 		}
 
-		var service structs.Service
+		var service api.Service
 		var m map[string]interface{}
 		if err := hcl.DecodeObject(&m, o.Val); err != nil {
 			return err
 		}
 
 		delete(m, "check")
+		delete(m, "check_restart")
 
 		if err := mapstructure.WeakDecode(m, &service); err != nil {
 			return err
-		}
-
-		if defaultServiceName && service.Name == "" {
-			return fmt.Errorf("Only one service block may omit the Name field")
-		}
-
-		if service.Name == "" {
-			defaultServiceName = true
-			service.Name = fmt.Sprintf("%s-%s-%s", jobName, taskGroupName, task.Name)
 		}
 
 		// Filter checks
@@ -750,14 +942,26 @@ func parseServices(jobName string, taskGroupName string, task *structs.Task, ser
 			}
 		}
 
+		// Filter check_restart
+		if cro := checkList.Filter("check_restart"); len(cro.Items) > 0 {
+			if len(cro.Items) > 1 {
+				return fmt.Errorf("check_restart '%s': cannot have more than 1 check_restart", service.Name)
+			}
+			if cr, err := parseCheckRestart(cro.Items[0]); err != nil {
+				return multierror.Prefix(err, fmt.Sprintf("service: '%s',", service.Name))
+			} else {
+				service.CheckRestart = cr
+			}
+		}
+
 		task.Services[idx] = &service
 	}
 
 	return nil
 }
 
-func parseChecks(service *structs.Service, checkObjs *ast.ObjectList) error {
-	service.Checks = make([]*structs.ServiceCheck, len(checkObjs.Items))
+func parseChecks(service *api.Service, checkObjs *ast.ObjectList) error {
+	service.Checks = make([]api.ServiceCheck, len(checkObjs.Items))
 	for idx, co := range checkObjs.Items {
 		// Check for invalid keys
 		valid := []string{
@@ -770,16 +974,54 @@ func parseChecks(service *structs.Service, checkObjs *ast.ObjectList) error {
 			"port",
 			"command",
 			"args",
+			"initial_status",
+			"tls_skip_verify",
+			"header",
+			"method",
+			"check_restart",
 		}
-		if err := checkHCLKeys(co.Val, valid); err != nil {
+		if err := helper.CheckHCLKeys(co.Val, valid); err != nil {
 			return multierror.Prefix(err, "check ->")
 		}
 
-		var check structs.ServiceCheck
+		var check api.ServiceCheck
 		var cm map[string]interface{}
 		if err := hcl.DecodeObject(&cm, co.Val); err != nil {
 			return err
 		}
+
+		// HCL allows repeating stanzas so merge 'header' into a single
+		// map[string][]string.
+		if headerI, ok := cm["header"]; ok {
+			headerRaw, ok := headerI.([]map[string]interface{})
+			if !ok {
+				return fmt.Errorf("check -> header -> expected a []map[string][]string but found %T", headerI)
+			}
+			m := map[string][]string{}
+			for _, rawm := range headerRaw {
+				for k, vI := range rawm {
+					vs, ok := vI.([]interface{})
+					if !ok {
+						return fmt.Errorf("check -> header -> %q expected a []string but found %T", k, vI)
+					}
+					for _, vI := range vs {
+						v, ok := vI.(string)
+						if !ok {
+							return fmt.Errorf("check -> header -> %q expected a string but found %T", k, vI)
+						}
+						m[k] = append(m[k], v)
+					}
+				}
+			}
+
+			check.Header = m
+
+			// Remove "header" as it has been parsed
+			delete(cm, "header")
+		}
+
+		delete(cm, "check_restart")
+
 		dec, err := mapstructure.NewDecoder(&mapstructure.DecoderConfig{
 			DecodeHook:       mapstructure.StringToTimeDurationHookFunc(),
 			WeaklyTypedInput: true,
@@ -792,13 +1034,64 @@ func parseChecks(service *structs.Service, checkObjs *ast.ObjectList) error {
 			return err
 		}
 
-		service.Checks[idx] = &check
+		// Filter check_restart
+		var checkRestartList *ast.ObjectList
+		if ot, ok := co.Val.(*ast.ObjectType); ok {
+			checkRestartList = ot.List
+		} else {
+			return fmt.Errorf("check_restart '%s': should be an object", check.Name)
+		}
+
+		if cro := checkRestartList.Filter("check_restart"); len(cro.Items) > 0 {
+			if len(cro.Items) > 1 {
+				return fmt.Errorf("check_restart '%s': cannot have more than 1 check_restart", check.Name)
+			}
+			if cr, err := parseCheckRestart(cro.Items[0]); err != nil {
+				return multierror.Prefix(err, fmt.Sprintf("check: '%s',", check.Name))
+			} else {
+				check.CheckRestart = cr
+			}
+		}
+
+		service.Checks[idx] = check
 	}
 
 	return nil
 }
 
-func parseResources(result *structs.Resources, list *ast.ObjectList) error {
+func parseCheckRestart(cro *ast.ObjectItem) (*api.CheckRestart, error) {
+	valid := []string{
+		"limit",
+		"grace",
+		"ignore_warnings",
+	}
+
+	if err := helper.CheckHCLKeys(cro.Val, valid); err != nil {
+		return nil, multierror.Prefix(err, "check_restart ->")
+	}
+
+	var checkRestart api.CheckRestart
+	var crm map[string]interface{}
+	if err := hcl.DecodeObject(&crm, cro.Val); err != nil {
+		return nil, err
+	}
+
+	dec, err := mapstructure.NewDecoder(&mapstructure.DecoderConfig{
+		DecodeHook:       mapstructure.StringToTimeDurationHookFunc(),
+		WeaklyTypedInput: true,
+		Result:           &checkRestart,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := dec.Decode(crm); err != nil {
+		return nil, err
+	}
+
+	return &checkRestart, nil
+}
+
+func parseResources(result *api.Resources, list *ast.ObjectList) error {
 	list = list.Elem()
 	if len(list.Items) == 0 {
 		return nil
@@ -821,12 +1114,12 @@ func parseResources(result *structs.Resources, list *ast.ObjectList) error {
 	// Check for invalid keys
 	valid := []string{
 		"cpu",
-		"disk",
 		"iops",
+		"disk",
 		"memory",
 		"network",
 	}
-	if err := checkHCLKeys(listVal, valid); err != nil {
+	if err := helper.CheckHCLKeys(listVal, valid); err != nil {
 		return multierror.Prefix(err, "resources ->")
 	}
 
@@ -851,11 +1144,11 @@ func parseResources(result *structs.Resources, list *ast.ObjectList) error {
 			"mbits",
 			"port",
 		}
-		if err := checkHCLKeys(o.Items[0].Val, valid); err != nil {
+		if err := helper.CheckHCLKeys(o.Items[0].Val, valid); err != nil {
 			return multierror.Prefix(err, "resources, network ->")
 		}
 
-		var r structs.NetworkResource
+		var r api.NetworkResource
 		var m map[string]interface{}
 		if err := hcl.DecodeObject(&m, o.Items[0].Val); err != nil {
 			return err
@@ -874,23 +1167,19 @@ func parseResources(result *structs.Resources, list *ast.ObjectList) error {
 			return multierror.Prefix(err, "resources, network, ports ->")
 		}
 
-		result.Networks = []*structs.NetworkResource{&r}
+		result.Networks = []*api.NetworkResource{&r}
 	}
 
-	// Combine the parsed resources with a default resource block.
-	min := structs.DefaultResources()
-	min.Merge(result)
-	*result = *min
 	return nil
 }
 
-func parsePorts(networkObj *ast.ObjectList, nw *structs.NetworkResource) error {
+func parsePorts(networkObj *ast.ObjectList, nw *api.NetworkResource) error {
 	// Check for invalid keys
 	valid := []string{
 		"mbits",
 		"port",
 	}
-	if err := checkHCLKeys(networkObj, valid); err != nil {
+	if err := helper.CheckHCLKeys(networkObj, valid); err != nil {
 		return err
 	}
 
@@ -909,7 +1198,7 @@ func parsePorts(networkObj *ast.ObjectList, nw *structs.NetworkResource) error {
 			return fmt.Errorf("found a port label collision: %s", label)
 		}
 		var p map[string]interface{}
-		var res structs.Port
+		var res api.Port
 		if err := hcl.DecodeObject(&p, port.Val); err != nil {
 			return err
 		}
@@ -927,10 +1216,10 @@ func parsePorts(networkObj *ast.ObjectList, nw *structs.NetworkResource) error {
 	return nil
 }
 
-func parseUpdate(result *structs.UpdateStrategy, list *ast.ObjectList) error {
+func parseUpdate(result **api.UpdateStrategy, list *ast.ObjectList) error {
 	list = list.Elem()
 	if len(list.Items) > 1 {
-		return fmt.Errorf("only one 'update' block allowed per job")
+		return fmt.Errorf("only one 'update' block allowed")
 	}
 
 	// Get our resource object
@@ -943,10 +1232,16 @@ func parseUpdate(result *structs.UpdateStrategy, list *ast.ObjectList) error {
 
 	// Check for invalid keys
 	valid := []string{
+		// COMPAT: Remove in 0.7.0. Stagger is deprecated in 0.6.0.
 		"stagger",
 		"max_parallel",
+		"health_check",
+		"min_healthy_time",
+		"healthy_deadline",
+		"auto_revert",
+		"canary",
 	}
-	if err := checkHCLKeys(o.Val, valid); err != nil {
+	if err := helper.CheckHCLKeys(o.Val, valid); err != nil {
 		return err
 	}
 
@@ -961,7 +1256,7 @@ func parseUpdate(result *structs.UpdateStrategy, list *ast.ObjectList) error {
 	return dec.Decode(m)
 }
 
-func parsePeriodic(result **structs.PeriodicConfig, list *ast.ObjectList) error {
+func parsePeriodic(result **api.PeriodicConfig, list *ast.ObjectList) error {
 	list = list.Elem()
 	if len(list.Items) > 1 {
 		return fmt.Errorf("only one 'periodic' block allowed per job")
@@ -980,15 +1275,13 @@ func parsePeriodic(result **structs.PeriodicConfig, list *ast.ObjectList) error 
 		"enabled",
 		"cron",
 		"prohibit_overlap",
+		"time_zone",
 	}
-	if err := checkHCLKeys(o.Val, valid); err != nil {
+	if err := helper.CheckHCLKeys(o.Val, valid); err != nil {
 		return err
 	}
 
-	// Enabled by default if the periodic block exists.
-	if value, ok := m["enabled"]; !ok {
-		m["Enabled"] = true
-	} else {
+	if value, ok := m["enabled"]; ok {
 		enabled, err := parseBool(value)
 		if err != nil {
 			return fmt.Errorf("periodic.enabled should be set to true or false; %v", err)
@@ -1003,7 +1296,7 @@ func parsePeriodic(result **structs.PeriodicConfig, list *ast.ObjectList) error 
 	}
 
 	// Build the constraint
-	var p structs.PeriodicConfig
+	var p api.PeriodicConfig
 	if err := mapstructure.WeakDecode(m, &p); err != nil {
 		return err
 	}
@@ -1011,30 +1304,79 @@ func parsePeriodic(result **structs.PeriodicConfig, list *ast.ObjectList) error 
 	return nil
 }
 
-func checkHCLKeys(node ast.Node, valid []string) error {
-	var list *ast.ObjectList
-	switch n := node.(type) {
-	case *ast.ObjectList:
-		list = n
-	case *ast.ObjectType:
-		list = n.List
-	default:
-		return fmt.Errorf("cannot check HCL keys of type %T", n)
+func parseVault(result *api.Vault, list *ast.ObjectList) error {
+	list = list.Elem()
+	if len(list.Items) == 0 {
+		return nil
+	}
+	if len(list.Items) > 1 {
+		return fmt.Errorf("only one 'vault' block allowed per task")
 	}
 
-	validMap := make(map[string]struct{}, len(valid))
-	for _, v := range valid {
-		validMap[v] = struct{}{}
+	// Get our resource object
+	o := list.Items[0]
+
+	// We need this later
+	var listVal *ast.ObjectList
+	if ot, ok := o.Val.(*ast.ObjectType); ok {
+		listVal = ot.List
+	} else {
+		return fmt.Errorf("vault: should be an object")
 	}
 
-	var result error
-	for _, item := range list.Items {
-		key := item.Keys[0].Token.Value().(string)
-		if _, ok := validMap[key]; !ok {
-			result = multierror.Append(result, fmt.Errorf(
-				"invalid key: %s", key))
-		}
+	// Check for invalid keys
+	valid := []string{
+		"policies",
+		"env",
+		"change_mode",
+		"change_signal",
+	}
+	if err := helper.CheckHCLKeys(listVal, valid); err != nil {
+		return multierror.Prefix(err, "vault ->")
 	}
 
-	return result
+	var m map[string]interface{}
+	if err := hcl.DecodeObject(&m, o.Val); err != nil {
+		return err
+	}
+
+	if err := mapstructure.WeakDecode(m, result); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func parseParameterizedJob(result **api.ParameterizedJobConfig, list *ast.ObjectList) error {
+	list = list.Elem()
+	if len(list.Items) > 1 {
+		return fmt.Errorf("only one 'parameterized' block allowed per job")
+	}
+
+	// Get our resource object
+	o := list.Items[0]
+
+	var m map[string]interface{}
+	if err := hcl.DecodeObject(&m, o.Val); err != nil {
+		return err
+	}
+
+	// Check for invalid keys
+	valid := []string{
+		"payload",
+		"meta_required",
+		"meta_optional",
+	}
+	if err := helper.CheckHCLKeys(o.Val, valid); err != nil {
+		return err
+	}
+
+	// Build the parameterized job block
+	var d api.ParameterizedJobConfig
+	if err := mapstructure.WeakDecode(m, &d); err != nil {
+		return err
+	}
+
+	*result = &d
+	return nil
 }

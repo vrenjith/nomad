@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/url"
 )
@@ -16,6 +17,19 @@ type Agent struct {
 	region     string
 }
 
+// KeyringResponse is a unified key response and can be used for install,
+// remove, use, as well as listing key queries.
+type KeyringResponse struct {
+	Messages map[string]string
+	Keys     map[string]int
+	NumNodes int
+}
+
+// KeyringRequest is request objects for serf key operations.
+type KeyringRequest struct {
+	Key string
+}
+
 // Agent returns a new agent which can be used to query
 // the agent-specific endpoints.
 func (c *Client) Agent() *Agent {
@@ -24,8 +38,8 @@ func (c *Client) Agent() *Agent {
 
 // Self is used to query the /v1/agent/self endpoint and
 // returns information specific to the running agent.
-func (a *Agent) Self() (map[string]map[string]interface{}, error) {
-	var out map[string]map[string]interface{}
+func (a *Agent) Self() (*AgentSelf, error) {
+	var out *AgentSelf
 
 	// Query the self endpoint on the agent
 	_, err := a.client.query("/v1/agent/self", &out, nil)
@@ -42,16 +56,18 @@ func (a *Agent) Self() (map[string]map[string]interface{}, error) {
 // populateCache is used to insert various pieces of static
 // data into the agent handle. This is used during subsequent
 // lookups for the same data later on to save the round trip.
-func (a *Agent) populateCache(info map[string]map[string]interface{}) {
+func (a *Agent) populateCache(self *AgentSelf) {
 	if a.nodeName == "" {
-		a.nodeName, _ = info["member"]["Name"].(string)
+		a.nodeName = self.Member.Name
 	}
-	if tags, ok := info["member"]["Tags"].(map[string]interface{}); ok {
-		if a.datacenter == "" {
-			a.datacenter, _ = tags["dc"].(string)
+	if a.datacenter == "" {
+		if val, ok := self.Config["Datacenter"]; ok {
+			a.datacenter, _ = val.(string)
 		}
-		if a.region == "" {
-			a.region, _ = tags["region"].(string)
+	}
+	if a.region == "" {
+		if val, ok := self.Config["Region"]; ok {
+			a.region, _ = val.(string)
 		}
 	}
 }
@@ -118,8 +134,8 @@ func (a *Agent) Join(addrs ...string) (int, error) {
 }
 
 // Members is used to query all of the known server members
-func (a *Agent) Members() ([]*AgentMember, error) {
-	var resp []*AgentMember
+func (a *Agent) Members() (*ServerMembers, error) {
+	var resp *ServerMembers
 
 	// Query the known members
 	_, err := a.client.query("/v1/agent/members", &resp, nil)
@@ -157,11 +173,88 @@ func (a *Agent) SetServers(addrs []string) error {
 	return err
 }
 
+// ListKeys returns the list of installed keys
+func (a *Agent) ListKeys() (*KeyringResponse, error) {
+	var resp KeyringResponse
+	_, err := a.client.query("/v1/agent/keyring/list", &resp, nil)
+	if err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// InstallKey installs a key in the keyrings of all the serf members
+func (a *Agent) InstallKey(key string) (*KeyringResponse, error) {
+	args := KeyringRequest{
+		Key: key,
+	}
+	var resp KeyringResponse
+	_, err := a.client.write("/v1/agent/keyring/install", &args, &resp, nil)
+	return &resp, err
+}
+
+// UseKey uses a key from the keyring of serf members
+func (a *Agent) UseKey(key string) (*KeyringResponse, error) {
+	args := KeyringRequest{
+		Key: key,
+	}
+	var resp KeyringResponse
+	_, err := a.client.write("/v1/agent/keyring/use", &args, &resp, nil)
+	return &resp, err
+}
+
+// RemoveKey removes a particular key from keyrings of serf members
+func (a *Agent) RemoveKey(key string) (*KeyringResponse, error) {
+	args := KeyringRequest{
+		Key: key,
+	}
+	var resp KeyringResponse
+	_, err := a.client.write("/v1/agent/keyring/remove", &args, &resp, nil)
+	return &resp, err
+}
+
+// Health queries the agent's health
+func (a *Agent) Health() (*AgentHealthResponse, error) {
+	req, err := a.client.newRequest("GET", "/v1/agent/health")
+	if err != nil {
+		return nil, err
+	}
+
+	var health AgentHealthResponse
+	_, resp, err := a.client.doRequest(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	// Always try to decode the response as JSON
+	err = json.NewDecoder(resp.Body).Decode(&health)
+	if err == nil {
+		return &health, nil
+	}
+
+	// Return custom error when response is not expected JSON format
+	return nil, fmt.Errorf("unable to unmarhsal response with status %d: %v", resp.StatusCode, err)
+}
+
 // joinResponse is used to decode the response we get while
 // sending a member join request.
 type joinResponse struct {
 	NumJoined int    `json:"num_joined"`
 	Error     string `json:"error"`
+}
+
+type ServerMembers struct {
+	ServerName   string
+	ServerRegion string
+	ServerDC     string
+	Members      []*AgentMember
+}
+
+type AgentSelf struct {
+	Config map[string]interface{}       `json:"config"`
+	Member AgentMember                  `json:"member"`
+	Stats  map[string]map[string]string `json:"stats"`
 }
 
 // AgentMember represents a cluster member known to the agent
@@ -196,4 +289,20 @@ func (a AgentMembersNameSort) Less(i, j int) bool {
 
 	return a[i].Name < a[j].Name
 
+}
+
+// AgentHealthResponse is the response from the Health endpoint desecribing an
+// agent's health.
+type AgentHealthResponse struct {
+	Client *AgentHealth `json:"client,omitempty"`
+	Server *AgentHealth `json:"server,omitempty"`
+}
+
+// AgentHealth describes the Client or Server's health in a Health request.
+type AgentHealth struct {
+	// Ok is false if the agent is unhealthy
+	Ok bool `json:"ok"`
+
+	// Message describes why the agent is unhealthy
+	Message string `json:"message"`
 }

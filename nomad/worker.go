@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/armon/go-metrics"
+	memdb "github.com/hashicorp/go-memdb"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/hashicorp/nomad/scheduler"
 )
@@ -26,6 +27,10 @@ const (
 	// backoffLimitSlow is the limit of the exponential backoff for
 	// the slower backoff
 	backoffLimitSlow = 10 * time.Second
+
+	// backoffSchedulerVersionMismatch is the backoff between retries when the
+	// scheduler version mismatches that of the leader.
+	backoffSchedulerVersionMismatch = 30 * time.Second
 
 	// dequeueTimeout is used to timeout an evaluation dequeue so that
 	// we can check if there is a shutdown event
@@ -101,7 +106,7 @@ func (w *Worker) checkPaused() {
 func (w *Worker) run() {
 	for {
 		// Dequeue a pending evaluation
-		eval, token, shutdown := w.dequeueEvaluation(dequeueTimeout)
+		eval, token, waitIndex, shutdown := w.dequeueEvaluation(dequeueTimeout)
 		if shutdown {
 			return
 		}
@@ -112,8 +117,8 @@ func (w *Worker) run() {
 			return
 		}
 
-		// Wait for the the raft log to catchup to the evaluation
-		if err := w.waitForIndex(eval.ModifyIndex, raftSyncLimit); err != nil {
+		// Wait for the raft log to catchup to the evaluation
+		if err := w.waitForIndex(waitIndex, raftSyncLimit); err != nil {
 			w.sendAck(eval.ID, token, false)
 			continue
 		}
@@ -131,11 +136,13 @@ func (w *Worker) run() {
 
 // dequeueEvaluation is used to fetch the next ready evaluation.
 // This blocks until an evaluation is available or a timeout is reached.
-func (w *Worker) dequeueEvaluation(timeout time.Duration) (*structs.Evaluation, string, bool) {
+func (w *Worker) dequeueEvaluation(timeout time.Duration) (
+	eval *structs.Evaluation, token string, waitIndex uint64, shutdown bool) {
 	// Setup the request
 	req := structs.EvalDequeueRequest{
-		Schedulers: w.srv.config.EnabledSchedulers,
-		Timeout:    timeout,
+		Schedulers:       w.srv.config.EnabledSchedulers,
+		Timeout:          timeout,
+		SchedulerVersion: scheduler.SchedulerVersion,
 		WriteRequest: structs.WriteRequest{
 			Region: w.srv.config.Region,
 		},
@@ -154,8 +161,17 @@ REQ:
 		if time.Since(w.start) > dequeueErrGrace && !w.srv.IsShutdown() {
 			w.logger.Printf("[ERR] worker: failed to dequeue evaluation: %v", err)
 		}
-		if w.backoffErr(backoffBaselineSlow, backoffLimitSlow) {
-			return nil, "", true
+
+		// Adjust the backoff based on the error. If it is a scheduler version
+		// mismatch we increase the baseline.
+		base, limit := backoffBaselineFast, backoffLimitSlow
+		if strings.Contains(err.Error(), "calling scheduler version") {
+			base = backoffSchedulerVersionMismatch
+			limit = backoffSchedulerVersionMismatch
+		}
+
+		if w.backoffErr(base, limit) {
+			return nil, "", 0, true
 		}
 		goto REQ
 	}
@@ -164,12 +180,12 @@ REQ:
 	// Check if we got a response
 	if resp.Eval != nil {
 		w.logger.Printf("[DEBUG] worker: dequeued evaluation %s", resp.Eval.ID)
-		return resp.Eval, resp.Token, false
+		return resp.Eval, resp.Token, resp.GetWaitIndex(), false
 	}
 
 	// Check for potential shutdown
 	if w.srv.IsShutdown() {
-		return nil, "", true
+		return nil, "", 0, true
 	}
 	goto REQ
 }
@@ -327,7 +343,7 @@ SUBMIT:
 	// allocations.
 	var state scheduler.State
 	if result.RefreshIndex != 0 {
-		// Wait for the the raft log to catchup to the evaluation
+		// Wait for the raft log to catchup to the evaluation
 		w.logger.Printf("[DEBUG] worker: refreshing state to index %d for %q", result.RefreshIndex, plan.EvalID)
 		if err := w.waitForIndex(result.RefreshIndex, raftSyncLimit); err != nil {
 			return nil, nil, err
@@ -429,6 +445,30 @@ func (w *Worker) ReblockEval(eval *structs.Evaluation) error {
 		return fmt.Errorf("shutdown while planning")
 	}
 	defer metrics.MeasureSince([]string{"nomad", "worker", "reblock_eval"}, time.Now())
+
+	// Update the evaluation if the queued jobs is not same as what is
+	// recorded in the job summary
+	ws := memdb.NewWatchSet()
+	summary, err := w.srv.fsm.state.JobSummaryByID(ws, eval.Namespace, eval.JobID)
+	if err != nil {
+		return fmt.Errorf("couldn't retrieve job summary: %v", err)
+	}
+	if summary != nil {
+		var hasChanged bool
+		for tg, summary := range summary.Summary {
+			if queued, ok := eval.QueuedAllocations[tg]; ok {
+				if queued != summary.Queued {
+					hasChanged = true
+					break
+				}
+			}
+		}
+		if hasChanged {
+			if err := w.UpdateEval(eval); err != nil {
+				return err
+			}
+		}
+	}
 
 	// Store the snapshot index in the eval
 	eval.SnapshotIndex = w.snapshotIndex

@@ -3,7 +3,6 @@ package getter
 import (
 	"fmt"
 	"io/ioutil"
-	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -16,6 +15,15 @@ import (
 	"github.com/hashicorp/nomad/nomad/mock"
 	"github.com/hashicorp/nomad/nomad/structs"
 )
+
+// fakeReplacer is a noop version of env.TaskEnv.ReplanceEnv
+type fakeReplacer struct{}
+
+func (fakeReplacer) ReplaceEnv(s string) string {
+	return s
+}
+
+var taskEnv = fakeReplacer{}
 
 func TestGetArtifact_FileAndChecksum(t *testing.T) {
 	// Create the test server hosting the file to download
@@ -39,9 +47,7 @@ func TestGetArtifact_FileAndChecksum(t *testing.T) {
 	}
 
 	// Download the artifact
-	taskEnv := env.NewTaskEnvironment(mock.Node())
-	logger := log.New(os.Stderr, "", log.LstdFlags)
-	if err := GetArtifact(taskEnv, artifact, taskDir, logger); err != nil {
+	if err := GetArtifact(taskEnv, artifact, taskDir); err != nil {
 		t.Fatalf("GetArtifact failed: %v", err)
 	}
 
@@ -75,9 +81,7 @@ func TestGetArtifact_File_RelativeDest(t *testing.T) {
 	}
 
 	// Download the artifact
-	taskEnv := env.NewTaskEnvironment(mock.Node())
-	logger := log.New(os.Stderr, "", log.LstdFlags)
-	if err := GetArtifact(taskEnv, artifact, taskDir, logger); err != nil {
+	if err := GetArtifact(taskEnv, artifact, taskDir); err != nil {
 		t.Fatalf("GetArtifact failed: %v", err)
 	}
 
@@ -94,7 +98,11 @@ func TestGetGetterUrl_Interprolation(t *testing.T) {
 	}
 
 	url := "foo.com"
-	taskEnv := env.NewTaskEnvironment(mock.Node()).SetTaskMeta(map[string]string{"artifact": url})
+	alloc := mock.Alloc()
+	task := alloc.Job.TaskGroups[0].Tasks[0]
+	task.Meta = map[string]string{"artifact": url}
+	taskEnv := env.NewBuilder(mock.Node(), alloc, task, "global").Build()
+
 	act, err := getGetterUrl(taskEnv, artifact)
 	if err != nil {
 		t.Fatalf("getGetterUrl() failed: %v", err)
@@ -127,9 +135,7 @@ func TestGetArtifact_InvalidChecksum(t *testing.T) {
 	}
 
 	// Download the artifact and expect an error
-	taskEnv := env.NewTaskEnvironment(mock.Node())
-	logger := log.New(os.Stderr, "", log.LstdFlags)
-	if err := GetArtifact(taskEnv, artifact, taskDir, logger); err == nil {
+	if err := GetArtifact(taskEnv, artifact, taskDir); err == nil {
 		t.Fatalf("GetArtifact should have failed")
 	}
 }
@@ -194,9 +200,7 @@ func TestGetArtifact_Archive(t *testing.T) {
 		},
 	}
 
-	taskEnv := env.NewTaskEnvironment(mock.Node())
-	logger := log.New(os.Stderr, "", log.LstdFlags)
-	if err := GetArtifact(taskEnv, artifact, taskDir, logger); err != nil {
+	if err := GetArtifact(taskEnv, artifact, taskDir); err != nil {
 		t.Fatalf("GetArtifact failed: %v", err)
 	}
 
@@ -208,4 +212,102 @@ func TestGetArtifact_Archive(t *testing.T) {
 		"test.sh":         "sleep 1\n",
 	}
 	checkContents(taskDir, expected, t)
+}
+
+func TestGetGetterUrl_Queries(t *testing.T) {
+	cases := []struct {
+		name     string
+		artifact *structs.TaskArtifact
+		output   string
+	}{
+		{
+			name: "adds query parameters",
+			artifact: &structs.TaskArtifact{
+				GetterSource: "https://foo.com?test=1",
+				GetterOptions: map[string]string{
+					"foo": "bar",
+					"bam": "boom",
+				},
+			},
+			output: "https://foo.com?bam=boom&foo=bar&test=1",
+		},
+		{
+			name: "git without http",
+			artifact: &structs.TaskArtifact{
+				GetterSource: "github.com/hashicorp/nomad",
+				GetterOptions: map[string]string{
+					"ref": "abcd1234",
+				},
+			},
+			output: "github.com/hashicorp/nomad?ref=abcd1234",
+		},
+		{
+			name: "git using ssh",
+			artifact: &structs.TaskArtifact{
+				GetterSource: "git@github.com:hashicorp/nomad?sshkey=1",
+				GetterOptions: map[string]string{
+					"ref": "abcd1234",
+				},
+			},
+			output: "git@github.com:hashicorp/nomad?ref=abcd1234&sshkey=1",
+		},
+		{
+			name: "s3 scheme 1",
+			artifact: &structs.TaskArtifact{
+				GetterSource: "s3::https://s3.amazonaws.com/bucket/foo",
+				GetterOptions: map[string]string{
+					"aws_access_key_id": "abcd1234",
+				},
+			},
+			output: "s3::https://s3.amazonaws.com/bucket/foo?aws_access_key_id=abcd1234",
+		},
+		{
+			name: "s3 scheme 2",
+			artifact: &structs.TaskArtifact{
+				GetterSource: "s3::https://s3-eu-west-1.amazonaws.com/bucket/foo",
+				GetterOptions: map[string]string{
+					"aws_access_key_id": "abcd1234",
+				},
+			},
+			output: "s3::https://s3-eu-west-1.amazonaws.com/bucket/foo?aws_access_key_id=abcd1234",
+		},
+		{
+			name: "s3 scheme 3",
+			artifact: &structs.TaskArtifact{
+				GetterSource: "bucket.s3.amazonaws.com/foo",
+				GetterOptions: map[string]string{
+					"aws_access_key_id": "abcd1234",
+				},
+			},
+			output: "bucket.s3.amazonaws.com/foo?aws_access_key_id=abcd1234",
+		},
+		{
+			name: "s3 scheme 4",
+			artifact: &structs.TaskArtifact{
+				GetterSource: "bucket.s3-eu-west-1.amazonaws.com/foo/bar",
+				GetterOptions: map[string]string{
+					"aws_access_key_id": "abcd1234",
+				},
+			},
+			output: "bucket.s3-eu-west-1.amazonaws.com/foo/bar?aws_access_key_id=abcd1234",
+		},
+		{
+			name: "local file",
+			artifact: &structs.TaskArtifact{
+				GetterSource: "/foo/bar",
+			},
+			output: "/foo/bar",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			act, err := getGetterUrl(taskEnv, c.artifact)
+			if err != nil {
+				t.Fatalf("want %q; got err %v", c.output, err)
+			} else if act != c.output {
+				t.Fatalf("want %q; got %q", c.output, act)
+			}
+		})
+	}
 }

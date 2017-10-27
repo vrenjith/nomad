@@ -1,11 +1,8 @@
 package api
 
 import (
-	"fmt"
 	"sort"
 	"strconv"
-
-	"github.com/hashicorp/go-cleanhttp"
 )
 
 // Nodes is used to query node-related API endpoints
@@ -25,7 +22,7 @@ func (n *Nodes) List(q *QueryOptions) ([]*NodeListStub, *QueryMeta, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	sort.Sort(NodeIndexSort(resp))
+	sort.Sort(resp)
 	return resp, qm, nil
 }
 
@@ -75,25 +72,26 @@ func (n *Nodes) ForceEvaluate(nodeID string, q *WriteOptions) (string, *WriteMet
 }
 
 func (n *Nodes) Stats(nodeID string, q *QueryOptions) (*HostStats, error) {
-	node, _, err := n.client.Nodes().Info(nodeID, q)
-	if err != nil {
-		return nil, err
-	}
-	if node.HTTPAddr == "" {
-		return nil, fmt.Errorf("http addr of the node %q is running is not advertised", nodeID)
-	}
-	client, err := NewClient(&Config{
-		Address:    fmt.Sprintf("http://%s", node.HTTPAddr),
-		HttpClient: cleanhttp.DefaultClient(),
-	})
+	nodeClient, err := n.client.GetNodeClient(nodeID, q)
 	if err != nil {
 		return nil, err
 	}
 	var resp HostStats
-	if _, err := client.query("/v1/client/stats", &resp, nil); err != nil {
+	if _, err := nodeClient.query("/v1/client/stats", &resp, nil); err != nil {
 		return nil, err
 	}
 	return &resp, nil
+}
+
+func (n *Nodes) GC(nodeID string, q *QueryOptions) error {
+	nodeClient, err := n.client.GetNodeClient(nodeID, q)
+	if err != nil {
+		return err
+	}
+
+	var resp struct{}
+	_, err = nodeClient.query("/v1/client/gc", &resp, nil)
+	return err
 }
 
 // Node is used to deserialize a node entry.
@@ -102,6 +100,7 @@ type Node struct {
 	Datacenter        string
 	Name              string
 	HTTPAddr          string
+	TLSEnabled        bool
 	Attributes        map[string]string
 	Resources         *Resources
 	Reserved          *Resources
@@ -111,6 +110,7 @@ type Node struct {
 	Drain             bool
 	Status            string
 	StatusDescription string
+	StatusUpdatedAt   int64
 	CreateIndex       uint64
 	ModifyIndex       uint64
 }
@@ -155,6 +155,7 @@ type NodeListStub struct {
 	Datacenter        string
 	Name              string
 	NodeClass         string
+	Version           string
 	Drain             bool
 	Status            string
 	StatusDescription string

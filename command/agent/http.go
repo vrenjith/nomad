@@ -2,18 +2,22 @@ package agent
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/http/pprof"
+	"os"
 	"strconv"
 	"time"
 
 	"github.com/NYTimes/gziphandler"
+	"github.com/elazarl/go-bindata-assetfs"
+	"github.com/hashicorp/nomad/helper/tlsutil"
 	"github.com/hashicorp/nomad/nomad/structs"
+	"github.com/rs/cors"
 	"github.com/ugorji/go/codec"
 )
 
@@ -26,13 +30,25 @@ const (
 	// this is checked to switch between the ACLToken and
 	// AtlasACLToken
 	scadaHTTPAddr = "SCADA"
+
+	// ErrEntOnly is the error returned if accessing an enterprise only
+	// endpoint
+	ErrEntOnly = "Nomad Enterprise only endpoint"
 )
 
 var (
-	// jsonHandle and jsonHandlePretty are the codec handles to JSON encode
-	// structs. The pretty handle will add indents for easier human consumption.
-	jsonHandle       = &codec.JsonHandle{}
-	jsonHandlePretty = &codec.JsonHandle{Indent: 4}
+	// Set to false by stub_asset if the ui build tag isn't enabled
+	uiEnabled = true
+
+	// Overridden if the ui build tag isn't enabled
+	stubHTML = ""
+
+	// allowCORS sets permissive CORS headers for a handler
+	allowCORS = cors.New(cors.Options{
+		AllowedOrigins: []string{"*"},
+		AllowedMethods: []string{"HEAD", "GET"},
+		AllowedHeaders: []string{"*"},
+	})
 )
 
 // HTTPServer is used to wrap an Agent and expose it over an HTTP interface
@@ -41,15 +57,36 @@ type HTTPServer struct {
 	mux      *http.ServeMux
 	listener net.Listener
 	logger   *log.Logger
-	addr     string
+	Addr     string
 }
 
 // NewHTTPServer starts new HTTP server over the agent
-func NewHTTPServer(agent *Agent, config *Config, logOutput io.Writer) (*HTTPServer, error) {
+func NewHTTPServer(agent *Agent, config *Config) (*HTTPServer, error) {
 	// Start the listener
-	ln, err := config.Listener("tcp", config.Addresses.HTTP, config.Ports.HTTP)
+	lnAddr, err := net.ResolveTCPAddr("tcp", config.normalizedAddrs.HTTP)
+	if err != nil {
+		return nil, err
+	}
+	ln, err := config.Listener("tcp", lnAddr.IP.String(), lnAddr.Port)
 	if err != nil {
 		return nil, fmt.Errorf("failed to start HTTP listener: %v", err)
+	}
+
+	// If TLS is enabled, wrap the listener with a TLS listener
+	if config.TLSConfig.EnableHTTP {
+		tlsConf := &tlsutil.Config{
+			VerifyIncoming:       config.TLSConfig.VerifyHTTPSClient,
+			VerifyOutgoing:       true,
+			VerifyServerHostname: config.TLSConfig.VerifyServerHostname,
+			CAFile:               config.TLSConfig.CAFile,
+			CertFile:             config.TLSConfig.CertFile,
+			KeyFile:              config.TLSConfig.KeyFile,
+		}
+		tlsConfig, err := tlsConf.IncomingTLSConfig()
+		if err != nil {
+			return nil, err
+		}
+		ln = tls.NewListener(tcpKeepAliveListener{ln.(*net.TCPListener)}, tlsConfig)
 	}
 
 	// Create the mux
@@ -60,13 +97,19 @@ func NewHTTPServer(agent *Agent, config *Config, logOutput io.Writer) (*HTTPServ
 		agent:    agent,
 		mux:      mux,
 		listener: ln,
-		logger:   log.New(logOutput, "", log.LstdFlags),
-		addr:     ln.Addr().String(),
+		logger:   agent.logger,
+		Addr:     ln.Addr().String(),
 	}
 	srv.registerHandlers(config.EnableDebug)
 
-	// Start the server
-	go http.Serve(ln, gziphandler.GzipHandler(mux))
+	// Handle requests with gzip compression
+	gzip, err := gziphandler.GzipHandlerWithOpts(gziphandler.MinSize(0))
+	if err != nil {
+		return nil, err
+	}
+
+	go http.Serve(ln, gzip(mux))
+
 	return srv, nil
 }
 
@@ -82,13 +125,31 @@ func newScadaHttp(agent *Agent, list net.Listener) *HTTPServer {
 		mux:      mux,
 		listener: list,
 		logger:   agent.logger,
-		addr:     scadaHTTPAddr,
+		Addr:     scadaHTTPAddr,
 	}
 	srv.registerHandlers(false) // Never allow debug for SCADA
 
-	// Start the server
+	// Handle requests with gzip compression
 	go http.Serve(list, gziphandler.GzipHandler(mux))
+
 	return srv
+}
+
+// tcpKeepAliveListener sets TCP keep-alive timeouts on accepted
+// connections. It's used by NewHttpServer so
+// dead TCP connections eventually go away.
+type tcpKeepAliveListener struct {
+	*net.TCPListener
+}
+
+func (ln tcpKeepAliveListener) Accept() (c net.Conn, err error) {
+	tc, err := ln.AcceptTCP()
+	if err != nil {
+		return
+	}
+	tc.SetKeepAlive(true)
+	tc.SetKeepAlivePeriod(30 * time.Second)
+	return tc, nil
 }
 
 // Shutdown is used to shutdown the HTTP server
@@ -113,35 +174,88 @@ func (s *HTTPServer) registerHandlers(enableDebug bool) {
 	s.mux.HandleFunc("/v1/evaluations", s.wrap(s.EvalsRequest))
 	s.mux.HandleFunc("/v1/evaluation/", s.wrap(s.EvalSpecificRequest))
 
+	s.mux.HandleFunc("/v1/deployments", s.wrap(s.DeploymentsRequest))
+	s.mux.HandleFunc("/v1/deployment/", s.wrap(s.DeploymentSpecificRequest))
+
+	s.mux.HandleFunc("/v1/acl/policies", s.wrap(s.ACLPoliciesRequest))
+	s.mux.HandleFunc("/v1/acl/policy/", s.wrap(s.ACLPolicySpecificRequest))
+
+	s.mux.HandleFunc("/v1/acl/bootstrap", s.wrap(s.ACLTokenBootstrap))
+	s.mux.HandleFunc("/v1/acl/tokens", s.wrap(s.ACLTokensRequest))
+	s.mux.HandleFunc("/v1/acl/token", s.wrap(s.ACLTokenSpecificRequest))
+	s.mux.HandleFunc("/v1/acl/token/", s.wrap(s.ACLTokenSpecificRequest))
+
 	s.mux.HandleFunc("/v1/client/fs/", s.wrap(s.FsRequest))
-	s.mux.HandleFunc("/v1/client/stats", s.wrap(s.ClientStatsRequest))
-	s.mux.HandleFunc("/v1/client/allocation/", s.wrap(s.ClientAllocRequest))
+	s.mux.HandleFunc("/v1/client/gc", s.wrap(s.ClientGCRequest))
+	s.mux.Handle("/v1/client/stats", wrapCORS(s.wrap(s.ClientStatsRequest)))
+	s.mux.Handle("/v1/client/allocation/", wrapCORS(s.wrap(s.ClientAllocRequest)))
 
 	s.mux.HandleFunc("/v1/agent/self", s.wrap(s.AgentSelfRequest))
 	s.mux.HandleFunc("/v1/agent/join", s.wrap(s.AgentJoinRequest))
 	s.mux.HandleFunc("/v1/agent/members", s.wrap(s.AgentMembersRequest))
 	s.mux.HandleFunc("/v1/agent/force-leave", s.wrap(s.AgentForceLeaveRequest))
 	s.mux.HandleFunc("/v1/agent/servers", s.wrap(s.AgentServersRequest))
+	s.mux.HandleFunc("/v1/agent/keyring/", s.wrap(s.KeyringOperationRequest))
+	s.mux.HandleFunc("/v1/agent/health", s.wrap(s.HealthRequest))
+
+	s.mux.HandleFunc("/v1/metrics", s.wrap(s.MetricsRequest))
+
+	s.mux.HandleFunc("/v1/validate/job", s.wrap(s.ValidateJobRequest))
 
 	s.mux.HandleFunc("/v1/regions", s.wrap(s.RegionListRequest))
 
 	s.mux.HandleFunc("/v1/status/leader", s.wrap(s.StatusLeaderRequest))
 	s.mux.HandleFunc("/v1/status/peers", s.wrap(s.StatusPeersRequest))
 
+	s.mux.HandleFunc("/v1/search", s.wrap(s.SearchRequest))
+
+	s.mux.HandleFunc("/v1/operator/", s.wrap(s.OperatorRequest))
+
 	s.mux.HandleFunc("/v1/system/gc", s.wrap(s.GarbageCollectRequest))
+	s.mux.HandleFunc("/v1/system/reconcile/summaries", s.wrap(s.ReconcileJobSummaries))
+
+	if uiEnabled {
+		s.mux.Handle("/ui/", http.StripPrefix("/ui/", handleUI(http.FileServer(&UIAssetWrapper{FileSystem: assetFS()}))))
+	} else {
+		// Write the stubHTML
+		s.mux.HandleFunc("/ui/", func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(stubHTML))
+		})
+	}
+	s.mux.Handle("/", handleRootRedirect())
 
 	if enableDebug {
 		s.mux.HandleFunc("/debug/pprof/", pprof.Index)
 		s.mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
 		s.mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
 		s.mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		s.mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 	}
+
+	// Register enterprise endpoints.
+	s.registerEnterpriseHandlers()
 }
 
 // HTTPCodedError is used to provide the HTTP error code
 type HTTPCodedError interface {
 	error
 	Code() int
+}
+
+type UIAssetWrapper struct {
+	FileSystem *assetfs.AssetFS
+}
+
+func (fs *UIAssetWrapper) Open(name string) (http.File, error) {
+	if file, err := fs.FileSystem.Open(name); err == nil {
+		return file, nil
+	} else {
+		// serve index.html instead of 404ing
+		if err == os.ErrNotExist {
+			return fs.FileSystem.Open("index.html")
+		}
+		return nil, err
+	}
 }
 
 func CodedError(c int, s string) HTTPCodedError {
@@ -159,6 +273,22 @@ func (e *codedError) Error() string {
 
 func (e *codedError) Code() int {
 	return e.code
+}
+
+func handleUI(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		header := w.Header()
+		header.Add("Content-Security-Policy", "default-src 'none'; connect-src 'self'; img-src 'self' data:; script-src 'self'; style-src 'self' 'unsafe-inline'; form-action 'none'; frame-ancestors 'none'")
+		h.ServeHTTP(w, req)
+		return
+	})
+}
+
+func handleRootRedirect() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		http.Redirect(w, req, "/ui/", 307)
+		return
+	})
 }
 
 // wrap is used to wrap functions to make them more convenient
@@ -180,7 +310,13 @@ func (s *HTTPServer) wrap(handler func(resp http.ResponseWriter, req *http.Reque
 			code := 500
 			if http, ok := err.(HTTPCodedError); ok {
 				code = http.Code()
+			} else {
+				switch err.Error() {
+				case structs.ErrPermissionDenied.Error(), structs.ErrTokenNotFound.Error():
+					code = 403
+				}
 			}
+
 			resp.WriteHeader(code)
 			resp.Write([]byte(err.Error()))
 			return
@@ -197,13 +333,13 @@ func (s *HTTPServer) wrap(handler func(resp http.ResponseWriter, req *http.Reque
 		if obj != nil {
 			var buf bytes.Buffer
 			if prettyPrint {
-				enc := codec.NewEncoder(&buf, jsonHandlePretty)
+				enc := codec.NewEncoder(&buf, structs.JsonHandlePretty)
 				err = enc.Encode(obj)
 				if err == nil {
 					buf.Write([]byte("\n"))
 				}
 			} else {
-				enc := codec.NewEncoder(&buf, jsonHandle)
+				enc := codec.NewEncoder(&buf, structs.JsonHandle)
 				err = enc.Encode(obj)
 			}
 			if err != nil {
@@ -306,10 +442,42 @@ func (s *HTTPServer) parseRegion(req *http.Request, r *string) {
 	}
 }
 
+// parseNamespace is used to parse the ?namespace parameter
+func parseNamespace(req *http.Request, n *string) {
+	if other := req.URL.Query().Get("namespace"); other != "" {
+		*n = other
+	} else if *n == "" {
+		*n = structs.DefaultNamespace
+	}
+}
+
+// parseToken is used to parse the X-Nomad-Token param
+func (s *HTTPServer) parseToken(req *http.Request, token *string) {
+	if other := req.Header.Get("X-Nomad-Token"); other != "" {
+		*token = other
+		return
+	}
+}
+
 // parse is a convenience method for endpoints that need to parse multiple flags
 func (s *HTTPServer) parse(resp http.ResponseWriter, req *http.Request, r *string, b *structs.QueryOptions) bool {
 	s.parseRegion(req, r)
+	s.parseToken(req, &b.AuthToken)
 	parseConsistency(req, b)
 	parsePrefix(req, b)
+	parseNamespace(req, &b.Namespace)
 	return parseWait(resp, req, b)
+}
+
+// parseWriteRequest is a convience method for endpoints that need to parse a
+// write request.
+func (s *HTTPServer) parseWriteRequest(req *http.Request, w *structs.WriteRequest) {
+	parseNamespace(req, &w.Namespace)
+	s.parseToken(req, &w.AuthToken)
+	s.parseRegion(req, &w.Region)
+}
+
+// wrapCORS wraps a HandlerFunc in allowCORS and returns a http.Handler
+func wrapCORS(f func(http.ResponseWriter, *http.Request)) http.Handler {
+	return allowCORS.Handler(http.HandlerFunc(f))
 }

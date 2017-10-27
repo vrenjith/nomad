@@ -7,9 +7,8 @@ import (
 	"time"
 
 	"github.com/hashicorp/nomad/api"
-	"github.com/hashicorp/nomad/jobspec"
 	"github.com/hashicorp/nomad/scheduler"
-	"github.com/mitchellh/colorstring"
+	"github.com/posener/complete"
 )
 
 const (
@@ -18,24 +17,28 @@ const (
 nomad run -check-index %d %s
 
 When running the job with the check-index flag, the job will only be run if the
-server side version matches the the job modify index returned. If the index has
+server side version matches the job modify index returned. If the index has
 changed, another user has modified the job and the plan's results are
 potentially invalid.`
 )
 
 type PlanCommand struct {
 	Meta
-	color *colorstring.Colorize
+	JobGetter
 }
 
 func (c *PlanCommand) Help() string {
 	helpText := `
-Usage: nomad plan [options] <file>
+Usage: nomad plan [options] <path>
 
   Plan invokes a dry-run of the scheduler to determine the effects of submitting
   either a new or updated version of a job. The plan will not result in any
   changes to the cluster but gives insight into whether the job could be run
   successfully and how it would affect existing allocations.
+
+  If the supplied path is "-", the jobfile is read from stdin. Otherwise
+  it is read from the file at the supplied path or downloaded and
+  read from URL specified.
 
   A job modify index is returned with the plan. This value can be used when
   submitting the job using "nomad run -check-index", which will check that the job
@@ -46,7 +49,12 @@ Usage: nomad plan [options] <file>
   give insight into what the scheduler will attempt to do and why.
 
   If the job has specified the region, the -region flag and NOMAD_REGION
-  environment variable are overridden and the the job's region is used.
+  environment variable are overridden and the job's region is used.
+
+  Plan will return one of the following exit codes:
+    * 0: No allocations created or destroyed.
+    * 1: Allocations created or destroyed.
+    * 255: Error determining plan results.
 
 General Options:
 
@@ -55,8 +63,11 @@ General Options:
 Plan Options:
 
   -diff
-	Determines whether the diff between the remote job and planned job is shown.
-	Defaults to true.
+    Determines whether the diff between the remote job and planned job is shown.
+    Defaults to true.
+
+  -policy-override
+    Sets the flag to force override any soft mandatory Sentinel policies.
 
   -verbose
     Increase diff verbosity.
@@ -68,66 +79,78 @@ func (c *PlanCommand) Synopsis() string {
 	return "Dry-run a job update to determine its effects"
 }
 
+func (c *PlanCommand) AutocompleteFlags() complete.Flags {
+	return mergeAutocompleteFlags(c.Meta.AutocompleteFlags(FlagSetClient),
+		complete.Flags{
+			"-diff":            complete.PredictNothing,
+			"-policy-override": complete.PredictNothing,
+			"-verbose":         complete.PredictNothing,
+		})
+}
+
+func (c *PlanCommand) AutocompleteArgs() complete.Predictor {
+	return complete.PredictOr(complete.PredictFiles("*.nomad"), complete.PredictFiles("*.hcl"))
+}
+
 func (c *PlanCommand) Run(args []string) int {
-	var diff, verbose bool
+	var diff, policyOverride, verbose bool
 
 	flags := c.Meta.FlagSet("plan", FlagSetClient)
 	flags.Usage = func() { c.Ui.Output(c.Help()) }
 	flags.BoolVar(&diff, "diff", true, "")
+	flags.BoolVar(&policyOverride, "policy-override", false, "")
 	flags.BoolVar(&verbose, "verbose", false, "")
 
 	if err := flags.Parse(args); err != nil {
-		return 1
+		return 255
 	}
 
 	// Check that we got exactly one job
 	args = flags.Args()
 	if len(args) != 1 {
 		c.Ui.Error(c.Help())
-		return 1
+		return 255
 	}
-	file := args[0]
 
-	// Parse the job file
-	job, err := jobspec.ParseFile(file)
+	path := args[0]
+	// Get Job struct from Jobfile
+	job, err := c.JobGetter.ApiJob(args[0])
 	if err != nil {
-		c.Ui.Error(fmt.Sprintf("Error parsing job file %s: %s", file, err))
-		return 1
-	}
-
-	// Initialize any fields that need to be.
-	job.InitFields()
-
-	// Check that the job is valid
-	if err := job.Validate(); err != nil {
-		c.Ui.Error(fmt.Sprintf("Error validating job: %s", err))
-		return 1
-	}
-
-	// Convert it to something we can use
-	apiJob, err := convertStructJob(job)
-	if err != nil {
-		c.Ui.Error(fmt.Sprintf("Error converting job: %s", err))
-		return 1
+		c.Ui.Error(fmt.Sprintf("Error getting job struct: %s", err))
+		return 255
 	}
 
 	// Get the HTTP client
 	client, err := c.Meta.Client()
 	if err != nil {
 		c.Ui.Error(fmt.Sprintf("Error initializing client: %s", err))
-		return 1
+		return 255
 	}
 
 	// Force the region to be that of the job.
-	if r := job.Region; r != "" {
-		client.SetRegion(r)
+	if r := job.Region; r != nil {
+		client.SetRegion(*r)
+	}
+
+	// Force the namespace to be that of the job.
+	if n := job.Namespace; n != nil {
+		client.SetNamespace(*n)
+	}
+
+	// Setup the options
+	opts := &api.PlanOptions{}
+	if diff {
+		opts.Diff = true
+	}
+	if policyOverride {
+		opts.PolicyOverride = true
 	}
 
 	// Submit the job
-	resp, _, err := client.Jobs().Plan(apiJob, diff, nil)
+	resp, _, err := client.Jobs().PlanOpts(job, opts, nil)
 	if err != nil {
 		c.Ui.Error(fmt.Sprintf("Error during plan: %s", err))
-		return 1
+		return 255
 	}
 
 	// Print the diff if not disabled
@@ -138,11 +161,31 @@ func (c *PlanCommand) Run(args []string) int {
 
 	// Print the scheduler dry-run output
 	c.Ui.Output(c.Colorize().Color("[bold]Scheduler dry-run:[reset]"))
-	c.Ui.Output(c.Colorize().Color(formatDryRun(resp)))
+	c.Ui.Output(c.Colorize().Color(formatDryRun(resp, job)))
 	c.Ui.Output("")
 
+	// Print any warnings if there are any
+	if resp.Warnings != "" {
+		c.Ui.Output(
+			c.Colorize().Color(fmt.Sprintf("[bold][yellow]Job Warnings:\n%s[reset]\n", resp.Warnings)))
+	}
+
 	// Print the job index info
-	c.Ui.Output(c.Colorize().Color(formatJobModifyIndex(resp.JobModifyIndex, file)))
+	c.Ui.Output(c.Colorize().Color(formatJobModifyIndex(resp.JobModifyIndex, path)))
+	return getExitCode(resp)
+}
+
+// getExitCode returns 0:
+// * 0: No allocations created or destroyed.
+// * 1: Allocations created or destroyed.
+func getExitCode(resp *api.JobPlanResponse) int {
+	// Check for changes
+	for _, d := range resp.Annotations.DesiredTGUpdates {
+		if d.Stop+d.Place+d.Migrate+d.DestructiveUpdate+d.Canary > 0 {
+			return 1
+		}
+	}
+
 	return 0
 }
 
@@ -155,7 +198,7 @@ func formatJobModifyIndex(jobModifyIndex uint64, jobName string) string {
 }
 
 // formatDryRun produces a string explaining the results of the dry run.
-func formatDryRun(resp *api.JobPlanResponse) string {
+func formatDryRun(resp *api.JobPlanResponse, job *api.Job) string {
 	var rolling *api.Evaluation
 	for _, eval := range resp.CreatedEvals {
 		if eval.TriggeredBy == "rolling-update" {
@@ -167,7 +210,12 @@ func formatDryRun(resp *api.JobPlanResponse) string {
 	if len(resp.FailedTGAllocs) == 0 {
 		out = "[bold][green]- All tasks successfully allocated.[reset]\n"
 	} else {
-		out = "[bold][yellow]- WARNING: Failed to place all allocations.[reset]\n"
+		// Change the output depending on if we are a system job or not
+		if job.Type != nil && *job.Type == "system" {
+			out = "[bold][yellow]- WARNING: Failed to place allocations on all nodes.[reset]\n"
+		} else {
+			out = "[bold][yellow]- WARNING: Failed to place all allocations.[reset]\n"
+		}
 		sorted := sortedTaskGroupFromMetrics(resp.FailedTGAllocs)
 		for _, tg := range sorted {
 			metrics := resp.FailedTGAllocs[tg]
@@ -188,16 +236,22 @@ func formatDryRun(resp *api.JobPlanResponse) string {
 		out += fmt.Sprintf("[green]- Rolling update, next evaluation will be in %s.\n", rolling.Wait)
 	}
 
-	if next := resp.NextPeriodicLaunch; !next.IsZero() {
-		out += fmt.Sprintf("[green]- If submitted now, next periodic launch would be at %s (%s from now).\n",
-			formatTime(next), formatTimeDifference(time.Now().UTC(), next, time.Second))
+	if next := resp.NextPeriodicLaunch; !next.IsZero() && !job.IsParameterized() {
+		loc, err := job.Periodic.GetLocation()
+		if err != nil {
+			out += fmt.Sprintf("[yellow]- Invalid time zone: %v", err)
+		} else {
+			now := time.Now().In(loc)
+			out += fmt.Sprintf("[green]- If submitted now, next periodic launch would be at %s (%s from now).\n",
+				formatTime(next), formatTimeDifference(now, next, time.Second))
+		}
 	}
 
 	out = strings.TrimSuffix(out, "\n")
 	return out
 }
 
-// formatJobDiff produces an annoted diff of the the job. If verbose mode is
+// formatJobDiff produces an annoted diff of the job. If verbose mode is
 // set, added or deleted task groups and tasks are expanded.
 func formatJobDiff(job *api.JobDiff, verbose bool) string {
 	marker, _ := getDiffString(job.Type)
@@ -264,6 +318,8 @@ func formatTaskGroupDiff(tg *api.TaskGroupDiff, tgPrefix int, verbose bool) stri
 				color = "[cyan]"
 			case scheduler.UpdateTypeDestructiveUpdate:
 				color = "[yellow]"
+			case scheduler.UpdateTypeCanary:
+				color = "[light_yellow]"
 			}
 			updates = append(updates, fmt.Sprintf("[reset]%s%d %s", color, count, updateType))
 		}
@@ -335,15 +391,17 @@ func formatTaskDiff(task *api.TaskDiff, startPrefix, taskPrefix int, verbose boo
 // of spaces to put between the marker and object name output.
 func formatObjectDiff(diff *api.ObjectDiff, startPrefix, keyPrefix int) string {
 	start := strings.Repeat(" ", startPrefix)
-	marker, _ := getDiffString(diff.Type)
+	marker, markerLen := getDiffString(diff.Type)
 	out := fmt.Sprintf("%s%s%s%s {\n", start, marker, strings.Repeat(" ", keyPrefix), diff.Name)
 
 	// Determine the length of the longest name and longest diff marker to
 	// properly align names and values
 	longestField, longestMarker := getLongestPrefixes(diff.Fields, diff.Objects)
-	subStartPrefix := startPrefix + 2
+	subStartPrefix := startPrefix + keyPrefix + 2
 	out += alignedFieldAndObjects(diff.Fields, diff.Objects, subStartPrefix, longestField, longestMarker)
-	return fmt.Sprintf("%s\n%s}", out, start)
+
+	endprefix := strings.Repeat(" ", startPrefix+markerLen+keyPrefix)
+	return fmt.Sprintf("%s\n%s}", out, endprefix)
 }
 
 // formatFieldDiff produces an annotated diff of a field. startPrefix is the

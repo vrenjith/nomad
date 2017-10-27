@@ -2,6 +2,8 @@ package api
 
 import (
 	"testing"
+
+	"github.com/hashicorp/nomad/helper"
 )
 
 func assertQueryMeta(t *testing.T, qm *QueryMeta) {
@@ -23,18 +25,20 @@ func testJob() *Job {
 	task := NewTask("task1", "exec").
 		SetConfig("command", "/bin/sleep").
 		Require(&Resources{
-			CPU:      100,
-			MemoryMB: 256,
-			DiskMB:   25,
-			IOPS:     10,
+			CPU:      helper.IntToPtr(100),
+			MemoryMB: helper.IntToPtr(256),
+			IOPS:     helper.IntToPtr(10),
 		}).
 		SetLogConfig(&LogConfig{
-			MaxFiles:      1,
-			MaxFileSizeMB: 2,
+			MaxFiles:      helper.IntToPtr(1),
+			MaxFileSizeMB: helper.IntToPtr(2),
 		})
 
 	group := NewTaskGroup("group1", 1).
-		AddTask(task)
+		AddTask(task).
+		RequireDisk(&EphemeralDisk{
+			SizeMB: helper.IntToPtr(25),
+		})
 
 	job := NewBatchJob("job1", "redis", "region1", 1).
 		AddDatacenter("dc1").
@@ -45,9 +49,32 @@ func testJob() *Job {
 
 func testPeriodicJob() *Job {
 	job := testJob().AddPeriodicConfig(&PeriodicConfig{
-		Enabled:  true,
-		Spec:     "*/30 * * * *",
-		SpecType: "cron",
+		Enabled:  helper.BoolToPtr(true),
+		Spec:     helper.StringToPtr("*/30 * * * *"),
+		SpecType: helper.StringToPtr("cron"),
 	})
 	return job
+}
+
+func testNamespace() *Namespace {
+	return &Namespace{
+		Name:        "test-namespace",
+		Description: "Testing namespaces",
+	}
+}
+
+func testQuotaSpec() *QuotaSpec {
+	return &QuotaSpec{
+		Name:        "test-namespace",
+		Description: "Testing namespaces",
+		Limits: []*QuotaLimit{
+			{
+				Region: "global",
+				RegionLimit: &Resources{
+					CPU:      helper.IntToPtr(2000),
+					MemoryMB: helper.IntToPtr(2000),
+				},
+			},
+		},
+	}
 }

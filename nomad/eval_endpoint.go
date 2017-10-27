@@ -6,8 +6,11 @@ import (
 
 	"github.com/armon/go-metrics"
 	"github.com/hashicorp/go-memdb"
+	multierror "github.com/hashicorp/go-multierror"
+	"github.com/hashicorp/nomad/acl"
+	"github.com/hashicorp/nomad/nomad/state"
 	"github.com/hashicorp/nomad/nomad/structs"
-	"github.com/hashicorp/nomad/nomad/watch"
+	"github.com/hashicorp/nomad/scheduler"
 )
 
 const (
@@ -28,18 +31,20 @@ func (e *Eval) GetEval(args *structs.EvalSpecificRequest,
 	}
 	defer metrics.MeasureSince([]string{"nomad", "eval", "get_eval"}, time.Now())
 
+	// Check for read-job permissions
+	if aclObj, err := e.srv.ResolveToken(args.AuthToken); err != nil {
+		return err
+	} else if aclObj != nil && !aclObj.AllowNsOp(args.RequestNamespace(), acl.NamespaceCapabilityReadJob) {
+		return structs.ErrPermissionDenied
+	}
+
 	// Setup the blocking query
 	opts := blockingOptions{
 		queryOpts: &args.QueryOptions,
 		queryMeta: &reply.QueryMeta,
-		watch:     watch.NewItems(watch.Item{Eval: args.EvalID}),
-		run: func() error {
+		run: func(ws memdb.WatchSet, state *state.StateStore) error {
 			// Look for the job
-			snap, err := e.srv.fsm.State().Snapshot()
-			if err != nil {
-				return err
-			}
-			out, err := snap.EvalByID(args.EvalID)
+			out, err := state.EvalByID(ws, args.EvalID)
 			if err != nil {
 				return err
 			}
@@ -50,7 +55,7 @@ func (e *Eval) GetEval(args *structs.EvalSpecificRequest,
 				reply.Index = out.ModifyIndex
 			} else {
 				// Use the last index that affected the nodes table
-				index, err := snap.Index("evals")
+				index, err := state.Index("evals")
 				if err != nil {
 					return err
 				}
@@ -77,6 +82,12 @@ func (e *Eval) Dequeue(args *structs.EvalDequeueRequest,
 		return fmt.Errorf("dequeue requires at least one scheduler type")
 	}
 
+	// Check that there isn't a scheduler version mismatch
+	if args.SchedulerVersion != scheduler.SchedulerVersion {
+		return fmt.Errorf("dequeue disallowed: calling scheduler version is %d; leader version is %d",
+			args.SchedulerVersion, scheduler.SchedulerVersion)
+	}
+
 	// Ensure there is a default timeout
 	if args.Timeout <= 0 {
 		args.Timeout = DefaultDequeueTimeout
@@ -90,13 +101,54 @@ func (e *Eval) Dequeue(args *structs.EvalDequeueRequest,
 
 	// Provide the output if any
 	if eval != nil {
+		// Get the index that the worker should wait until before scheduling.
+		waitIndex, err := e.getWaitIndex(eval.Namespace, eval.JobID)
+		if err != nil {
+			var mErr multierror.Error
+			multierror.Append(&mErr, err)
+
+			// We have dequeued the evaluation but won't be returning it to the
+			// worker so Nack the eval.
+			if err := e.srv.evalBroker.Nack(eval.ID, token); err != nil {
+				multierror.Append(&mErr, err)
+			}
+
+			return &mErr
+		}
+
 		reply.Eval = eval
 		reply.Token = token
+		reply.WaitIndex = waitIndex
 	}
 
 	// Set the query response
 	e.srv.setQueryMeta(&reply.QueryMeta)
 	return nil
+}
+
+// getWaitIndex returns the wait index that should be used by the worker before
+// invoking the scheduler. The index should be the highest modify index of any
+// evaluation for the job. This prevents scheduling races for the same job when
+// there are blocked evaluations.
+func (e *Eval) getWaitIndex(namespace, job string) (uint64, error) {
+	snap, err := e.srv.State().Snapshot()
+	if err != nil {
+		return 0, err
+	}
+
+	evals, err := snap.EvalsByJob(nil, namespace, job)
+	if err != nil {
+		return 0, err
+	}
+
+	var max uint64
+	for _, eval := range evals {
+		if max < eval.ModifyIndex {
+			max = eval.ModifyIndex
+		}
+	}
+
+	return max, nil
 }
 
 // Ack is used to acknowledge completion of a dequeued evaluation
@@ -183,7 +235,9 @@ func (e *Eval) Create(args *structs.EvalUpdateRequest,
 	if err != nil {
 		return err
 	}
-	out, err := snap.EvalByID(eval.ID)
+
+	ws := memdb.NewWatchSet()
+	out, err := snap.EvalByID(ws, eval.ID)
 	if err != nil {
 		return err
 	}
@@ -226,7 +280,9 @@ func (e *Eval) Reblock(args *structs.EvalUpdateRequest, reply *structs.GenericRe
 	if err != nil {
 		return err
 	}
-	out, err := snap.EvalByID(eval.ID)
+
+	ws := memdb.NewWatchSet()
+	out, err := snap.EvalByID(ws, eval.ID)
 	if err != nil {
 		return err
 	}
@@ -269,22 +325,25 @@ func (e *Eval) List(args *structs.EvalListRequest,
 	}
 	defer metrics.MeasureSince([]string{"nomad", "eval", "list"}, time.Now())
 
+	// Check for read-job permissions
+	if aclObj, err := e.srv.ResolveToken(args.AuthToken); err != nil {
+		return err
+	} else if aclObj != nil && !aclObj.AllowNsOp(args.RequestNamespace(), acl.NamespaceCapabilityReadJob) {
+		return structs.ErrPermissionDenied
+	}
+
 	// Setup the blocking query
 	opts := blockingOptions{
 		queryOpts: &args.QueryOptions,
 		queryMeta: &reply.QueryMeta,
-		watch:     watch.NewItems(watch.Item{Table: "evals"}),
-		run: func() error {
+		run: func(ws memdb.WatchSet, state *state.StateStore) error {
 			// Scan all the evaluations
-			snap, err := e.srv.fsm.State().Snapshot()
-			if err != nil {
-				return err
-			}
+			var err error
 			var iter memdb.ResultIterator
 			if prefix := args.QueryOptions.Prefix; prefix != "" {
-				iter, err = snap.EvalsByIDPrefix(prefix)
+				iter, err = state.EvalsByIDPrefix(ws, args.RequestNamespace(), prefix)
 			} else {
-				iter, err = snap.Evals()
+				iter, err = state.EvalsByNamespace(ws, args.RequestNamespace())
 			}
 			if err != nil {
 				return err
@@ -302,7 +361,7 @@ func (e *Eval) List(args *structs.EvalListRequest,
 			reply.Evaluations = evals
 
 			// Use the last index that affected the jobs table
-			index, err := snap.Index("evals")
+			index, err := state.Index("evals")
 			if err != nil {
 				return err
 			}
@@ -323,18 +382,20 @@ func (e *Eval) Allocations(args *structs.EvalSpecificRequest,
 	}
 	defer metrics.MeasureSince([]string{"nomad", "eval", "allocations"}, time.Now())
 
+	// Check for read-job permissions
+	if aclObj, err := e.srv.ResolveToken(args.AuthToken); err != nil {
+		return err
+	} else if aclObj != nil && !aclObj.AllowNsOp(args.RequestNamespace(), acl.NamespaceCapabilityReadJob) {
+		return structs.ErrPermissionDenied
+	}
+
 	// Setup the blocking query
 	opts := blockingOptions{
 		queryOpts: &args.QueryOptions,
 		queryMeta: &reply.QueryMeta,
-		watch:     watch.NewItems(watch.Item{AllocEval: args.EvalID}),
-		run: func() error {
+		run: func(ws memdb.WatchSet, state *state.StateStore) error {
 			// Capture the allocations
-			snap, err := e.srv.fsm.State().Snapshot()
-			if err != nil {
-				return err
-			}
-			allocs, err := snap.AllocsByEval(args.EvalID)
+			allocs, err := state.AllocsByEval(ws, args.EvalID)
 			if err != nil {
 				return err
 			}
@@ -348,7 +409,7 @@ func (e *Eval) Allocations(args *structs.EvalSpecificRequest,
 			}
 
 			// Use the last index that affected the allocs table
-			index, err := snap.Index("allocs")
+			index, err := state.Index("allocs")
 			if err != nil {
 				return err
 			}

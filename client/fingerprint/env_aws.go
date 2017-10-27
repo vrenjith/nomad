@@ -16,71 +16,59 @@ import (
 	"github.com/hashicorp/nomad/nomad/structs"
 )
 
-// This is where the AWS metadata server normally resides. We hardcode the
-// "instance" path as well since it's the only one we access here.
-const DEFAULT_AWS_URL = "http://169.254.169.254/latest/meta-data/"
+const (
+	// This is where the AWS metadata server normally resides. We hardcode the
+	// "instance" path as well since it's the only one we access here.
+	DEFAULT_AWS_URL = "http://169.254.169.254/latest/meta-data/"
+
+	// AwsMetadataTimeout is the timeout used when contacting the AWS metadata
+	// service
+	AwsMetadataTimeout = 2 * time.Second
+)
 
 // map of instance type to approximate speed, in Mbits/s
-// http://serverfault.com/questions/324883/aws-bandwidth-and-content-delivery/326797#326797
-// which itself cites these sources:
-// - http://blog.rightscale.com/2007/10/28/network-performance-within-amazon-ec2-and-to-amazon-s3/
-// - http://www.soc.napier.ac.uk/~bill/chris_p.pdf
-//
+// Estimates from http://stackoverflow.com/a/35806587
 // This data is meant for a loose approximation
-var ec2InstanceSpeedMap = map[string]int{
-	"m4.large":    80,
-	"m3.medium":   80,
-	"m3.large":    80,
-	"c4.large":    80,
-	"c3.large":    80,
-	"c3.xlarge":   80,
-	"r3.large":    80,
-	"r3.xlarge":   80,
-	"i2.xlarge":   80,
-	"d2.xlarge":   80,
-	"t2.micro":    16,
-	"t2.small":    16,
-	"t2.medium":   16,
-	"t2.large":    16,
-	"m4.xlarge":   760,
-	"m4.2xlarge":  760,
-	"m4.4xlarge":  760,
-	"m3.xlarge":   760,
-	"m3.2xlarge":  760,
-	"c4.xlarge":   760,
-	"c4.2xlarge":  760,
-	"c4.4xlarge":  760,
-	"c3.2xlarge":  760,
-	"c3.4xlarge":  760,
-	"g2.2xlarge":  760,
-	"r3.2xlarge":  760,
-	"r3.4xlarge":  760,
-	"i2.2xlarge":  760,
-	"i2.4xlarge":  760,
-	"d2.2xlarge":  760,
-	"d2.4xlarge":  760,
-	"m4.10xlarge": 10000,
-	"c4.8xlarge":  10000,
-	"c3.8xlarge":  10000,
-	"g2.8xlarge":  10000,
-	"r3.8xlarge":  10000,
-	"i2.8xlarge":  10000,
-	"d2.8xlarge":  10000,
+var ec2InstanceSpeedMap = map[*regexp.Regexp]int{
+	regexp.MustCompile("t2.nano"):      30,
+	regexp.MustCompile("t2.micro"):     70,
+	regexp.MustCompile("t2.small"):     125,
+	regexp.MustCompile("t2.medium"):    300,
+	regexp.MustCompile("m3.medium"):    400,
+	regexp.MustCompile("c4.8xlarge"):   4000,
+	regexp.MustCompile("x1.16xlarge"):  5000,
+	regexp.MustCompile(`.*\.large`):    500,
+	regexp.MustCompile(`.*\.xlarge`):   750,
+	regexp.MustCompile(`.*\.2xlarge`):  1000,
+	regexp.MustCompile(`.*\.4xlarge`):  2000,
+	regexp.MustCompile(`.*\.8xlarge`):  10000,
+	regexp.MustCompile(`.*\.10xlarge`): 10000,
+	regexp.MustCompile(`.*\.16xlarge`): 10000,
+	regexp.MustCompile(`.*\.32xlarge`): 10000,
 }
 
 // EnvAWSFingerprint is used to fingerprint AWS metadata
 type EnvAWSFingerprint struct {
 	StaticFingerprinter
-	logger *log.Logger
+	timeout time.Duration
+	logger  *log.Logger
 }
 
 // NewEnvAWSFingerprint is used to create a fingerprint from AWS metadata
 func NewEnvAWSFingerprint(logger *log.Logger) Fingerprint {
-	f := &EnvAWSFingerprint{logger: logger}
+	f := &EnvAWSFingerprint{
+		logger:  logger,
+		timeout: AwsMetadataTimeout,
+	}
 	return f
 }
 
 func (f *EnvAWSFingerprint) Fingerprint(cfg *config.Config, node *structs.Node) (bool, error) {
+	// Check if we should tighten the timeout
+	if cfg.ReadBoolDefault(TightenNetworkTimeoutsConfig, false) {
+		f.timeout = 1 * time.Millisecond
+	}
+
 	if !f.isAWS() {
 		return false, nil
 	}
@@ -98,9 +86,8 @@ func (f *EnvAWSFingerprint) Fingerprint(cfg *config.Config, node *structs.Node) 
 		metadataURL = DEFAULT_AWS_URL
 	}
 
-	// assume 2 seconds is enough time for inside AWS network
 	client := &http.Client{
-		Timeout:   2 * time.Second,
+		Timeout:   f.timeout,
 		Transport: cleanhttp.DefaultTransport(),
 	}
 
@@ -108,7 +95,7 @@ func (f *EnvAWSFingerprint) Fingerprint(cfg *config.Config, node *structs.Node) 
 	// uniquely identifies a node, such as ip, should be marked as unique. When
 	// marked as unique, the key isn't included in the computed node class.
 	keys := map[string]bool{
-		"ami-id":                      true,
+		"ami-id":                      false,
 		"hostname":                    true,
 		"instance-id":                 true,
 		"instance-type":               false,
@@ -156,16 +143,34 @@ func (f *EnvAWSFingerprint) Fingerprint(cfg *config.Config, node *structs.Node) 
 	}
 
 	// find LinkSpeed from lookup
-	if throughput := f.linkSpeed(); throughput > 0 {
-		newNetwork.MBits = throughput
+	throughput := f.linkSpeed()
+	if cfg.NetworkSpeed != 0 {
+		throughput = cfg.NetworkSpeed
+	} else if throughput == 0 {
+		// Failed to determine speed. Check if the network fingerprint got it
+		found := false
+		if node.Resources != nil && len(node.Resources.Networks) > 0 {
+			for _, n := range node.Resources.Networks {
+				if n.IP == newNetwork.IP {
+					throughput = n.MBits
+					found = true
+					break
+				}
+			}
+		}
+
+		// Nothing detected so default
+		if !found {
+			throughput = defaultNetworkSpeed
+		}
 	}
 
+	// populate Node Network Resources
 	if node.Resources == nil {
 		node.Resources = &structs.Resources{}
 	}
-	node.Resources.Networks = append(node.Resources.Networks, newNetwork)
-
-	// populate Node Network Resources
+	newNetwork.MBits = throughput
+	node.Resources.Networks = []*structs.NetworkResource{newNetwork}
 
 	// populate Links
 	node.Links["aws.ec2"] = fmt.Sprintf("%s.%s",
@@ -183,9 +188,8 @@ func (f *EnvAWSFingerprint) isAWS() bool {
 		metadataURL = DEFAULT_AWS_URL
 	}
 
-	// assume 2 seconds is enough time for inside AWS network
 	client := &http.Client{
-		Timeout:   2 * time.Second,
+		Timeout:   f.timeout,
 		Transport: cleanhttp.DefaultTransport(),
 	}
 
@@ -226,25 +230,32 @@ func (f *EnvAWSFingerprint) linkSpeed() int {
 		metadataURL = DEFAULT_AWS_URL
 	}
 
-	// assume 2 seconds is enough time for inside AWS network
 	client := &http.Client{
-		Timeout:   2 * time.Second,
+		Timeout:   f.timeout,
 		Transport: cleanhttp.DefaultTransport(),
 	}
 
 	res, err := client.Get(metadataURL + "instance-type")
+	if err != nil {
+		f.logger.Printf("[ERR]: fingerprint.env_aws: Error reading instance-type: %v", err)
+		return 0
+	}
+
 	body, err := ioutil.ReadAll(res.Body)
 	res.Body.Close()
 	if err != nil {
-		f.logger.Printf("[ERR]: fingerprint.env_aws: Error reading response body for instance-type")
+		f.logger.Printf("[ERR]: fingerprint.env_aws: Error reading response body for instance-type: %v", err)
 		return 0
 	}
 
 	key := strings.Trim(string(body), "\n")
-	v, ok := ec2InstanceSpeedMap[key]
-	if !ok {
-		return 0
+	netSpeed := 0
+	for reg, speed := range ec2InstanceSpeedMap {
+		if reg.MatchString(key) {
+			netSpeed = speed
+			break
+		}
 	}
 
-	return v
+	return netSpeed
 }

@@ -10,13 +10,14 @@ import (
 func TestAnnotateTaskGroup_Updates(t *testing.T) {
 	annotations := &structs.PlanAnnotations{
 		DesiredTGUpdates: map[string]*structs.DesiredUpdates{
-			"foo": &structs.DesiredUpdates{
+			"foo": {
 				Ignore:            1,
 				Place:             2,
 				Migrate:           3,
 				Stop:              4,
 				InPlaceUpdate:     5,
 				DestructiveUpdate: 6,
+				Canary:            7,
 			},
 		},
 	}
@@ -35,6 +36,7 @@ func TestAnnotateTaskGroup_Updates(t *testing.T) {
 			UpdateTypeDestroy:           4,
 			UpdateTypeInplaceUpdate:     5,
 			UpdateTypeDestructiveUpdate: 6,
+			UpdateTypeCanary:            7,
 		},
 	}
 
@@ -341,6 +343,21 @@ func TestAnnotateTask(t *testing.T) {
 								New:  "baz2",
 							},
 						},
+					},
+				},
+			},
+			Parent:  &structs.TaskGroupDiff{Type: structs.DiffTypeEdited},
+			Desired: AnnotationForcesInplaceUpdate,
+		},
+		{
+			Diff: &structs.TaskDiff{
+				Type: structs.DiffTypeEdited,
+				Fields: []*structs.FieldDiff{
+					{
+						Type: structs.DiffTypeEdited,
+						Name: "KillTimeout",
+						Old:  "200",
+						New:  "2000000",
 					},
 				},
 			},
