@@ -14,8 +14,8 @@ have at least one server, though a cluster of 3 or 5 servers is recommended.
 A single server deployment is _**highly**_ discouraged as data loss is inevitable
 in a failure scenario.
 
-All other agents run in client mode. A client is a very lightweight
-process that registers the host machine, performs heartbeating, and runs any tasks
+All other agents run in client mode. A Nomad client is a very lightweight
+process that registers the host machine, performs heartbeating, and runs the tasks
 that are assigned to it by the servers. The agent must be run on every node that
 is part of the cluster so that the servers can assign work to those machines.
 
@@ -26,7 +26,7 @@ is used to quickly start an agent that is acting as a client and server to test
 job configurations or prototype interactions. It should _**not**_ be used in
 production as it does not persist state.
 
-```
+```text
 vagrant@nomad:~$ sudo nomad agent -dev
 
 ==> Starting Nomad agent...
@@ -74,16 +74,16 @@ certain task drivers will not be available.
 
 ## Cluster Nodes
 
-If you run [`nomad node-status`](/docs/commands/node-status.html) in another terminal, you
-can see the registered nodes of the Nomad cluster:
+If you run [`nomad node status`](/docs/commands/node/status.html) in another
+terminal, you can see the registered nodes of the Nomad cluster:
 
 ```text
 $ vagrant ssh
 ...
 
-$ nomad node-status
-ID        Datacenter  Name   Class   Drain  Status
-171a583b  dc1         nomad  <none>  false  ready
+$ nomad node status
+ID        DC   Name   Class   Drain  Eligibility  Status
+171a583b  dc1  nomad  <none>  false  eligible     ready
 ```
 
 The output shows our Node ID, which is a randomly generated UUID,
@@ -94,12 +94,12 @@ currently off.
 The agent is also running in server mode, which means it is part of
 the [gossip protocol](/docs/internals/gossip.html) used to connect all
 the server instances together. We can view the members of the gossip
-ring using the [`server-members`](/docs/commands/server-members.html) command:
+ring using the [`server members`](/docs/commands/server/members.html) command:
 
 ```text
-$ nomad server-members
+$ nomad server members
 Name          Address    Port  Status  Leader  Protocol  Build  Datacenter  Region
-nomad.global  127.0.0.1  4648  alive   true    2         0.6.0  dc1         global
+nomad.global  127.0.0.1  4648  alive   true    2         0.7.0  dc1         global
 ```
 
 The output shows our own agent, the address it is running on, its
@@ -138,7 +138,7 @@ If an agent is operating as a server, a graceful leave is important to avoid
 causing a potential availability outage affecting the
 [consensus protocol](/docs/internals/consensus.html). If a server does
 forcefully exit and will not be returning into service, the
-[`server-force-leave` command](/docs/commands/server-force-leave.html) should
+[`server force-leave` command](/docs/commands/server/force-leave.html) should
 be used to force the server from a _failed_ to a _left_ state.
 
 ## Next Steps

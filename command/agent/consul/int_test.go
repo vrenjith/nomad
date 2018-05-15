@@ -14,7 +14,6 @@ import (
 	"github.com/hashicorp/nomad/client"
 	"github.com/hashicorp/nomad/client/allocdir"
 	"github.com/hashicorp/nomad/client/config"
-	"github.com/hashicorp/nomad/client/driver"
 	"github.com/hashicorp/nomad/client/vaultclient"
 	"github.com/hashicorp/nomad/command/agent/consul"
 	"github.com/hashicorp/nomad/nomad/mock"
@@ -32,9 +31,6 @@ func testLogger() *log.Logger {
 // TestConsul_Integration asserts TaskRunner properly registers and deregisters
 // services and checks with Consul using an embedded Consul agent.
 func TestConsul_Integration(t *testing.T) {
-	if _, ok := driver.BuiltinDrivers["mock_driver"]; !ok {
-		t.Skip(`test requires mock_driver; run with "-tags nomad_test"`)
-	}
 	if testing.Short() {
 		t.Skip("-short set; skipping")
 	}
@@ -87,8 +83,17 @@ func TestConsul_Integration(t *testing.T) {
 	task.Config = map[string]interface{}{
 		"run_for": "1h",
 	}
+
 	// Choose a port that shouldn't be in use
-	task.Resources.Networks[0].ReservedPorts = []structs.Port{{Label: "http", Value: 3}}
+	netResource := &structs.NetworkResource{
+		Device:        "eth0",
+		IP:            "127.0.0.1",
+		MBits:         50,
+		ReservedPorts: []structs.Port{{Label: "http", Value: 3}},
+	}
+	alloc.Resources.Networks[0] = netResource
+	alloc.TaskResources["web"].Networks[0] = netResource
+	task.Resources.Networks[0] = netResource
 	task.Services = []*structs.Service{
 		{
 			Name:      "httpd",
@@ -96,13 +101,12 @@ func TestConsul_Integration(t *testing.T) {
 			Tags:      []string{"nomad", "test", "http"},
 			Checks: []*structs.ServiceCheck{
 				{
-					Name:      "httpd-http-check",
-					Type:      "http",
-					Path:      "/",
-					Protocol:  "http",
-					PortLabel: "http",
-					Interval:  9000 * time.Hour,
-					Timeout:   1, // fail as fast as possible
+					Name:     "httpd-http-check",
+					Type:     "http",
+					Path:     "/",
+					Protocol: "http",
+					Interval: 9000 * time.Hour,
+					Timeout:  1, // fail as fast as possible
 				},
 				{
 					Name:     "httpd-script-check",
@@ -116,7 +120,12 @@ func TestConsul_Integration(t *testing.T) {
 		{
 			Name:      "httpd2",
 			PortLabel: "http",
-			Tags:      []string{"test", "http2"},
+			Tags: []string{
+				"test",
+				// Use URL-unfriendly tags to test #3620
+				"public-test.ettaviation.com:80/ redirect=302,https://test.ettaviation.com",
+				"public-test.ettaviation.com:443/",
+			},
 		},
 	}
 
@@ -133,7 +142,7 @@ func TestConsul_Integration(t *testing.T) {
 	consulClient, err := consulapi.NewClient(consulConfig)
 	assert.Nil(err)
 
-	serviceClient := consul.NewServiceClient(consulClient.Agent(), true, logger)
+	serviceClient := consul.NewServiceClient(consulClient.Agent(), logger)
 	defer serviceClient.Shutdown() // just-in-case cleanup
 	consulRan := make(chan struct{})
 	go func() {

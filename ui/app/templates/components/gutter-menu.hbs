@@ -9,6 +9,7 @@
           <li>
             <div class="menu-item">
               {{#power-select
+                data-test-namespace-switcher
                 options=sortedNamespaces
                 selected=system.activeNamespace
                 searchField="name"
@@ -35,12 +36,12 @@
         Cluster
       </p>
       <ul class="menu-list">
-        <li>{{#link-to "nodes" activeClass="is-active"}}Clients{{/link-to}}</li>
+        <li>{{#link-to "clients" activeClass="is-active"}}Clients{{/link-to}}</li>
         <li>{{#link-to "servers" activeClass="is-active"}}Servers{{/link-to}}</li>
       </ul>
     </aside>
   </div>
 </div>
-<div class="page-column is-right">
+<div data-test-page-content class="page-column is-right">
   {{yield}}
 </div>

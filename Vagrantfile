@@ -120,15 +120,16 @@ def configureLinuxProvisioners(vmCfg)
 		privileged: true,
 		path: './scripts/vagrant-linux-priv-rkt.sh'
 
-    vmCfg.vm.provision "shell",
-        privileged: false,
-        path: './scripts/vagrant-linux-priv-ui.sh'
+	vmCfg.vm.provision "shell",
+		privileged: false,
+		path: './scripts/vagrant-linux-priv-ui.sh'
 
 	return vmCfg
 end
 
 def configureProviders(vmCfg, cpus: "2", memory: "2048")
 	vmCfg.vm.provider "virtualbox" do |v|
+		v.customize ["modifyvm", :id, "--cableconnected1", "on"]
 		v.memory = memory
 		v.cpus = cpus
 	end
@@ -142,6 +143,7 @@ def configureProviders(vmCfg, cpus: "2", memory: "2048")
 	end
 
 	vmCfg.vm.provider "virtualbox" do |v|
+		v.customize ["modifyvm", :id, "--cableconnected1", "on"]
 		v.memory = memory
 		v.cpus = cpus
 	end
@@ -154,7 +156,7 @@ def suggestedCPUCores()
 	when /darwin/
 		Integer(`sysctl -n hw.ncpu`) / 2
 	when /linux/
-		Integer(`cat /proc/cpuinfo | grep processor | wc -l`) / 2
+		Integer(`grep -c ^processor /proc/cpuinfo`) / 2
 	else
 		2
 	end

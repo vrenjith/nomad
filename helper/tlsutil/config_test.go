@@ -3,12 +3,17 @@ package tlsutil
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"net"
+	"strings"
 	"testing"
 
+	"github.com/hashicorp/nomad/nomad/structs/config"
 	"github.com/hashicorp/yamux"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 const (
@@ -46,9 +51,11 @@ func TestConfig_CACertificate_Valid(t *testing.T) {
 	}
 }
 
-func TestConfig_KeyPair_None(t *testing.T) {
-	conf := &Config{}
-	cert, err := conf.KeyPair()
+func TestConfig_LoadKeyPair_None(t *testing.T) {
+	conf := &Config{
+		KeyLoader: &config.KeyLoader{},
+	}
+	cert, err := conf.LoadKeyPair()
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -57,12 +64,13 @@ func TestConfig_KeyPair_None(t *testing.T) {
 	}
 }
 
-func TestConfig_KeyPair_Valid(t *testing.T) {
+func TestConfig_LoadKeyPair_Valid(t *testing.T) {
 	conf := &Config{
-		CertFile: foocert,
-		KeyFile:  fookey,
+		CertFile:  foocert,
+		KeyFile:   fookey,
+		KeyLoader: &config.KeyLoader{},
 	}
-	cert, err := conf.KeyPair()
+	cert, err := conf.LoadKeyPair()
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -138,28 +146,25 @@ func TestConfig_OutgoingTLS_VerifyHostname(t *testing.T) {
 }
 
 func TestConfig_OutgoingTLS_WithKeyPair(t *testing.T) {
+	assert := assert.New(t)
+
 	conf := &Config{
 		VerifyOutgoing: true,
 		CAFile:         cacert,
 		CertFile:       foocert,
 		KeyFile:        fookey,
+		KeyLoader:      &config.KeyLoader{},
 	}
-	tls, err := conf.OutgoingTLSConfig()
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	if tls == nil {
-		t.Fatalf("expected config")
-	}
-	if len(tls.RootCAs.Subjects()) != 1 {
-		t.Fatalf("expect root cert")
-	}
-	if !tls.InsecureSkipVerify {
-		t.Fatalf("should skip verification")
-	}
-	if len(tls.Certificates) != 1 {
-		t.Fatalf("expected client cert")
-	}
+	tlsConf, err := conf.OutgoingTLSConfig()
+	assert.Nil(err)
+	assert.NotNil(tlsConf)
+	assert.Equal(len(tlsConf.RootCAs.Subjects()), 1)
+	assert.True(tlsConf.InsecureSkipVerify)
+
+	clientHelloInfo := &tls.ClientHelloInfo{}
+	cert, err := tlsConf.GetCertificate(clientHelloInfo)
+	assert.Nil(err)
+	assert.NotNil(cert)
 }
 
 func startTLSServer(config *Config) (net.Conn, chan error) {
@@ -206,6 +211,7 @@ func TestConfig_outgoingWrapper_OK(t *testing.T) {
 		KeyFile:              fookey,
 		VerifyServerHostname: true,
 		VerifyOutgoing:       true,
+		KeyLoader:            &config.KeyLoader{},
 	}
 
 	client, errc := startTLSServer(config)
@@ -274,6 +280,7 @@ func TestConfig_wrapTLS_OK(t *testing.T) {
 		CertFile:       foocert,
 		KeyFile:        fookey,
 		VerifyOutgoing: true,
+		KeyLoader:      &config.KeyLoader{},
 	}
 
 	client, errc := startTLSServer(config)
@@ -300,9 +307,10 @@ func TestConfig_wrapTLS_OK(t *testing.T) {
 
 func TestConfig_wrapTLS_BadCert(t *testing.T) {
 	serverConfig := &Config{
-		CAFile:   cacert,
-		CertFile: badcert,
-		KeyFile:  badkey,
+		CAFile:    cacert,
+		CertFile:  badcert,
+		KeyFile:   badkey,
+		KeyLoader: &config.KeyLoader{},
 	}
 
 	client, errc := startTLSServer(serverConfig)
@@ -335,11 +343,14 @@ func TestConfig_wrapTLS_BadCert(t *testing.T) {
 }
 
 func TestConfig_IncomingTLS(t *testing.T) {
+	assert := assert.New(t)
+
 	conf := &Config{
 		VerifyIncoming: true,
 		CAFile:         cacert,
 		CertFile:       foocert,
 		KeyFile:        fookey,
+		KeyLoader:      &config.KeyLoader{},
 	}
 	tlsC, err := conf.IncomingTLSConfig()
 	if err != nil {
@@ -354,9 +365,11 @@ func TestConfig_IncomingTLS(t *testing.T) {
 	if tlsC.ClientAuth != tls.RequireAndVerifyClientCert {
 		t.Fatalf("should not skip verification")
 	}
-	if len(tlsC.Certificates) != 1 {
-		t.Fatalf("expected client cert")
-	}
+
+	clientHelloInfo := &tls.ClientHelloInfo{}
+	cert, err := tlsC.GetCertificate(clientHelloInfo)
+	assert.Nil(err)
+	assert.NotNil(cert)
 }
 
 func TestConfig_IncomingTLS_MissingCA(t *testing.T) {
@@ -364,6 +377,7 @@ func TestConfig_IncomingTLS_MissingCA(t *testing.T) {
 		VerifyIncoming: true,
 		CertFile:       foocert,
 		KeyFile:        fookey,
+		KeyLoader:      &config.KeyLoader{},
 	}
 	_, err := conf.IncomingTLSConfig()
 	if err == nil {
@@ -399,5 +413,121 @@ func TestConfig_IncomingTLS_NoVerify(t *testing.T) {
 	}
 	if len(tlsC.Certificates) != 0 {
 		t.Fatalf("unexpected client cert")
+	}
+}
+
+func TestConfig_ParseCiphers_Valid(t *testing.T) {
+	require := require.New(t)
+
+	validCiphers := strings.Join([]string{
+		"TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305",
+		"TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305",
+		"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+		"TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+		"TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+		"TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+		"TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
+		"TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA",
+		"TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
+		"TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA",
+		"TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA",
+		"TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA",
+		"TLS_RSA_WITH_AES_128_GCM_SHA256",
+		"TLS_RSA_WITH_AES_256_GCM_SHA384",
+		"TLS_RSA_WITH_AES_128_CBC_SHA256",
+		"TLS_RSA_WITH_AES_128_CBC_SHA",
+		"TLS_RSA_WITH_AES_256_CBC_SHA",
+	}, ",")
+
+	expectedCiphers := []uint16{
+		tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
+		tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
+		tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+		tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+		tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+		tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+		tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256,
+		tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+		tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256,
+		tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
+		tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+		tls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
+		tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
+		tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
+		tls.TLS_RSA_WITH_AES_128_CBC_SHA256,
+		tls.TLS_RSA_WITH_AES_128_CBC_SHA,
+		tls.TLS_RSA_WITH_AES_256_CBC_SHA,
+	}
+
+	parsedCiphers, err := ParseCiphers(validCiphers)
+	require.Nil(err)
+	require.Equal(parsedCiphers, expectedCiphers)
+}
+
+func TestConfig_ParseCiphers_Default(t *testing.T) {
+	require := require.New(t)
+
+	expectedCiphers := []uint16{
+		tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
+		tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+		tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+	}
+
+	parsedCiphers, err := ParseCiphers("")
+	require.Nil(err)
+	require.Equal(parsedCiphers, expectedCiphers)
+}
+
+func TestConfig_ParseCiphers_Invalid(t *testing.T) {
+	require := require.New(t)
+
+	invalidCiphers := []string{"TLS_RSA_WITH_3DES_EDE_CBC_SHA",
+		"TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA",
+		"TLS_RSA_WITH_RC4_128_SHA",
+		"TLS_ECDHE_RSA_WITH_RC4_128_SHA",
+		"TLS_ECDHE_ECDSA_WITH_RC4_128_SHA",
+	}
+
+	for _, cipher := range invalidCiphers {
+		parsedCiphers, err := ParseCiphers(cipher)
+		require.NotNil(err)
+		require.Equal(fmt.Sprintf("unsupported TLS cipher %q", cipher), err.Error())
+		require.Equal(0, len(parsedCiphers))
+	}
+}
+
+func TestConfig_ParseMinVersion_Valid(t *testing.T) {
+	require := require.New(t)
+
+	validVersions := []string{"tls10",
+		"tls11",
+		"tls12",
+	}
+
+	expected := map[string]uint16{
+		"tls10": tls.VersionTLS10,
+		"tls11": tls.VersionTLS11,
+		"tls12": tls.VersionTLS12,
+	}
+
+	for _, version := range validVersions {
+		parsedVersion, err := ParseMinVersion(version)
+		require.Nil(err)
+		require.Equal(expected[version], parsedVersion)
+	}
+}
+
+func TestConfig_ParseMinVersion_Invalid(t *testing.T) {
+	require := require.New(t)
+
+	invalidVersions := []string{"tls13",
+		"tls15",
+	}
+
+	for _, version := range invalidVersions {
+		parsedVersion, err := ParseMinVersion(version)
+		require.NotNil(err)
+		require.Equal(fmt.Sprintf("unsupported TLS version %q", version), err.Error())
+		require.Equal(uint16(0), parsedVersion)
 	}
 }

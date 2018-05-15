@@ -3,9 +3,17 @@ package testutil
 import (
 	"os/exec"
 	"runtime"
+	"sync"
 	"syscall"
 	"testing"
 )
+
+// RequireRoot skips tests unless running on a Unix as root.
+func RequireRoot(t *testing.T) {
+	if syscall.Geteuid() != 0 {
+		t.Skip("Must run as root on Unix")
+	}
+}
 
 func ExecCompatible(t *testing.T) {
 	if runtime.GOOS != "linux" || syscall.Geteuid() != 0 {
@@ -31,13 +39,23 @@ func QemuCompatible(t *testing.T) {
 	}
 }
 
+var rktExists bool
+var rktOnce sync.Once
+
 func RktCompatible(t *testing.T) {
-	if runtime.GOOS == "windows" || syscall.Geteuid() != 0 {
-		t.Skip("Must be root on non-windows environments to run test")
+	if runtime.GOOS != "linux" || syscall.Geteuid() != 0 {
+		t.Skip("Must be root on Linux to run test")
 	}
+
 	// else see if rkt exists
-	_, err := exec.Command("rkt", "version").CombinedOutput()
-	if err != nil {
+	rktOnce.Do(func() {
+		_, err := exec.Command("rkt", "version").CombinedOutput()
+		if err == nil {
+			rktExists = true
+		}
+	})
+
+	if !rktExists {
 		t.Skip("Must have rkt installed for rkt specific tests to run")
 	}
 }

@@ -389,7 +389,7 @@ func (tm *TaskTemplateManager) handleTemplateRerenders(allRenderedTime time.Time
 				}
 
 				// Read environment variables from templates
-				envMap, err := loadTemplateEnv(tmpls, tm.config.TaskDir)
+				envMap, err := loadTemplateEnv(tm.config.Templates, tm.config.TaskDir)
 				if err != nil {
 					tm.config.Hooks.Kill(consulTemplateSourceName, err.Error(), true)
 					return
@@ -568,7 +568,7 @@ func newRunnerConfig(config *TaskTemplateManagerConfig,
 	cc := config.ClientConfig
 	conf := ctconf.DefaultConfig()
 
-	// Gather the consul-template tempates
+	// Gather the consul-template templates
 	flat := ctconf.TemplateConfigs(make([]*ctconf.TemplateConfig, 0, len(templateMapping)))
 	for ctmpl := range templateMapping {
 		local := ctmpl

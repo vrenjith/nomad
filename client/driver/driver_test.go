@@ -24,13 +24,6 @@ var basicResources = &structs.Resources{
 	CPU:      250,
 	MemoryMB: 256,
 	DiskMB:   20,
-	Networks: []*structs.NetworkResource{
-		{
-			IP:            "0.0.0.0",
-			ReservedPorts: []structs.Port{{Label: "main", Value: 12345}},
-			DynamicPorts:  []structs.Port{{Label: "HTTP", Value: 43330}},
-		},
-	},
 }
 
 func init() {
@@ -152,7 +145,7 @@ func testDriverContexts(t *testing.T, task *structs.Task) *testContext {
 	emitter := func(m string, args ...interface{}) {
 		logger.Printf("[EVENT] "+m, args...)
 	}
-	driverCtx := NewDriverContext(task.Name, alloc.ID, cfg, cfg.Node, logger, emitter)
+	driverCtx := NewDriverContext(alloc.Job.Name, alloc.TaskGroup, task.Name, alloc.ID, cfg, cfg.Node, logger, emitter)
 
 	return &testContext{allocDir, driverCtx, execCtx, eb}
 }
@@ -209,12 +202,12 @@ func setupTaskEnv(t *testing.T, driver string) (*allocdir.TaskDir, map[string]st
 		"NOMAD_PORT_two":                "443",
 		"NOMAD_HOST_PORT_two":           "443",
 		"NOMAD_ADDR_admin":              "1.2.3.4:8081",
-		"NOMAD_ADDR_web_main":           "192.168.0.100:5000",
+		"NOMAD_ADDR_web_admin":          "192.168.0.100:5000",
 		"NOMAD_ADDR_web_http":           "192.168.0.100:2000",
-		"NOMAD_IP_web_main":             "192.168.0.100",
+		"NOMAD_IP_web_admin":            "192.168.0.100",
 		"NOMAD_IP_web_http":             "192.168.0.100",
 		"NOMAD_PORT_web_http":           "2000",
-		"NOMAD_PORT_web_main":           "5000",
+		"NOMAD_PORT_web_admin":          "5000",
 		"NOMAD_IP_admin":                "1.2.3.4",
 		"NOMAD_PORT_admin":              "8081",
 		"NOMAD_HOST_PORT_admin":         "8081",
@@ -421,7 +414,7 @@ func TestCreatedResources_CopyRemove(t *testing.T) {
 	}
 
 	if expected := []string{"v2", "v3"}; !reflect.DeepEqual(expected, res2.Resources["k1"]) {
-		t.Fatalf("unpexpected list for k1: %#v", res2.Resources["k1"])
+		t.Fatalf("unexpected list for k1: %#v", res2.Resources["k1"])
 	}
 
 	// Assert removing the only value from a key removes the key

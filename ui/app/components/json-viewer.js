@@ -1,7 +1,8 @@
-import Ember from 'ember';
+import Component from '@ember/component';
+import { computed } from '@ember/object';
+import { run } from '@ember/runloop';
+import { copy } from '@ember/object/internals';
 import JSONFormatterPkg from 'npm:json-formatter-js';
-
-const { Component, computed, run } = Ember;
 
 // json-formatter-js is packaged in a funny way that ember-cli-browserify
 // doesn't unwrap properly.
@@ -11,10 +12,10 @@ export default Component.extend({
   classNames: ['json-viewer'],
 
   json: null,
-  expandDepth: 2,
+  expandDepth: Infinity,
 
   formatter: computed('json', 'expandDepth', function() {
-    return new JSONFormatter(this.get('json'), this.get('expandDepth'), {
+    return new JSONFormatter(copy(this.get('json'), true), this.get('expandDepth'), {
       theme: 'nomad',
     });
   }),
@@ -30,5 +31,7 @@ export default Component.extend({
 });
 
 function embedViewer() {
-  this.$().empty().append(this.get('formatter').render());
+  this.$()
+    .empty()
+    .append(this.get('formatter').render());
 }
