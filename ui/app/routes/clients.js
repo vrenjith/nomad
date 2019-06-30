@@ -8,14 +8,21 @@ export default Route.extend(WithForbiddenState, {
   store: service(),
   system: service(),
 
+  breadcrumbs: [
+    {
+      label: 'Clients',
+      args: ['clients.index'],
+    },
+  ],
+
   beforeModel() {
     return this.get('system.leader');
   },
 
   model() {
     return RSVP.hash({
-      nodes: this.get('store').findAll('node'),
-      agents: this.get('store').findAll('agent'),
+      nodes: this.store.findAll('node'),
+      agents: this.store.findAll('agent'),
     }).catch(notifyForbidden(this));
   },
 });

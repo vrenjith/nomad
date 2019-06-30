@@ -25,6 +25,7 @@ func TestIsNomadServer(t *testing.T) {
 			"vsn":      "1",
 			"raft_vsn": "2",
 			"build":    "0.7.0+ent",
+			"nonvoter": "1",
 		},
 	}
 	valid, parts := isNomadServer(m)
@@ -55,6 +56,9 @@ func TestIsNomadServer(t *testing.T) {
 	} else if seg[0] != 0 && seg[1] != 7 && seg[2] != 0 {
 		t.Fatalf("bad: %v", parts.Build)
 	}
+	if !parts.NonVoter {
+		t.Fatalf("should be nonvoter")
+	}
 
 	m.Tags["bootstrap"] = "1"
 	valid, parts = isNomadServer(m)
@@ -74,25 +78,16 @@ func TestIsNomadServer(t *testing.T) {
 	if !valid || parts.Expect != 3 {
 		t.Fatalf("bad: %v", parts.Expect)
 	}
+
+	delete(m.Tags, "nonvoter")
+	valid, parts = isNomadServer(m)
+	if !valid || parts.NonVoter {
+		t.Fatalf("should be a voter")
+	}
 }
 
-func TestServersMeetMinimumVersion(t *testing.T) {
+func TestServersMeetMinimumVersionExcludingFailed(t *testing.T) {
 	t.Parallel()
-	makeMember := func(version string) serf.Member {
-		return serf.Member{
-			Name: "foo",
-			Addr: net.IP([]byte{127, 0, 0, 1}),
-			Tags: map[string]string{
-				"role":   "nomad",
-				"region": "aws",
-				"dc":     "east-aws",
-				"port":   "10000",
-				"build":  version,
-				"vsn":    "1",
-			},
-			Status: serf.StatusAlive,
-		}
-	}
 
 	cases := []struct {
 		members  []serf.Member
@@ -102,7 +97,7 @@ func TestServersMeetMinimumVersion(t *testing.T) {
 		// One server, meets reqs
 		{
 			members: []serf.Member{
-				makeMember("0.7.5"),
+				makeMember("0.7.5", serf.StatusAlive),
 			},
 			ver:      version.Must(version.NewVersion("0.7.5")),
 			expected: true,
@@ -110,7 +105,7 @@ func TestServersMeetMinimumVersion(t *testing.T) {
 		// One server in dev, meets reqs
 		{
 			members: []serf.Member{
-				makeMember("0.8.5-dev"),
+				makeMember("0.8.5-dev", serf.StatusAlive),
 			},
 			ver:      version.Must(version.NewVersion("0.7.5")),
 			expected: true,
@@ -118,7 +113,7 @@ func TestServersMeetMinimumVersion(t *testing.T) {
 		// One server with meta, meets reqs
 		{
 			members: []serf.Member{
-				makeMember("0.7.5+ent"),
+				makeMember("0.7.5+ent", serf.StatusAlive),
 			},
 			ver:      version.Must(version.NewVersion("0.7.5")),
 			expected: true,
@@ -126,16 +121,17 @@ func TestServersMeetMinimumVersion(t *testing.T) {
 		// One server, doesn't meet reqs
 		{
 			members: []serf.Member{
-				makeMember("0.7.5"),
+				makeMember("0.7.5", serf.StatusAlive),
 			},
 			ver:      version.Must(version.NewVersion("0.8.0")),
 			expected: false,
 		},
-		// Multiple servers, meets req version
+		// Multiple servers, meets req version, includes failed that doesn't meet req
 		{
 			members: []serf.Member{
-				makeMember("0.7.5"),
-				makeMember("0.8.0"),
+				makeMember("0.7.5", serf.StatusAlive),
+				makeMember("0.8.0", serf.StatusAlive),
+				makeMember("0.7.0", serf.StatusFailed),
 			},
 			ver:      version.Must(version.NewVersion("0.7.5")),
 			expected: true,
@@ -143,8 +139,8 @@ func TestServersMeetMinimumVersion(t *testing.T) {
 		// Multiple servers, doesn't meet req version
 		{
 			members: []serf.Member{
-				makeMember("0.7.5"),
-				makeMember("0.8.0"),
+				makeMember("0.7.5", serf.StatusAlive),
+				makeMember("0.8.0", serf.StatusAlive),
 			},
 			ver:      version.Must(version.NewVersion("0.8.0")),
 			expected: false,
@@ -152,10 +148,64 @@ func TestServersMeetMinimumVersion(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		result := ServersMeetMinimumVersion(tc.members, tc.ver)
+		result := ServersMeetMinimumVersion(tc.members, tc.ver, false)
 		if result != tc.expected {
 			t.Fatalf("bad: %v, %v, %v", result, tc.ver.String(), tc)
 		}
+	}
+}
+
+func TestServersMeetMinimumVersionIncludingFailed(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		members  []serf.Member
+		ver      *version.Version
+		expected bool
+	}{
+		// Multiple servers, meets req version
+		{
+			members: []serf.Member{
+				makeMember("0.7.5", serf.StatusAlive),
+				makeMember("0.8.0", serf.StatusAlive),
+				makeMember("0.7.5", serf.StatusFailed),
+			},
+			ver:      version.Must(version.NewVersion("0.7.5")),
+			expected: true,
+		},
+		// Multiple servers, doesn't meet req version
+		{
+			members: []serf.Member{
+				makeMember("0.7.5", serf.StatusAlive),
+				makeMember("0.8.0", serf.StatusAlive),
+				makeMember("0.7.0", serf.StatusFailed),
+			},
+			ver:      version.Must(version.NewVersion("0.7.5")),
+			expected: false,
+		},
+	}
+
+	for _, tc := range cases {
+		result := ServersMeetMinimumVersion(tc.members, tc.ver, true)
+		if result != tc.expected {
+			t.Fatalf("bad: %v, %v, %v", result, tc.ver.String(), tc)
+		}
+	}
+}
+
+func makeMember(version string, status serf.MemberStatus) serf.Member {
+	return serf.Member{
+		Name: "foo",
+		Addr: net.IP([]byte{127, 0, 0, 1}),
+		Tags: map[string]string{
+			"role":   "nomad",
+			"region": "aws",
+			"dc":     "east-aws",
+			"port":   "10000",
+			"build":  version,
+			"vsn":    "1",
+		},
+		Status: status,
 	}
 }
 

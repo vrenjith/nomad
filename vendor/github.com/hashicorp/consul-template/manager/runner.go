@@ -13,6 +13,7 @@ import (
 	"github.com/hashicorp/consul-template/child"
 	"github.com/hashicorp/consul-template/config"
 	dep "github.com/hashicorp/consul-template/dependency"
+	"github.com/hashicorp/consul-template/renderer"
 	"github.com/hashicorp/consul-template/template"
 	"github.com/hashicorp/consul-template/watch"
 	"github.com/hashicorp/go-multierror"
@@ -139,7 +140,7 @@ type RenderEvent struct {
 	UpdatedAt time.Time
 
 	// Used is the full list of dependencies seen in the template. Because of
-	// the n-pass evaluation, this number can change over time. The dependecnies
+	// the n-pass evaluation, this number can change over time. The dependencies
 	// in this list may or may not have data. This just contains the list of all
 	// dependencies parsed out of the template with the current data.
 	UsedDeps *dep.Set
@@ -161,6 +162,12 @@ type RenderEvent struct {
 
 	// LastDidRender marks the last time the template was written to disk.
 	LastDidRender time.Time
+
+	// ForQuiescence determines if this event is returned early in the
+	// render loop due to quiescence. When evaluating if all templates have
+	// been rendered we need to know if the event is triggered by quiesence
+	// and if we can skip evaluating it as a render event for those purposes
+	ForQuiescence bool
 }
 
 // NewRunner accepts a slice of TemplateConfigs and returns a pointer to the new
@@ -397,7 +404,7 @@ func (r *Runner) Stop() {
 	r.stopChild()
 
 	if err := r.deletePid(); err != nil {
-		log.Printf("[WARN] (runner) could not remove pid at %q: %s",
+		log.Printf("[WARN] (runner) could not remove pid at %v: %s",
 			r.config.PidFile, err)
 	}
 
@@ -496,12 +503,12 @@ func (r *Runner) Signal(s os.Signal) error {
 // Run iterates over each template in this Runner and conditionally executes
 // the template rendering and command execution.
 //
-// The template is rendered atomicly. If and only if the template render
+// The template is rendered atomically. If and only if the template render
 // completes successfully, the optional commands will be executed, if given.
 // Please note that all templates are rendered **and then** any commands are
 // executed.
 func (r *Runner) Run() error {
-	log.Printf("[INFO] (runner) initiating run")
+	log.Printf("[DEBUG] (runner) initiating run")
 
 	var newRenderEvent, wouldRenderAny, renderedAny bool
 	runCtx := &templateRunCtx{
@@ -719,7 +726,7 @@ func (r *Runner) runTemplate(tmpl *template.Template, runCtx *templateRunCtx) (*
 		return event, nil
 	}
 
-	// Trigger an update of the de-duplicaiton manager
+	// Trigger an update of the de-duplication manager
 	if r.dedup != nil && isLeader {
 		if err := r.dedup.UpdateDeps(tmpl, used.List()); err != nil {
 			log.Printf("[ERR] (runner) failed to update dependency data for de-duplication: %v", err)
@@ -730,6 +737,8 @@ func (r *Runner) runTemplate(tmpl *template.Template, runCtx *templateRunCtx) (*
 	// We do not want to render the templates yet.
 	if q, ok := r.quiescenceMap[tmpl.ID()]; ok {
 		q.tick()
+		// This event is being returned early for quiescence
+		event.ForQuiescence = true
 		return event, nil
 	}
 
@@ -739,7 +748,7 @@ func (r *Runner) runTemplate(tmpl *template.Template, runCtx *templateRunCtx) (*
 		log.Printf("[DEBUG] (runner) rendering %s", templateConfig.Display())
 
 		// Render the template, taking dry mode into account
-		result, err := Render(&RenderInput{
+		result, err := renderer.Render(&renderer.RenderInput{
 			Backup:         config.BoolVal(templateConfig.Backup),
 			Contents:       result.Output,
 			CreateDestDirs: config.BoolVal(templateConfig.CreateDestDirs),
@@ -957,6 +966,13 @@ func (r *Runner) allTemplatesRendered() bool {
 			return false
 		}
 
+		// Skip evaluation of events from quiescence as they will
+		// be default unrendered as we are still waiting for the
+		// specified period
+		if event.ForQuiescence {
+			continue
+		}
+
 		// The template might already exist on disk with the exact contents, but
 		// we still want to count that as "rendered" [GH-1000].
 		if !event.DidRender && !event.WouldRender {
@@ -1011,7 +1027,7 @@ func (r *Runner) childEnv() []string {
 		m["VAULT_TLS_SERVER_NAME"] = config.StringVal(r.config.Vault.SSL.ServerName)
 	}
 
-	// Append runner-supplied env (this is supplied programatically).
+	// Append runner-supplied env (this is supplied programmatically).
 	for k, v := range r.Env {
 		m[k] = v
 	}
@@ -1222,6 +1238,7 @@ func newClientSet(c *config.Config) (*dep.ClientSet, error) {
 
 	if err := clients.CreateVaultClient(&dep.CreateVaultClientInput{
 		Address:                      config.StringVal(c.Vault.Address),
+		Namespace:                    config.StringVal(c.Vault.Namespace),
 		Token:                        config.StringVal(c.Vault.Token),
 		UnwrapToken:                  config.BoolVal(c.Vault.UnwrapToken),
 		SSLEnabled:                   config.BoolVal(c.Vault.SSL.Enabled),
@@ -1250,11 +1267,12 @@ func newWatcher(c *config.Config, clients *dep.ClientSet, once bool) (*watch.Wat
 	log.Printf("[INFO] (runner) creating watcher")
 
 	w, err := watch.NewWatcher(&watch.NewWatcherInput{
-		Clients:         clients,
-		MaxStale:        config.TimeDurationVal(c.MaxStale),
-		Once:            once,
-		RenewVault:      clients.Vault().Token() != "" && config.BoolVal(c.Vault.RenewToken),
-		RetryFuncConsul: watch.RetryFunc(c.Consul.Retry.RetryFunc()),
+		Clients:             clients,
+		MaxStale:            config.TimeDurationVal(c.MaxStale),
+		Once:                once,
+		RenewVault:          clients.Vault().Token() != "" && config.BoolVal(c.Vault.RenewToken),
+		VaultAgentTokenFile: config.StringVal(c.Vault.VaultAgentTokenFile),
+		RetryFuncConsul:     watch.RetryFunc(c.Consul.Retry.RetryFunc()),
 		// TODO: Add a sane default retry - right now this only affects "local"
 		// dependencies like reading a file from disk.
 		RetryFuncDefault: nil,

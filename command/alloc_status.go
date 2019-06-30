@@ -9,10 +9,9 @@ import (
 	"time"
 
 	humanize "github.com/dustin/go-humanize"
-
 	"github.com/hashicorp/nomad/api"
 	"github.com/hashicorp/nomad/api/contexts"
-	"github.com/hashicorp/nomad/client"
+	"github.com/hashicorp/nomad/client/allocrunner/taskrunner/restarts"
 	"github.com/posener/complete"
 )
 
@@ -234,6 +233,7 @@ func formatAllocBasicInfo(alloc *api.Allocation, client *api.Client, uuidLength 
 		fmt.Sprintf("Eval ID|%s", limit(alloc.EvalID, uuidLength)),
 		fmt.Sprintf("Name|%s", alloc.Name),
 		fmt.Sprintf("Node ID|%s", limit(alloc.NodeID, uuidLength)),
+		fmt.Sprintf("Node Name|%s", alloc.NodeName),
 		fmt.Sprintf("Job ID|%s", alloc.JobID),
 		fmt.Sprintf("Job Version|%d", getVersion(alloc.Job)),
 		fmt.Sprintf("Client Status|%s", alloc.ClientStatus),
@@ -425,7 +425,7 @@ func buildDisplayMessage(event *api.TaskEvent) string {
 		desc = strings.Join(parts, ", ")
 	case api.TaskRestarting:
 		in := fmt.Sprintf("Task restarting in %v", time.Duration(event.StartDelay))
-		if event.RestartReason != "" && event.RestartReason != client.ReasonWithinPolicy {
+		if event.RestartReason != "" && event.RestartReason != restarts.ReasonWithinPolicy {
 			desc = fmt.Sprintf("%s - %s", event.RestartReason, in)
 		} else {
 			desc = in
@@ -488,8 +488,9 @@ func (c *AllocStatusCommand) outputTaskResources(alloc *api.Allocation, task str
 			addr = append(addr, fmt.Sprintf("%v: %v:%v\n", port.Label, nw.IP, port.Value))
 		}
 	}
+
 	var resourcesOutput []string
-	resourcesOutput = append(resourcesOutput, "CPU|Memory|Disk|IOPS|Addresses")
+	resourcesOutput = append(resourcesOutput, "CPU|Memory|Disk|Addresses")
 	firstAddr := ""
 	if len(addr) > 0 {
 		firstAddr = addr[0]
@@ -498,6 +499,8 @@ func (c *AllocStatusCommand) outputTaskResources(alloc *api.Allocation, task str
 	// Display the rolled up stats. If possible prefer the live statistics
 	cpuUsage := strconv.Itoa(*resource.CPU)
 	memUsage := humanize.IBytes(uint64(*resource.MemoryMB * bytesPerMegabyte))
+	var deviceStats []*api.DeviceGroupStats
+
 	if stats != nil {
 		if ru, ok := stats.Tasks[task]; ok && ru != nil && ru.ResourceUsage != nil {
 			if cs := ru.ResourceUsage.CpuStats; cs != nil {
@@ -506,18 +509,24 @@ func (c *AllocStatusCommand) outputTaskResources(alloc *api.Allocation, task str
 			if ms := ru.ResourceUsage.MemoryStats; ms != nil {
 				memUsage = fmt.Sprintf("%v/%v", humanize.IBytes(ms.RSS), memUsage)
 			}
+			deviceStats = ru.ResourceUsage.DeviceStats
 		}
 	}
-	resourcesOutput = append(resourcesOutput, fmt.Sprintf("%v MHz|%v|%v|%v|%v",
+	resourcesOutput = append(resourcesOutput, fmt.Sprintf("%v MHz|%v|%v|%v",
 		cpuUsage,
 		memUsage,
 		humanize.IBytes(uint64(*alloc.Resources.DiskMB*bytesPerMegabyte)),
-		*resource.IOPS,
 		firstAddr))
 	for i := 1; i < len(addr); i++ {
 		resourcesOutput = append(resourcesOutput, fmt.Sprintf("||||%v", addr[i]))
 	}
 	c.Ui.Output(formatListWithSpaces(resourcesOutput))
+
+	if len(deviceStats) > 0 {
+		c.Ui.Output("")
+		c.Ui.Output("Device Stats")
+		c.Ui.Output(formatList(getDeviceResources(deviceStats)))
+	}
 
 	if stats != nil {
 		if ru, ok := stats.Tasks[task]; ok && ru != nil && displayStats && ru.ResourceUsage != nil {
@@ -532,6 +541,8 @@ func (c *AllocStatusCommand) outputTaskResources(alloc *api.Allocation, task str
 func (c *AllocStatusCommand) outputVerboseResourceUsage(task string, resourceUsage *api.ResourceUsage) {
 	memoryStats := resourceUsage.MemoryStats
 	cpuStats := resourceUsage.CpuStats
+	deviceStats := resourceUsage.DeviceStats
+
 	if memoryStats != nil && len(memoryStats.Measured) > 0 {
 		c.Ui.Output("Memory Stats")
 
@@ -547,6 +558,8 @@ func (c *AllocStatusCommand) outputVerboseResourceUsage(task string, resourceUsa
 				measuredStats = append(measuredStats, humanize.IBytes(memoryStats.Cache))
 			case "Swap":
 				measuredStats = append(measuredStats, humanize.IBytes(memoryStats.Swap))
+			case "Usage":
+				measuredStats = append(measuredStats, humanize.IBytes(memoryStats.Usage))
 			case "Max Usage":
 				measuredStats = append(measuredStats, humanize.IBytes(memoryStats.MaxUsage))
 			case "Kernel Usage":
@@ -592,6 +605,13 @@ func (c *AllocStatusCommand) outputVerboseResourceUsage(task string, resourceUsa
 		out[0] = strings.Join(cpuStats.Measured, "|")
 		out[1] = strings.Join(measuredStats, "|")
 		c.Ui.Output(formatList(out))
+	}
+
+	if len(deviceStats) > 0 {
+		c.Ui.Output("")
+		c.Ui.Output("Device Stats")
+
+		printDeviceStats(c.Ui, deviceStats)
 	}
 }
 

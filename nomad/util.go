@@ -14,6 +14,11 @@ import (
 	"github.com/hashicorp/serf/serf"
 )
 
+// MinVersionPlanNormalization is the minimum version to support the
+// normalization of Plan in SubmitPlan, and the denormalization raft log entry committed
+// in ApplyPlanResultsRequest
+var MinVersionPlanNormalization = version.Must(version.NewVersion("0.9.2"))
+
 // ensurePath is used to make sure a path exists
 func ensurePath(path string, dir bool) error {
 	if !dir {
@@ -38,6 +43,7 @@ type serverParts struct {
 	Addr         net.Addr
 	RPCAddr      net.Addr
 	Status       serf.MemberStatus
+	NonVoter     bool
 }
 
 func (s *serverParts) String() string {
@@ -117,6 +123,9 @@ func isNomadServer(m serf.Member) (bool, *serverParts) {
 		}
 	}
 
+	// Check if the server is a non voter
+	_, nonVoter := m.Tags["nonvoter"]
+
 	addr := &net.TCPAddr{IP: m.Addr, Port: port}
 	rpcAddr := &net.TCPAddr{IP: rpcIP, Port: port}
 	parts := &serverParts{
@@ -134,15 +143,17 @@ func isNomadServer(m serf.Member) (bool, *serverParts) {
 		Build:        *buildVersion,
 		RaftVersion:  raftVsn,
 		Status:       m.Status,
+		NonVoter:     nonVoter,
 	}
 	return true, parts
 }
 
-// ServersMeetMinimumVersion returns whether the given alive servers are at least on the
-// given Nomad version
-func ServersMeetMinimumVersion(members []serf.Member, minVersion *version.Version) bool {
+// ServersMeetMinimumVersion returns whether the Nomad servers are at least on the
+// given Nomad version. The checkFailedServers parameter specifies whether version
+// for the failed servers should be verified.
+func ServersMeetMinimumVersion(members []serf.Member, minVersion *version.Version, checkFailedServers bool) bool {
 	for _, member := range members {
-		if valid, parts := isNomadServer(member); valid && parts.Status == serf.StatusAlive {
+		if valid, parts := isNomadServer(member); valid && (parts.Status == serf.StatusAlive || (checkFailedServers && parts.Status == serf.StatusFailed)) {
 			// Check if the versions match - version.LessThan will return true for
 			// 0.8.0-rc1 < 0.8.0, so we want to ignore the metadata
 			versionsMatch := slicesMatch(minVersion.Segments(), parts.Build.Segments())

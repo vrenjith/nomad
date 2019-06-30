@@ -31,6 +31,9 @@ func (s *Server) getNodeConn(nodeID string) (*nodeConnState, bool) {
 	s.nodeConnsLock.RLock()
 	defer s.nodeConnsLock.RUnlock()
 	conns, ok := s.nodeConns[nodeID]
+	if !ok {
+		return nil, false
+	}
 
 	// Return the latest conn
 	var state *nodeConnState
@@ -42,7 +45,7 @@ func (s *Server) getNodeConn(nodeID string) (*nodeConnState, bool) {
 
 	// Shouldn't happen but rather be safe
 	if state == nil {
-		s.logger.Printf("[WARN] nomad.client_rpc: node %q exists in node connection map without any connection", nodeID)
+		s.logger.Named("client_rpc").Warn("node exists in node connection map without any connection", "node_id", nodeID)
 		return nil, false
 	}
 

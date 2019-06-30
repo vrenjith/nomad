@@ -16,7 +16,7 @@ to bootstrap a local staging environment:
 
 ```bash
 $ git clone git@github.com:hashicorp/nomad.git
-$ cd terraform
+$ cd nomad/terraform
 $ vagrant up && vagrant ssh
 ```
 
@@ -37,8 +37,8 @@ properly:
 
 ```bash
 $ consul members
-$ nomad server-members
-$ nomad node-status
+$ nomad server members
+$ nomad node status
 ```
 
 ## Unseal the Vault cluster (optional)
@@ -46,8 +46,8 @@ $ nomad node-status
 To initialize and unseal Vault, run:
 
 ```bash
-$ vault init -key-shares=1 -key-threshold=1
-$ vault unseal
+$ vault operator init -key-shares=1 -key-threshold=1
+$ vault operator unseal
 $ export VAULT_TOKEN=[INITIAL_ROOT_TOKEN]
 ```
 

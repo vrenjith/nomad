@@ -28,7 +28,7 @@ placed on another node about to be drained.
 The [node status](/docs/commands/node/status.html) command compliments this
 nicely by providing the current drain status of a given node.
 
-See the [Decommissioning Nodes guide](/guides/node-draining.html) for detailed
+See the [Workload Migration guide](/guides/operations/node-draining.html) for detailed
 examples of node draining.
 
 ## Usage
@@ -57,6 +57,7 @@ operation is desired.
   node. Remaining allocations after the deadline are force removed from the
   node. Defaults to 1 hour.
 * `-detach`: Return immediately instead of entering monitor mode.
+* `-monitor`: Enter monitor mode directly without modifying the drain status.
 * `-force`: Force remove allocations off the node immediately.
 * `-no-deadline`: No deadline allows the allocations to drain off the node
   without being force stopped after a certain deadline.
@@ -114,6 +115,14 @@ $ nomad node drain -disable -keep-ineligible 4d2ba53b
 ...
 ```
 
+Enable drain mode and detach from monitoring, then reattach later:
+
+```
+$ nomad node drain -enable -detach -self
+...
+$ nomad node drain -self -monitor
+...
+```
 
 [eligibility]: /docs/commands/node/eligibility.html
 [migrate]: /docs/job-specification/migrate.html

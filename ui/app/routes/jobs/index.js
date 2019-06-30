@@ -5,15 +5,9 @@ import WithWatchers from 'nomad-ui/mixins/with-watchers';
 
 export default Route.extend(WithWatchers, {
   startWatchers(controller) {
-    controller.set('modelWatch', this.get('watch').perform());
+    controller.set('modelWatch', this.watch.perform());
   },
 
   watch: watchAll('job'),
   watchers: collect('watch'),
-
-  actions: {
-    refreshRoute() {
-      return true;
-    },
-  },
 });

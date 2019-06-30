@@ -2,10 +2,11 @@ package scheduler
 
 import (
 	"fmt"
-	"log"
 	"time"
 
 	"sort"
+
+	log "github.com/hashicorp/go-hclog"
 
 	"github.com/hashicorp/nomad/helper"
 	"github.com/hashicorp/nomad/helper/uuid"
@@ -38,7 +39,7 @@ type allocUpdateType func(existing *structs.Allocation, newJob *structs.Job,
 type allocReconciler struct {
 	// logger is used to log debug information. Logging should be kept at a
 	// minimal here
-	logger *log.Logger
+	logger log.Logger
 
 	// canInplace is used to check if the allocation can be inplace upgraded
 	allocUpdateFn allocUpdateType
@@ -127,6 +128,8 @@ type delayedRescheduleInfo struct {
 	// allocID is the ID of the allocation eligible to be rescheduled
 	allocID string
 
+	alloc *structs.Allocation
+
 	// rescheduleTime is the time to use in the delayed evaluation
 	rescheduleTime time.Time
 }
@@ -155,11 +158,11 @@ func (r *reconcileResults) Changes() int {
 
 // NewAllocReconciler creates a new reconciler that should be used to determine
 // the changes required to bring the cluster state inline with the declared jobspec
-func NewAllocReconciler(logger *log.Logger, allocUpdateFn allocUpdateType, batch bool,
+func NewAllocReconciler(logger log.Logger, allocUpdateFn allocUpdateType, batch bool,
 	jobID string, job *structs.Job, deployment *structs.Deployment,
 	existingAllocs []*structs.Allocation, taintedNodes map[string]*structs.Node, evalID string) *allocReconciler {
 	return &allocReconciler{
-		logger:         logger,
+		logger:         logger.Named("reconciler"),
 		allocUpdateFn:  allocUpdateFn,
 		batch:          batch,
 		jobID:          jobID,
@@ -217,7 +220,11 @@ func (a *allocReconciler) Compute() *reconcileResults {
 	// Set the description of a created deployment
 	if d := a.result.deployment; d != nil {
 		if d.RequiresPromotion() {
-			d.StatusDescription = structs.DeploymentStatusDescriptionRunningNeedsPromotion
+			if d.HasAutoPromote() {
+				d.StatusDescription = structs.DeploymentStatusDescriptionRunningAutoPromotion
+			} else {
+				d.StatusDescription = structs.DeploymentStatusDescriptionRunningNeedsPromotion
+			}
 		}
 	}
 
@@ -271,6 +278,7 @@ func (a *allocReconciler) cancelDeployments() {
 // handleStop marks all allocations to be stopped, handling the lost case
 func (a *allocReconciler) handleStop(m allocMatrix) {
 	for group, as := range m {
+		as = filterByTerminal(as)
 		untainted, migrate, lost := as.filterByTainted(a.taintedNodes)
 		a.markStop(untainted, "", allocNotNeeded)
 		a.markStop(migrate, "", allocNotNeeded)
@@ -325,6 +333,7 @@ func (a *allocReconciler) computeGroup(group string, all allocSet) bool {
 		dstate = &structs.DeploymentState{}
 		if tg.Update != nil {
 			dstate.AutoRevert = tg.Update.AutoRevert
+			dstate.AutoPromote = tg.Update.AutoPromote
 			dstate.ProgressDeadline = tg.Update.ProgressDeadline
 		}
 	}
@@ -418,6 +427,8 @@ func (a *allocReconciler) computeGroup(group string, all allocSet) bool {
 		for _, p := range place {
 			a.result.place = append(a.result.place, p)
 		}
+		a.markStop(rescheduleNow, "", allocRescheduled)
+		desiredChanges.Stop += uint64(len(rescheduleNow))
 
 		min := helper.IntMin(len(place), limit)
 		limit -= min
@@ -442,6 +453,12 @@ func (a *allocReconciler) computeGroup(group string, all allocSet) bool {
 				if p.IsRescheduling() && !(a.deploymentFailed && prev != nil && a.deployment.ID == prev.DeploymentID) {
 					a.result.place = append(a.result.place, p)
 					desiredChanges.Place++
+
+					a.result.stop = append(a.result.stop, allocStopResult{
+						alloc:             prev,
+						statusDescription: allocRescheduled,
+					})
+					desiredChanges.Stop++
 				}
 			}
 		}
@@ -464,24 +481,9 @@ func (a *allocReconciler) computeGroup(group string, all allocSet) bool {
 		desiredChanges.Ignore += uint64(len(destructive))
 	}
 
-	// Calculate the allowed number of changes and set the desired changes
-	// accordingly.
-	if !a.deploymentFailed && !a.deploymentPaused {
-		desiredChanges.Migrate += uint64(len(migrate))
-	} else {
-		desiredChanges.Stop += uint64(len(migrate))
-	}
-
+	// Migrate all the allocations
+	desiredChanges.Migrate += uint64(len(migrate))
 	for _, alloc := range migrate.nameOrder() {
-		// If the deployment is failed or paused, don't replace it, just mark as stop.
-		if a.deploymentFailed || a.deploymentPaused {
-			a.result.stop = append(a.result.stop, allocStopResult{
-				alloc:             alloc,
-				statusDescription: allocNodeTainted,
-			})
-			continue
-		}
-
 		a.result.stop = append(a.result.stop, allocStopResult{
 			alloc:             alloc,
 			statusDescription: allocMigrating,
@@ -500,7 +502,7 @@ func (a *allocReconciler) computeGroup(group string, all allocSet) bool {
 	updatingSpec := len(destructive) != 0 || len(a.result.inplaceUpdate) != 0
 	hadRunning := false
 	for _, alloc := range all {
-		if alloc.Job.Version == a.job.Version {
+		if alloc.Job.Version == a.job.Version && alloc.Job.CreateIndex == a.job.CreateIndex {
 			hadRunning = true
 			break
 		}

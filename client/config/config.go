@@ -8,10 +8,13 @@ import (
 	"strings"
 	"time"
 
+	log "github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/nomad/client/state"
 	"github.com/hashicorp/nomad/helper"
-	"github.com/hashicorp/nomad/helper/tlsutil"
+	"github.com/hashicorp/nomad/helper/pluginutils/loader"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/hashicorp/nomad/nomad/structs/config"
+	"github.com/hashicorp/nomad/plugins/base"
 	"github.com/hashicorp/nomad/version"
 )
 
@@ -77,6 +80,9 @@ type Config struct {
 	// LogOutput is the destination for logs
 	LogOutput io.Writer
 
+	// Logger provides a logger to thhe client
+	Logger log.Logger
+
 	// Region is the clients region
 	Region string
 
@@ -117,10 +123,6 @@ type Config struct {
 	// ClientMinPort is the lower range of the ports that the client uses for
 	// communicating with plugin subsystems over loopback
 	ClientMinPort uint
-
-	// GloballyReservedPorts are ports that are reserved across all network
-	// devices and IPs.
-	GloballyReservedPorts []int
 
 	// A mapping of directories on the host OS to attempt to embed inside each
 	// task's chroot.
@@ -196,6 +198,9 @@ type Config struct {
 	// key/value/tag format, or simply a key/value format
 	DisableTaggedMetrics bool
 
+	// DisableRemoteExec disables remote exec targeting tasks on this client
+	DisableRemoteExec bool
+
 	// BackwardsCompatibleMetrics determines whether to show methods of
 	// displaying metrics for older versions, or to only show the new format
 	BackwardsCompatibleMetrics bool
@@ -206,6 +211,16 @@ type Config struct {
 	// This period is meant to be long enough for a leader election to take
 	// place, and a small jitter is applied to avoid a thundering herd.
 	RPCHoldTimeout time.Duration
+
+	// PluginLoader is used to load plugins.
+	PluginLoader loader.PluginCatalog
+
+	// PluginSingletonLoader is a plugin loader that will returns singleton
+	// instances of the plugins.
+	PluginSingletonLoader loader.PluginCatalog
+
+	// StateDBFactory is used to override stateDB implementations,
+	StateDBFactory state.NewStateDBFunc
 }
 
 func (c *Config) Copy() *Config {
@@ -214,7 +229,6 @@ func (c *Config) Copy() *Config {
 	nc.Node = nc.Node.Copy()
 	nc.Servers = helper.CopySliceString(nc.Servers)
 	nc.Options = helper.CopyMapStringString(nc.Options)
-	nc.GloballyReservedPorts = helper.CopySliceInt(c.GloballyReservedPorts)
 	nc.ConsulConfig = c.ConsulConfig.Copy()
 	nc.VaultConfig = c.VaultConfig.Copy()
 	return nc
@@ -238,6 +252,7 @@ func DefaultConfig() *Config {
 		GCMaxAllocs:                50,
 		NoHostUUID:                 true,
 		DisableTaggedMetrics:       false,
+		DisableRemoteExec:          false,
 		BackwardsCompatibleMetrics: false,
 		RPCHoldTimeout:             5 * time.Second,
 	}
@@ -359,16 +374,12 @@ func (c *Config) ReadStringListToMapDefault(key, defaultValue string) map[string
 	return list
 }
 
-// TLSConfiguration returns a TLSUtil Config based on the existing client
-// configuration
-func (c *Config) TLSConfiguration() *tlsutil.Config {
-	return &tlsutil.Config{
-		VerifyIncoming:       true,
-		VerifyOutgoing:       true,
-		VerifyServerHostname: c.TLSConfig.VerifyServerHostname,
-		CAFile:               c.TLSConfig.CAFile,
-		CertFile:             c.TLSConfig.CertFile,
-		KeyFile:              c.TLSConfig.KeyFile,
-		KeyLoader:            c.TLSConfig.GetKeyLoader(),
+// NomadPluginConfig produces the NomadConfig struct which is sent to Nomad plugins
+func (c *Config) NomadPluginConfig() *base.AgentConfig {
+	return &base.AgentConfig{
+		Driver: &base.ClientDriverConfig{
+			ClientMinPort: c.ClientMinPort,
+			ClientMaxPort: c.ClientMaxPort,
+		},
 	}
 }

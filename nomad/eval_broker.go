@@ -10,9 +10,9 @@ import (
 
 	"context"
 
-	"github.com/armon/go-metrics"
+	metrics "github.com/armon/go-metrics"
 	"github.com/hashicorp/nomad/helper/uuid"
-	"github.com/hashicorp/nomad/lib"
+	"github.com/hashicorp/nomad/lib/delayheap"
 	"github.com/hashicorp/nomad/nomad/structs"
 )
 
@@ -86,7 +86,7 @@ type EvalBroker struct {
 
 	// delayHeap is a heap used to track incoming evaluations that are
 	// not eligible to enqueue until their WaitTime
-	delayHeap *lib.DelayHeap
+	delayHeap *delayheap.DelayHeap
 
 	// delayedEvalsUpdateCh is used to trigger notifications for updates
 	// to the delayHeap
@@ -142,7 +142,7 @@ func NewEvalBroker(timeout, initialNackDelay, subsequentNackDelay time.Duration,
 		timeWait:             make(map[string]*time.Timer),
 		initialNackDelay:     initialNackDelay,
 		subsequentNackDelay:  subsequentNackDelay,
-		delayHeap:            lib.NewDelayHeap(),
+		delayHeap:            delayheap.NewDelayHeap(),
 		delayedEvalsUpdateCh: make(chan struct{}, 1),
 	}
 	b.stats.ByScheduler = make(map[string]*SchedulerStats)
@@ -161,15 +161,17 @@ func (b *EvalBroker) Enabled() bool {
 // should only be enabled on the active leader.
 func (b *EvalBroker) SetEnabled(enabled bool) {
 	b.l.Lock()
+	defer b.l.Unlock()
+
 	prevEnabled := b.enabled
 	b.enabled = enabled
 	if !prevEnabled && enabled {
 		// start the go routine for delayed evals
 		ctx, cancel := context.WithCancel(context.Background())
 		b.delayedEvalCancelFunc = cancel
-		go b.runDelayedEvalsWatcher(ctx)
+		go b.runDelayedEvalsWatcher(ctx, b.delayedEvalsUpdateCh)
 	}
-	b.l.Unlock()
+
 	if !enabled {
 		b.flush()
 	}
@@ -208,6 +210,11 @@ func (b *EvalBroker) EnqueueAll(evals map[*structs.Evaluation]string) {
 // outstanding, the evaluation is blocked until an Ack/Nack is received.
 // processEnqueue must be called with the lock held.
 func (b *EvalBroker) processEnqueue(eval *structs.Evaluation, token string) {
+	// If we're not enabled, don't enable more queuing.
+	if !b.enabled {
+		return
+	}
+
 	// Check if already enqueued
 	if _, ok := b.evals[eval.ID]; ok {
 		if token == "" {
@@ -259,8 +266,10 @@ func (b *EvalBroker) processWaitingEnqueue(eval *structs.Evaluation) {
 func (b *EvalBroker) enqueueWaiting(eval *structs.Evaluation) {
 	b.l.Lock()
 	defer b.l.Unlock()
+
 	delete(b.timeWait, eval.ID)
 	b.stats.TotalWaiting -= 1
+
 	b.enqueueLocked(eval, eval.Type)
 }
 
@@ -678,11 +687,9 @@ func (b *EvalBroker) ResumeNackTimeout(evalID, token string) error {
 	return nil
 }
 
-// Flush is used to clear the state of the broker
+// Flush is used to clear the state of the broker. It must be called from within
+// the lock.
 func (b *EvalBroker) flush() {
-	b.l.Lock()
-	defer b.l.Unlock()
-
 	// Unblock any waiters
 	for _, waitCh := range b.waiting {
 		close(waitCh)
@@ -719,7 +726,7 @@ func (b *EvalBroker) flush() {
 	b.ready = make(map[string]PendingEvaluations)
 	b.unack = make(map[string]*unackEval)
 	b.timeWait = make(map[string]*time.Timer)
-	b.delayHeap = lib.NewDelayHeap()
+	b.delayHeap = delayheap.NewDelayHeap()
 }
 
 // evalWrapper satisfies the HeapNode interface
@@ -741,7 +748,7 @@ func (d *evalWrapper) Namespace() string {
 
 // runDelayedEvalsWatcher is a long-lived function that waits till a time deadline is met for
 // pending evaluations before enqueuing them
-func (b *EvalBroker) runDelayedEvalsWatcher(ctx context.Context) {
+func (b *EvalBroker) runDelayedEvalsWatcher(ctx context.Context, updateCh <-chan struct{}) {
 	var timerChannel <-chan time.Time
 	var delayTimer *time.Timer
 	for {
@@ -763,12 +770,12 @@ func (b *EvalBroker) runDelayedEvalsWatcher(ctx context.Context) {
 			return
 		case <-timerChannel:
 			// remove from the heap since we can enqueue it now
-			b.delayHeap.Remove(&evalWrapper{eval})
 			b.l.Lock()
+			b.delayHeap.Remove(&evalWrapper{eval})
 			b.stats.TotalWaiting -= 1
 			b.enqueueLocked(eval, eval.Type)
 			b.l.Unlock()
-		case <-b.delayedEvalsUpdateCh:
+		case <-updateCh:
 			continue
 		}
 	}
@@ -777,12 +784,14 @@ func (b *EvalBroker) runDelayedEvalsWatcher(ctx context.Context) {
 // nextDelayedEval returns the next delayed eval to launch and when it should be enqueued.
 // This peeks at the heap to return the top. If the heap is empty, this returns nil and zero time.
 func (b *EvalBroker) nextDelayedEval() (*structs.Evaluation, time.Time) {
+	b.l.RLock()
+	defer b.l.RUnlock()
+
 	// If there is nothing wait for an update.
 	if b.delayHeap.Length() == 0 {
 		return nil, time.Time{}
 	}
 	nextEval := b.delayHeap.Peek()
-
 	if nextEval == nil {
 		return nil, time.Time{}
 	}
@@ -813,7 +822,7 @@ func (b *EvalBroker) Stats() *BrokerStats {
 }
 
 // EmitStats is used to export metrics about the broker while enabled
-func (b *EvalBroker) EmitStats(period time.Duration, stopCh chan struct{}) {
+func (b *EvalBroker) EmitStats(period time.Duration, stopCh <-chan struct{}) {
 	for {
 		select {
 		case <-time.After(period):

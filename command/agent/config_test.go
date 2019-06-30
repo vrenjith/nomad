@@ -14,6 +14,7 @@ import (
 	"github.com/hashicorp/nomad/helper"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/hashicorp/nomad/nomad/structs/config"
+	"github.com/stretchr/testify/require"
 )
 
 var (
@@ -44,7 +45,9 @@ func TestConfig_Merge(t *testing.T) {
 		Datacenter:                "dc1",
 		NodeName:                  "node1",
 		DataDir:                   "/tmp/dir1",
+		PluginDir:                 "/tmp/pluginDir1",
 		LogLevel:                  "INFO",
+		LogJson:                   false,
 		EnableDebug:               false,
 		LeaveOnInt:                false,
 		LeaveOnTerm:               false,
@@ -75,6 +78,7 @@ func TestConfig_Merge(t *testing.T) {
 			CirconusCheckTags:                  "cat1:tag1,cat2:tag2",
 			CirconusBrokerID:                   "0",
 			CirconusBrokerSelectTag:            "dc:dc1",
+			PrefixFilter:                       []string{"filter1", "filter2"},
 		},
 		Client: &ClientConfig{
 			Enabled:   false,
@@ -84,18 +88,17 @@ func TestConfig_Merge(t *testing.T) {
 			Options: map[string]string{
 				"foo": "bar",
 			},
-			NetworkSpeed:   100,
-			CpuCompute:     100,
-			MemoryMB:       100,
-			MaxKillTimeout: "20s",
-			ClientMaxPort:  19996,
+			NetworkSpeed:      100,
+			CpuCompute:        100,
+			MemoryMB:          100,
+			MaxKillTimeout:    "20s",
+			ClientMaxPort:     19996,
+			DisableRemoteExec: false,
 			Reserved: &Resources{
-				CPU:                 10,
-				MemoryMB:            10,
-				DiskMB:              10,
-				IOPS:                10,
-				ReservedPorts:       "1,10-30,55",
-				ParsedReservedPorts: []int{1, 2, 4},
+				CPU:           10,
+				MemoryMB:      10,
+				DiskMB:        10,
+				ReservedPorts: "1,10-30,55",
 			},
 		},
 		Server: &ServerConfig{
@@ -105,7 +108,7 @@ func TestConfig_Merge(t *testing.T) {
 			DataDir:                "/tmp/data1",
 			ProtocolVersion:        1,
 			RaftProtocol:           1,
-			NumSchedulers:          1,
+			NumSchedulers:          helper.IntToPtr(1),
 			NodeGCThreshold:        "1h",
 			HeartbeatGrace:         30 * time.Second,
 			MinHeartbeatTTL:        30 * time.Second,
@@ -174,14 +177,25 @@ func TestConfig_Merge(t *testing.T) {
 			DisableUpgradeMigration: &falseValue,
 			EnableCustomUpgrades:    &falseValue,
 		},
+		Plugins: []*config.PluginConfig{
+			{
+				Name: "docker",
+				Args: []string{"foo"},
+				Config: map[string]interface{}{
+					"bar": 1,
+				},
+			},
+		},
 	}
 
 	c3 := &Config{
-		Region:                    "region2",
+		Region:                    "global",
 		Datacenter:                "dc2",
 		NodeName:                  "node2",
 		DataDir:                   "/tmp/dir2",
+		PluginDir:                 "/tmp/pluginDir2",
 		LogLevel:                  "DEBUG",
+		LogJson:                   true,
 		EnableDebug:               true,
 		LeaveOnInt:                true,
 		LeaveOnTerm:               true,
@@ -214,6 +228,9 @@ func TestConfig_Merge(t *testing.T) {
 			CirconusCheckTags:                  "cat1:tag1,cat2:tag2",
 			CirconusBrokerID:                   "1",
 			CirconusBrokerSelectTag:            "dc:dc2",
+			PrefixFilter:                       []string{"prefix1", "prefix2"},
+			DisableDispatchedJobSummaryMetrics: true,
+			FilterDefault:                      helper.BoolToPtr(false),
 		},
 		Client: &ClientConfig{
 			Enabled:   true,
@@ -228,20 +245,19 @@ func TestConfig_Merge(t *testing.T) {
 				"foo": "bar",
 				"baz": "zip",
 			},
-			ChrootEnv:      map[string]string{},
-			ClientMaxPort:  20000,
-			ClientMinPort:  22000,
-			NetworkSpeed:   105,
-			CpuCompute:     105,
-			MemoryMB:       105,
-			MaxKillTimeout: "50s",
+			ChrootEnv:         map[string]string{},
+			ClientMaxPort:     20000,
+			ClientMinPort:     22000,
+			NetworkSpeed:      105,
+			CpuCompute:        105,
+			MemoryMB:          105,
+			MaxKillTimeout:    "50s",
+			DisableRemoteExec: false,
 			Reserved: &Resources{
-				CPU:                 15,
-				MemoryMB:            15,
-				DiskMB:              15,
-				IOPS:                15,
-				ReservedPorts:       "2,10-30,55",
-				ParsedReservedPorts: []int{1, 2, 3},
+				CPU:           15,
+				MemoryMB:      15,
+				DiskMB:        15,
+				ReservedPorts: "2,10-30,55",
 			},
 			GCInterval:            6 * time.Second,
 			GCParallelDestroys:    6,
@@ -255,7 +271,7 @@ func TestConfig_Merge(t *testing.T) {
 			DataDir:                "/tmp/data2",
 			ProtocolVersion:        2,
 			RaftProtocol:           2,
-			NumSchedulers:          2,
+			NumSchedulers:          helper.IntToPtr(2),
 			EnabledSchedulers:      []string{structs.JobTypeBatch},
 			NodeGCThreshold:        "12h",
 			HeartbeatGrace:         2 * time.Minute,
@@ -264,8 +280,7 @@ func TestConfig_Merge(t *testing.T) {
 			RejoinAfterLeave:       true,
 			StartJoin:              []string{"1.1.1.1"},
 			RetryJoin:              []string{"1.1.1.1"},
-			RetryInterval:          "10s",
-			retryInterval:          time.Second * 10,
+			RetryInterval:          time.Second * 10,
 			NonVotingServer:        true,
 			RedundancyZone:         "bar",
 			UpgradeVersion:         "bar",
@@ -340,6 +355,22 @@ func TestConfig_Merge(t *testing.T) {
 			EnableRedundancyZones:   &trueValue,
 			DisableUpgradeMigration: &trueValue,
 			EnableCustomUpgrades:    &trueValue,
+		},
+		Plugins: []*config.PluginConfig{
+			{
+				Name: "docker",
+				Args: []string{"bam"},
+				Config: map[string]interface{}{
+					"baz": 2,
+				},
+			},
+			{
+				Name: "exec",
+				Args: []string{"arg"},
+				Config: map[string]interface{}{
+					"config": true,
+				},
+			},
 		},
 	}
 
@@ -849,54 +880,6 @@ func TestConfig_normalizeAddrs(t *testing.T) {
 	}
 }
 
-func TestResources_ParseReserved(t *testing.T) {
-	cases := []struct {
-		Input  string
-		Parsed []int
-		Err    bool
-	}{
-		{
-			"1,2,3",
-			[]int{1, 2, 3},
-			false,
-		},
-		{
-			"3,1,2,1,2,3,1-3",
-			[]int{1, 2, 3},
-			false,
-		},
-		{
-			"3-1",
-			nil,
-			true,
-		},
-		{
-			"1-3,2-4",
-			[]int{1, 2, 3, 4},
-			false,
-		},
-		{
-			"1-3,4,5-5,6,7,8-10",
-			[]int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10},
-			false,
-		},
-	}
-
-	for i, tc := range cases {
-		r := &Resources{ReservedPorts: tc.Input}
-		err := r.ParseReserved()
-		if (err != nil) != tc.Err {
-			t.Fatalf("test case %d: %v", i, err)
-			continue
-		}
-
-		if !reflect.DeepEqual(r.ParsedReservedPorts, tc.Parsed) {
-			t.Fatalf("test case %d: \n\n%#v\n\n%#v", i, r.ParsedReservedPorts, tc.Parsed)
-		}
-
-	}
-}
-
 func TestIsMissingPort(t *testing.T) {
 	_, _, err := net.SplitHostPort("localhost")
 	if missing := isMissingPort(err); !missing {
@@ -906,4 +889,175 @@ func TestIsMissingPort(t *testing.T) {
 	if missing := isMissingPort(err); missing {
 		t.Errorf("expected no error, but got %v", err)
 	}
+}
+
+func TestMergeServerJoin(t *testing.T) {
+	require := require.New(t)
+
+	{
+		retryJoin := []string{"127.0.0.1", "127.0.0.2"}
+		startJoin := []string{"127.0.0.1", "127.0.0.2"}
+		retryMaxAttempts := 1
+		retryInterval := time.Duration(0)
+
+		a := &ServerJoin{
+			RetryJoin:        retryJoin,
+			StartJoin:        startJoin,
+			RetryMaxAttempts: retryMaxAttempts,
+			RetryInterval:    time.Duration(retryInterval),
+		}
+		b := &ServerJoin{}
+
+		result := a.Merge(b)
+		require.Equal(result.RetryJoin, retryJoin)
+		require.Equal(result.StartJoin, startJoin)
+		require.Equal(result.RetryMaxAttempts, retryMaxAttempts)
+		require.Equal(result.RetryInterval, retryInterval)
+	}
+	{
+		retryJoin := []string{"127.0.0.1", "127.0.0.2"}
+		startJoin := []string{"127.0.0.1", "127.0.0.2"}
+		retryMaxAttempts := 1
+		retryInterval := time.Duration(0)
+
+		a := &ServerJoin{}
+		b := &ServerJoin{
+			RetryJoin:        retryJoin,
+			StartJoin:        startJoin,
+			RetryMaxAttempts: retryMaxAttempts,
+			RetryInterval:    time.Duration(retryInterval),
+		}
+
+		result := a.Merge(b)
+		require.Equal(result.RetryJoin, retryJoin)
+		require.Equal(result.StartJoin, startJoin)
+		require.Equal(result.RetryMaxAttempts, retryMaxAttempts)
+		require.Equal(result.RetryInterval, retryInterval)
+	}
+	{
+		retryJoin := []string{"127.0.0.1", "127.0.0.2"}
+		startJoin := []string{"127.0.0.1", "127.0.0.2"}
+		retryMaxAttempts := 1
+		retryInterval := time.Duration(0)
+
+		var a *ServerJoin
+		b := &ServerJoin{
+			RetryJoin:        retryJoin,
+			StartJoin:        startJoin,
+			RetryMaxAttempts: retryMaxAttempts,
+			RetryInterval:    time.Duration(retryInterval),
+		}
+
+		result := a.Merge(b)
+		require.Equal(result.RetryJoin, retryJoin)
+		require.Equal(result.StartJoin, startJoin)
+		require.Equal(result.RetryMaxAttempts, retryMaxAttempts)
+		require.Equal(result.RetryInterval, retryInterval)
+	}
+	{
+		retryJoin := []string{"127.0.0.1", "127.0.0.2"}
+		startJoin := []string{"127.0.0.1", "127.0.0.2"}
+		retryMaxAttempts := 1
+		retryInterval := time.Duration(0)
+
+		a := &ServerJoin{
+			RetryJoin:        retryJoin,
+			StartJoin:        startJoin,
+			RetryMaxAttempts: retryMaxAttempts,
+			RetryInterval:    time.Duration(retryInterval),
+		}
+		var b *ServerJoin
+
+		result := a.Merge(b)
+		require.Equal(result.RetryJoin, retryJoin)
+		require.Equal(result.StartJoin, startJoin)
+		require.Equal(result.RetryMaxAttempts, retryMaxAttempts)
+		require.Equal(result.RetryInterval, retryInterval)
+	}
+	{
+		retryJoin := []string{"127.0.0.1", "127.0.0.2"}
+		startJoin := []string{"127.0.0.1", "127.0.0.2"}
+		retryMaxAttempts := 1
+		retryInterval := time.Duration(0)
+
+		a := &ServerJoin{
+			RetryJoin: retryJoin,
+			StartJoin: startJoin,
+		}
+		b := &ServerJoin{
+			RetryMaxAttempts: retryMaxAttempts,
+			RetryInterval:    time.Duration(retryInterval),
+		}
+
+		result := a.Merge(b)
+		require.Equal(result.RetryJoin, retryJoin)
+		require.Equal(result.StartJoin, startJoin)
+		require.Equal(result.RetryMaxAttempts, retryMaxAttempts)
+		require.Equal(result.RetryInterval, retryInterval)
+	}
+}
+
+func TestTelemetry_PrefixFilters(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		in       []string
+		expAllow []string
+		expBlock []string
+		expErr   bool
+	}{
+		{
+			in:       []string{"+foo"},
+			expAllow: []string{"foo"},
+		},
+		{
+			in:       []string{"-foo"},
+			expBlock: []string{"foo"},
+		},
+		{
+			in:       []string{"+a.b.c", "-x.y.z"},
+			expAllow: []string{"a.b.c"},
+			expBlock: []string{"x.y.z"},
+		},
+		{
+			in:     []string{"+foo", "bad", "-bar"},
+			expErr: true,
+		},
+	}
+
+	for i, c := range cases {
+		t.Run(fmt.Sprintf("PrefixCase%d", i), func(t *testing.T) {
+			require := require.New(t)
+			tel := &Telemetry{
+				PrefixFilter: c.in,
+			}
+
+			allow, block, err := tel.PrefixFilters()
+			require.Exactly(c.expAllow, allow)
+			require.Exactly(c.expBlock, block)
+			require.Equal(c.expErr, err != nil)
+		})
+	}
+}
+
+func TestTelemetry_Parse(t *testing.T) {
+	require := require.New(t)
+	dir, err := ioutil.TempDir("", "nomad")
+	require.NoError(err)
+	defer os.RemoveAll(dir)
+
+	file1 := filepath.Join(dir, "config1.hcl")
+	err = ioutil.WriteFile(file1, []byte(`telemetry{
+		prefix_filter = ["+nomad.raft"]
+		filter_default = false
+		disable_dispatched_job_summary_metrics = true
+	}`), 0600)
+	require.NoError(err)
+
+	// Works on config dir
+	config, err := LoadConfig(dir)
+	require.NoError(err)
+
+	require.False(*config.Telemetry.FilterDefault)
+	require.Exactly([]string{"+nomad.raft"}, config.Telemetry.PrefixFilter)
+	require.True(config.Telemetry.DisableDispatchedJobSummaryMetrics)
 }

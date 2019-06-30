@@ -22,17 +22,18 @@ export default Component.extend({
     // const targetURL = this.get('router').urlFor('servers.server', this.get('agent'));
     // const currentURL = `${this.get('router.rootURL').slice(0, -1)}${this.get('router.currentURL')}`;
 
-    const router = this.get('router');
-    const targetURL = router.generate('servers.server', this.get('agent'));
-    const currentURL = `${router.get('rootURL').slice(0, -1)}${router
-      .get('currentURL')
-      .split('?')[0]}`;
+    const router = this.router;
+    const targetURL = router.generate('servers.server', this.agent);
+    const currentURL = `${router.get('rootURL').slice(0, -1)}${
+      router.get('currentURL').split('?')[0]
+    }`;
 
-    return currentURL === targetURL;
+    // Account for potential URI encoding
+    return currentURL.replace(/%40/g, '@') === targetURL.replace(/%40/g, '@');
   }),
 
   click() {
-    const transition = () => this.get('router').transitionTo('servers.server', this.get('agent'));
+    const transition = () => this.router.transitionTo('servers.server', this.agent);
     lazyClick([transition, event]);
   },
 });

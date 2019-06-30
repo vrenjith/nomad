@@ -152,6 +152,12 @@ func TestJobDiff(t *testing.T) {
 					},
 					{
 						Type: DiffTypeDeleted,
+						Name: "Dispatched",
+						Old:  "false",
+						New:  "",
+					},
+					{
+						Type: DiffTypeDeleted,
 						Name: "Meta[foo]",
 						Old:  "bar",
 						New:  "",
@@ -212,6 +218,12 @@ func TestJobDiff(t *testing.T) {
 						Name: "AllAtOnce",
 						Old:  "",
 						New:  "true",
+					},
+					{
+						Type: DiffTypeAdded,
+						Name: "Dispatched",
+						Old:  "",
+						New:  "false",
 					},
 					{
 						Type: DiffTypeAdded,
@@ -734,6 +746,110 @@ func TestJobDiff(t *testing.T) {
 								Type: DiffTypeDeleted,
 								Name: "RTarget",
 								Old:  "bar",
+								New:  "",
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			// Affinities edited
+			Old: &Job{
+				Affinities: []*Affinity{
+					{
+						LTarget: "foo",
+						RTarget: "foo",
+						Operand: "foo",
+						Weight:  20,
+						str:     "foo",
+					},
+					{
+						LTarget: "bar",
+						RTarget: "bar",
+						Operand: "bar",
+						Weight:  20,
+						str:     "bar",
+					},
+				},
+			},
+			New: &Job{
+				Affinities: []*Affinity{
+					{
+						LTarget: "foo",
+						RTarget: "foo",
+						Operand: "foo",
+						Weight:  20,
+						str:     "foo",
+					},
+					{
+						LTarget: "baz",
+						RTarget: "baz",
+						Operand: "baz",
+						Weight:  20,
+						str:     "baz",
+					},
+				},
+			},
+			Expected: &JobDiff{
+				Type: DiffTypeEdited,
+				Objects: []*ObjectDiff{
+					{
+						Type: DiffTypeAdded,
+						Name: "Affinity",
+						Fields: []*FieldDiff{
+							{
+								Type: DiffTypeAdded,
+								Name: "LTarget",
+								Old:  "",
+								New:  "baz",
+							},
+							{
+								Type: DiffTypeAdded,
+								Name: "Operand",
+								Old:  "",
+								New:  "baz",
+							},
+							{
+								Type: DiffTypeAdded,
+								Name: "RTarget",
+								Old:  "",
+								New:  "baz",
+							},
+							{
+								Type: DiffTypeAdded,
+								Name: "Weight",
+								Old:  "",
+								New:  "20",
+							},
+						},
+					},
+					{
+						Type: DiffTypeDeleted,
+						Name: "Affinity",
+						Fields: []*FieldDiff{
+							{
+								Type: DiffTypeDeleted,
+								Name: "LTarget",
+								Old:  "bar",
+								New:  "",
+							},
+							{
+								Type: DiffTypeDeleted,
+								Name: "Operand",
+								Old:  "bar",
+								New:  "",
+							},
+							{
+								Type: DiffTypeDeleted,
+								Name: "RTarget",
+								Old:  "bar",
+								New:  "",
+							},
+							{
+								Type: DiffTypeDeleted,
+								Name: "Weight",
+								Old:  "20",
 								New:  "",
 							},
 						},
@@ -1292,6 +1408,110 @@ func TestTaskGroupDiff(t *testing.T) {
 			},
 		},
 		{
+			// Affinities edited
+			Old: &TaskGroup{
+				Affinities: []*Affinity{
+					{
+						LTarget: "foo",
+						RTarget: "foo",
+						Operand: "foo",
+						Weight:  20,
+						str:     "foo",
+					},
+					{
+						LTarget: "bar",
+						RTarget: "bar",
+						Operand: "bar",
+						Weight:  20,
+						str:     "bar",
+					},
+				},
+			},
+			New: &TaskGroup{
+				Affinities: []*Affinity{
+					{
+						LTarget: "foo",
+						RTarget: "foo",
+						Operand: "foo",
+						Weight:  20,
+						str:     "foo",
+					},
+					{
+						LTarget: "baz",
+						RTarget: "baz",
+						Operand: "baz",
+						Weight:  20,
+						str:     "baz",
+					},
+				},
+			},
+			Expected: &TaskGroupDiff{
+				Type: DiffTypeEdited,
+				Objects: []*ObjectDiff{
+					{
+						Type: DiffTypeAdded,
+						Name: "Affinity",
+						Fields: []*FieldDiff{
+							{
+								Type: DiffTypeAdded,
+								Name: "LTarget",
+								Old:  "",
+								New:  "baz",
+							},
+							{
+								Type: DiffTypeAdded,
+								Name: "Operand",
+								Old:  "",
+								New:  "baz",
+							},
+							{
+								Type: DiffTypeAdded,
+								Name: "RTarget",
+								Old:  "",
+								New:  "baz",
+							},
+							{
+								Type: DiffTypeAdded,
+								Name: "Weight",
+								Old:  "",
+								New:  "20",
+							},
+						},
+					},
+					{
+						Type: DiffTypeDeleted,
+						Name: "Affinity",
+						Fields: []*FieldDiff{
+							{
+								Type: DiffTypeDeleted,
+								Name: "LTarget",
+								Old:  "bar",
+								New:  "",
+							},
+							{
+								Type: DiffTypeDeleted,
+								Name: "Operand",
+								Old:  "bar",
+								New:  "",
+							},
+							{
+								Type: DiffTypeDeleted,
+								Name: "RTarget",
+								Old:  "bar",
+								New:  "",
+							},
+							{
+								Type: DiffTypeDeleted,
+								Name: "Weight",
+								Old:  "20",
+								New:  "",
+							},
+						},
+					},
+				},
+			},
+		},
+		{
 			// RestartPolicy added
 			Old: &TaskGroup{},
 			New: &TaskGroup{
@@ -1759,6 +1979,12 @@ func TestTaskGroupDiff(t *testing.T) {
 						Fields: []*FieldDiff{
 							{
 								Type: DiffTypeDeleted,
+								Name: "AutoPromote",
+								Old:  "false",
+								New:  "",
+							},
+							{
+								Type: DiffTypeDeleted,
 								Name: "AutoRevert",
 								Old:  "true",
 								New:  "",
@@ -1815,6 +2041,12 @@ func TestTaskGroupDiff(t *testing.T) {
 						Fields: []*FieldDiff{
 							{
 								Type: DiffTypeAdded,
+								Name: "AutoPromote",
+								Old:  "",
+								New:  "false",
+							},
+							{
+								Type: DiffTypeAdded,
 								Name: "AutoRevert",
 								Old:  "",
 								New:  "true",
@@ -1864,6 +2096,7 @@ func TestTaskGroupDiff(t *testing.T) {
 					HealthyDeadline:  30 * time.Second,
 					ProgressDeadline: 29 * time.Second,
 					AutoRevert:       true,
+					AutoPromote:      true,
 					Canary:           2,
 				},
 			},
@@ -1875,6 +2108,7 @@ func TestTaskGroupDiff(t *testing.T) {
 					HealthyDeadline:  31 * time.Second,
 					ProgressDeadline: 32 * time.Second,
 					AutoRevert:       false,
+					AutoPromote:      false,
 					Canary:           1,
 				},
 			},
@@ -1885,6 +2119,12 @@ func TestTaskGroupDiff(t *testing.T) {
 						Type: DiffTypeEdited,
 						Name: "Update",
 						Fields: []*FieldDiff{
+							{
+								Type: DiffTypeEdited,
+								Name: "AutoPromote",
+								Old:  "true",
+								New:  "false",
+							},
 							{
 								Type: DiffTypeEdited,
 								Name: "AutoRevert",
@@ -1943,6 +2183,7 @@ func TestTaskGroupDiff(t *testing.T) {
 					HealthyDeadline:  30 * time.Second,
 					ProgressDeadline: 30 * time.Second,
 					AutoRevert:       true,
+					AutoPromote:      true,
 					Canary:           2,
 				},
 			},
@@ -1954,6 +2195,7 @@ func TestTaskGroupDiff(t *testing.T) {
 					HealthyDeadline:  30 * time.Second,
 					ProgressDeadline: 30 * time.Second,
 					AutoRevert:       true,
+					AutoPromote:      true,
 					Canary:           2,
 				},
 			},
@@ -1964,6 +2206,12 @@ func TestTaskGroupDiff(t *testing.T) {
 						Type: DiffTypeEdited,
 						Name: "Update",
 						Fields: []*FieldDiff{
+							{
+								Type: DiffTypeNone,
+								Name: "AutoPromote",
+								Old:  "true",
+								New:  "true",
+							},
 							{
 								Type: DiffTypeNone,
 								Name: "AutoRevert",
@@ -2599,6 +2847,110 @@ func TestTaskDiff(t *testing.T) {
 			},
 		},
 		{
+			Name: "Affinities edited",
+			Old: &Task{
+				Affinities: []*Affinity{
+					{
+						LTarget: "foo",
+						RTarget: "foo",
+						Operand: "foo",
+						Weight:  20,
+						str:     "foo",
+					},
+					{
+						LTarget: "bar",
+						RTarget: "bar",
+						Operand: "bar",
+						Weight:  20,
+						str:     "bar",
+					},
+				},
+			},
+			New: &Task{
+				Affinities: []*Affinity{
+					{
+						LTarget: "foo",
+						RTarget: "foo",
+						Operand: "foo",
+						Weight:  20,
+						str:     "foo",
+					},
+					{
+						LTarget: "baz",
+						RTarget: "baz",
+						Operand: "baz",
+						Weight:  20,
+						str:     "baz",
+					},
+				},
+			},
+			Expected: &TaskDiff{
+				Type: DiffTypeEdited,
+				Objects: []*ObjectDiff{
+					{
+						Type: DiffTypeAdded,
+						Name: "Affinity",
+						Fields: []*FieldDiff{
+							{
+								Type: DiffTypeAdded,
+								Name: "LTarget",
+								Old:  "",
+								New:  "baz",
+							},
+							{
+								Type: DiffTypeAdded,
+								Name: "Operand",
+								Old:  "",
+								New:  "baz",
+							},
+							{
+								Type: DiffTypeAdded,
+								Name: "RTarget",
+								Old:  "",
+								New:  "baz",
+							},
+							{
+								Type: DiffTypeAdded,
+								Name: "Weight",
+								Old:  "",
+								New:  "20",
+							},
+						},
+					},
+					{
+						Type: DiffTypeDeleted,
+						Name: "Affinity",
+						Fields: []*FieldDiff{
+							{
+								Type: DiffTypeDeleted,
+								Name: "LTarget",
+								Old:  "bar",
+								New:  "",
+							},
+							{
+								Type: DiffTypeDeleted,
+								Name: "Operand",
+								Old:  "bar",
+								New:  "",
+							},
+							{
+								Type: DiffTypeDeleted,
+								Name: "RTarget",
+								Old:  "bar",
+								New:  "",
+							},
+							{
+								Type: DiffTypeDeleted,
+								Name: "Weight",
+								Old:  "20",
+								New:  "",
+							},
+						},
+					},
+				},
+			},
+		},
+		{
 			Name: "LogConfig added",
 			Old:  &Task{},
 			New: &Task{
@@ -2854,7 +3206,6 @@ func TestTaskDiff(t *testing.T) {
 					CPU:      100,
 					MemoryMB: 100,
 					DiskMB:   100,
-					IOPS:     100,
 				},
 			},
 			New: &Task{
@@ -2862,7 +3213,6 @@ func TestTaskDiff(t *testing.T) {
 					CPU:      200,
 					MemoryMB: 200,
 					DiskMB:   200,
-					IOPS:     200,
 				},
 			},
 			Expected: &TaskDiff{
@@ -2886,12 +3236,6 @@ func TestTaskDiff(t *testing.T) {
 							},
 							{
 								Type: DiffTypeEdited,
-								Name: "IOPS",
-								Old:  "100",
-								New:  "200",
-							},
-							{
-								Type: DiffTypeEdited,
 								Name: "MemoryMB",
 								Old:  "100",
 								New:  "200",
@@ -2909,7 +3253,6 @@ func TestTaskDiff(t *testing.T) {
 					CPU:      100,
 					MemoryMB: 100,
 					DiskMB:   100,
-					IOPS:     100,
 				},
 			},
 			New: &Task{
@@ -2917,7 +3260,6 @@ func TestTaskDiff(t *testing.T) {
 					CPU:      200,
 					MemoryMB: 100,
 					DiskMB:   200,
-					IOPS:     100,
 				},
 			},
 			Expected: &TaskDiff{
@@ -2942,8 +3284,8 @@ func TestTaskDiff(t *testing.T) {
 							{
 								Type: DiffTypeNone,
 								Name: "IOPS",
-								Old:  "100",
-								New:  "100",
+								Old:  "0",
+								New:  "0",
 							},
 							{
 								Type: DiffTypeNone,
@@ -3096,6 +3438,241 @@ func TestTaskDiff(t *testing.T) {
 												New:  "",
 											},
 										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			Name: "Device Resources edited",
+			Old: &Task{
+				Resources: &Resources{
+					Devices: []*RequestedDevice{
+						{
+							Name:  "foo",
+							Count: 2,
+						},
+						{
+							Name:  "bar",
+							Count: 2,
+						},
+						{
+							Name:  "baz",
+							Count: 2,
+						},
+					},
+				},
+			},
+			New: &Task{
+				Resources: &Resources{
+					Devices: []*RequestedDevice{
+						{
+							Name:  "foo",
+							Count: 2,
+						},
+						{
+							Name:  "bar",
+							Count: 3,
+						},
+						{
+							Name:  "bam",
+							Count: 2,
+						},
+					},
+				},
+			},
+			Expected: &TaskDiff{
+				Type: DiffTypeEdited,
+				Objects: []*ObjectDiff{
+					{
+						Type: DiffTypeEdited,
+						Name: "Resources",
+						Objects: []*ObjectDiff{
+							{
+								Type: DiffTypeEdited,
+								Name: "Device",
+								Fields: []*FieldDiff{
+									{
+										Type: DiffTypeEdited,
+										Name: "Count",
+										Old:  "2",
+										New:  "3",
+									},
+								},
+							},
+							{
+								Type: DiffTypeAdded,
+								Name: "Device",
+								Fields: []*FieldDiff{
+									{
+										Type: DiffTypeAdded,
+										Name: "Count",
+										Old:  "",
+										New:  "2",
+									},
+									{
+										Type: DiffTypeAdded,
+										Name: "Name",
+										Old:  "",
+										New:  "bam",
+									},
+								},
+							},
+							{
+								Type: DiffTypeDeleted,
+								Name: "Device",
+								Fields: []*FieldDiff{
+									{
+										Type: DiffTypeDeleted,
+										Name: "Count",
+										Old:  "2",
+										New:  "",
+									},
+									{
+										Type: DiffTypeDeleted,
+										Name: "Name",
+										Old:  "baz",
+										New:  "",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			Name:       "Device Resources edited with context",
+			Contextual: true,
+			Old: &Task{
+				Resources: &Resources{
+					CPU:      100,
+					MemoryMB: 100,
+					DiskMB:   100,
+					Devices: []*RequestedDevice{
+						{
+							Name:  "foo",
+							Count: 2,
+						},
+						{
+							Name:  "bar",
+							Count: 2,
+						},
+						{
+							Name:  "baz",
+							Count: 2,
+						},
+					},
+				},
+			},
+			New: &Task{
+				Resources: &Resources{
+					CPU:      100,
+					MemoryMB: 100,
+					DiskMB:   100,
+					Devices: []*RequestedDevice{
+						{
+							Name:  "foo",
+							Count: 2,
+						},
+						{
+							Name:  "bar",
+							Count: 3,
+						},
+						{
+							Name:  "bam",
+							Count: 2,
+						},
+					},
+				},
+			},
+			Expected: &TaskDiff{
+				Type: DiffTypeEdited,
+				Objects: []*ObjectDiff{
+					{
+						Type: DiffTypeEdited,
+						Name: "Resources",
+						Fields: []*FieldDiff{
+							{
+								Type: DiffTypeNone,
+								Name: "CPU",
+								Old:  "100",
+								New:  "100",
+							},
+							{
+								Type: DiffTypeNone,
+								Name: "DiskMB",
+								Old:  "100",
+								New:  "100",
+							},
+							{
+								Type: DiffTypeNone,
+								Name: "IOPS",
+								Old:  "0",
+								New:  "0",
+							},
+							{
+								Type: DiffTypeNone,
+								Name: "MemoryMB",
+								Old:  "100",
+								New:  "100",
+							},
+						},
+						Objects: []*ObjectDiff{
+							{
+								Type: DiffTypeEdited,
+								Name: "Device",
+								Fields: []*FieldDiff{
+									{
+										Type: DiffTypeEdited,
+										Name: "Count",
+										Old:  "2",
+										New:  "3",
+									},
+									{
+										Type: DiffTypeNone,
+										Name: "Name",
+										Old:  "bar",
+										New:  "bar",
+									},
+								},
+							},
+							{
+								Type: DiffTypeAdded,
+								Name: "Device",
+								Fields: []*FieldDiff{
+									{
+										Type: DiffTypeAdded,
+										Name: "Count",
+										Old:  "",
+										New:  "2",
+									},
+									{
+										Type: DiffTypeAdded,
+										Name: "Name",
+										Old:  "",
+										New:  "bam",
+									},
+								},
+							},
+							{
+								Type: DiffTypeDeleted,
+								Name: "Device",
+								Fields: []*FieldDiff{
+									{
+										Type: DiffTypeDeleted,
+										Name: "Count",
+										Old:  "2",
+										New:  "",
+									},
+									{
+										Type: DiffTypeDeleted,
+										Name: "Name",
+										Old:  "baz",
+										New:  "",
 									},
 								},
 							},

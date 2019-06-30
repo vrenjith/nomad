@@ -112,6 +112,12 @@ does not automatically enable service discovery.
   this service. If this is not supplied, no tags will be assigned to the service
   when it is registered.
 
+- `canary_tags` `(array<string>: [])` - Specifies the list of tags to associate with
+  this service when the service is part of an allocation that is currently a
+  canary. Once the canary is promoted, the registered tags will be updated to
+  those specified in the `tags` parameter. If this is not supplied, the
+  registered tags will be equal to that of the `tags parameter.
+
 - `address_mode` `(string: "auto")` - Specifies what address (host or
   driver-specific) this service should advertise.  This setting is supported in
   Docker since Nomad 0.6 and rkt since Nomad 0.7. See [below for
@@ -507,7 +513,7 @@ directly since Nomad isn't managing any port assignments.
 ### IPv6 Docker containers
 
 The [Docker](/docs/drivers/docker.html#advertise_ipv6_address) driver supports the
-`advertise_ipv6_address` parameter in it's configuration.
+`advertise_ipv6_address` parameter in its configuration.
 
 Services will automatically advertise the IPv6 address when `advertise_ipv6_address` 
 is used.
@@ -616,7 +622,7 @@ system of a task for that driver.</small>
 
 [check_restart_stanza]: /docs/job-specification/check_restart.html "check_restart stanza"
 [consul_grpc]: https://www.consul.io/api/agent/check.html#grpc
-[service-discovery]: /docs/service-discovery/index.html "Nomad Service Discovery"
+[service-discovery]: /guides/integrations/consul-integration/index.html#service-discovery/index.html "Nomad Service Discovery"
 [interpolation]: /docs/runtime/interpolation.html "Nomad Runtime Interpolation"
 [network]: /docs/job-specification/network.html "Nomad network Job Specification"
 [qemu]: /docs/drivers/qemu.html "Nomad qemu Driver"

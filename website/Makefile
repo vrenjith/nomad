@@ -1,4 +1,4 @@
-VERSION?="0.3.35"
+VERSION?="0.3.39"
 
 build:
 	@echo "==> Starting build in Docker..."
@@ -21,5 +21,9 @@ website:
 		--publish "35729:35729" \
 		--volume "$(shell pwd):/website" \
 		hashicorp/middleman-hashicorp:${VERSION}
+
+test:
+	@echo "==> Running website tests..."
+	./scripts/test.sh ${VERSION}
 
 .PHONY: build website

@@ -6,6 +6,7 @@ import (
 
 	"github.com/hashicorp/nomad/command/agent"
 	"github.com/hashicorp/nomad/version"
+	colorable "github.com/mattn/go-colorable"
 	"github.com/mitchellh/cli"
 )
 
@@ -62,8 +63,8 @@ func Commands(metaPtr *Meta, agentUi cli.Ui) map[string]cli.CommandFactory {
 	if meta.Ui == nil {
 		meta.Ui = &cli.BasicUi{
 			Reader:      os.Stdin,
-			Writer:      os.Stdout,
-			ErrorWriter: os.Stderr,
+			Writer:      colorable.NewColorableStdout(),
+			ErrorWriter: colorable.NewColorableStderr(),
 		}
 	}
 
@@ -128,6 +129,11 @@ func Commands(metaPtr *Meta, agentUi cli.Ui) map[string]cli.CommandFactory {
 				Meta: meta,
 			}, nil
 		},
+		"acl token list": func() (cli.Command, error) {
+			return &ACLTokenListCommand{
+				Meta: meta,
+			}, nil
+		},
 		"acl token self": func() (cli.Command, error) {
 			return &ACLTokenSelfCommand{
 				Meta: meta,
@@ -138,6 +144,21 @@ func Commands(metaPtr *Meta, agentUi cli.Ui) map[string]cli.CommandFactory {
 				Meta: meta,
 			}, nil
 		},
+		"alloc exec": func() (cli.Command, error) {
+			return &AllocExecCommand{
+				Meta: meta,
+			}, nil
+		},
+		"alloc signal": func() (cli.Command, error) {
+			return &AllocSignalCommand{
+				Meta: meta,
+			}, nil
+		},
+		"alloc stop": func() (cli.Command, error) {
+			return &AllocStopCommand{
+				Meta: meta,
+			}, nil
+		},
 		"alloc fs": func() (cli.Command, error) {
 			return &AllocFSCommand{
 				Meta: meta,
@@ -145,6 +166,11 @@ func Commands(metaPtr *Meta, agentUi cli.Ui) map[string]cli.CommandFactory {
 		},
 		"alloc logs": func() (cli.Command, error) {
 			return &AllocLogsCommand{
+				Meta: meta,
+			}, nil
+		},
+		"alloc restart": func() (cli.Command, error) {
+			return &AllocRestartCommand{
 				Meta: meta,
 			}, nil
 		},
@@ -225,8 +251,8 @@ func Commands(metaPtr *Meta, agentUi cli.Ui) map[string]cli.CommandFactory {
 				Meta: meta,
 			}, nil
 		},
-		"executor": func() (cli.Command, error) {
-			return &ExecutorPluginCommand{
+		"exec": func() (cli.Command, error) {
+			return &AllocExecCommand{
 				Meta: meta,
 			}, nil
 		},
@@ -270,6 +296,11 @@ func Commands(metaPtr *Meta, agentUi cli.Ui) map[string]cli.CommandFactory {
 				Meta: meta,
 			}, nil
 		},
+		"job eval": func() (cli.Command, error) {
+			return &JobEvalCommand{
+				Meta: meta,
+			}, nil
+		},
 		"job history": func() (cli.Command, error) {
 			return &JobHistoryCommand{
 				Meta: meta,
@@ -282,6 +313,16 @@ func Commands(metaPtr *Meta, agentUi cli.Ui) map[string]cli.CommandFactory {
 		},
 		"job inspect": func() (cli.Command, error) {
 			return &JobInspectCommand{
+				Meta: meta,
+			}, nil
+		},
+		"job periodic": func() (cli.Command, error) {
+			return &JobPeriodicCommand{
+				Meta: meta,
+			}, nil
+		},
+		"job periodic force": func() (cli.Command, error) {
+			return &JobPeriodicForceCommand{
 				Meta: meta,
 			}, nil
 		},

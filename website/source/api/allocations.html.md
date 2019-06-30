@@ -29,7 +29,7 @@ The table below shows this endpoint's support for
 ### Parameters
 
 - `prefix` `(string: "")`- Specifies a string to filter allocations on based on
-  an index prefix. This is specified as a querystring parameter.
+  an index prefix. This is specified as a query string parameter.
 
 ### Sample Request
 
@@ -221,17 +221,20 @@ $ curl \
       "dc1"
     ],
     "Constraints": null,
+    "Affinities": null,
     "TaskGroups": [
       {
         "Name": "cache",
         "Count": 1,
         "Constraints": null,
+        "Affinities": null,
         "RestartPolicy": {
           "Attempts": 10,
           "Interval": 300000000000,
           "Delay": 25000000000,
           "Mode": "delay"
         },
+        "Spreads": null,
         "Tasks": [
           {
             "Name": "redis",
@@ -273,11 +276,11 @@ $ curl \
             "Vault": null,
             "Templates": null,
             "Constraints": null,
+            "Affinities": null,
             "Resources": {
               "CPU": 500,
               "MemoryMB": 10,
               "DiskMB": 0,
-              "IOPS": 0,
               "Networks": [
                 {
                   "Device": "",
@@ -294,6 +297,7 @@ $ curl \
                 }
               ]
             },
+            "Spreads": null,
             "DispatchPayload": null,
             "Meta": null,
             "KillTimeout": 5000000000,
@@ -320,6 +324,7 @@ $ curl \
     "Periodic": null,
     "ParameterizedJob": null,
     "Payload": null,
+    "Spreads": null,
     "Meta": null,
     "VaultToken": "",
     "Status": "pending",
@@ -333,7 +338,6 @@ $ curl \
     "CPU": 500,
     "MemoryMB": 10,
     "DiskMB": 300,
-    "IOPS": 0,
     "Networks": [
       {
         "Device": "lo0",
@@ -354,7 +358,6 @@ $ curl \
     "CPU": 0,
     "MemoryMB": 0,
     "DiskMB": 300,
-    "IOPS": 0,
     "Networks": null
   },
   "TaskResources": {
@@ -362,7 +365,6 @@ $ curl \
       "CPU": 500,
       "MemoryMB": 10,
       "DiskMB": 0,
-      "IOPS": 0,
       "Networks": [
         {
           "Device": "lo0",
@@ -565,3 +567,128 @@ $ curl \
         - `Building Task Directory` - Task is building its file system.
 
         Depending on the type the event will have applicable annotations.
+
+## Stop Allocation
+
+This endpoint stops and reschedules a specific allocation.
+
+| Method | Path                       | Produces                   |
+| ------ | -------------------------- | -------------------------- |
+| `POST` / `PUT`  | `/v1/allocation/:alloc_id/stop` | `application/json`         |
+
+The table below shows this endpoint's support for
+[blocking queries](/api/index.html#blocking-queries) and
+[required ACLs](/api/index.html#acls).
+
+| Blocking Queries | ACL Required         |
+| ---------------- | -------------------- |
+| `NO`            | `namespace:alloc-lifecycle` |
+
+### Parameters
+
+- `:alloc_id` `(string: <required>)`- Specifies the UUID of the allocation. This
+  must be the full UUID, not the short 8-character one. This is specified as
+  part of the path.
+
+### Sample Request
+
+```text
+$ curl -X POST \
+    https://localhost:4646/v1/allocation/5456bd7a-9fc0-c0dd-6131-cbee77f57577/stop
+```
+
+### Sample Response
+
+```json
+{
+  "EvalID": "5456bd7a-9fc0-c0dd-6131-cbee77f57577",
+  "Index": 54
+}
+```
+
+## Signal Allocation
+
+This endpoint sends a signal to an allocation or task.
+
+| Method | Path                       | Produces                   |
+| ------ | -------------------------- | -------------------------- |
+| `POST` / `PUT`  | `/v1/client/allocation/:alloc_id/signal` | `application/json`         |
+
+The table below shows this endpoint's support for
+[blocking queries](/api/index.html#blocking-queries) and
+[required ACLs](/api/index.html#acls).
+
+| Blocking Queries | ACL Required         |
+| ---------------- | -------------------- |
+| `NO`            | `namespace:alloc-lifecycle` |
+
+### Parameters
+
+- `:alloc_id` `(string: <required>)`- Specifies the UUID of the allocation. This
+  must be the full UUID, not the short 8-character one. This is specified as
+  part of the path.
+
+### Sample Payload
+
+```json
+{
+  "Signal": "SIGUSR1",
+  "Task": "FOO"
+}
+```
+
+### Sample Request
+
+```text
+$ curl -X POST -d '{"Signal": "SIGUSR1" }' \
+    https://localhost:4646/v1/client/allocation/5456bd7a-9fc0-c0dd-6131-cbee77f57577/signal
+```
+
+### Sample Response
+
+```json
+{}
+```
+
+## Restart Allocation
+
+This endpoint restarts an allocation or task in-place.
+
+| Method | Path                       | Produces                   |
+| ------ | -------------------------- | -------------------------- |
+| `POST` / `PUT`  | `/v1/client/allocation/:alloc_id/restart` | `application/json`         |
+
+The table below shows this endpoint's support for
+[blocking queries](/api/index.html#blocking-queries) and
+[required ACLs](/api/index.html#acls).
+
+| Blocking Queries | ACL Required         |
+| ---------------- | -------------------- |
+| `NO`            | `namespace:alloc-lifecycle` |
+
+### Parameters
+
+- `:alloc_id` `(string: <required>)`- Specifies the UUID of the allocation. This
+  must be the full UUID, not the short 8-character one. This is specified as
+  part of the path.
+
+### Sample Payload
+
+```json
+{
+  "Task": "FOO"
+}
+```
+
+### Sample Request
+
+```text
+$ curl -X POST -d '{"Task": "redis" }' \
+    https://localhost:4646/v1/client/allocation/5456bd7a-9fc0-c0dd-6131-cbee77f57577/restart
+```
+
+### Sample Response
+
+```json
+{}
+```

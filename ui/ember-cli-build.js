@@ -3,6 +3,7 @@ const EmberApp = require('ember-cli/lib/broccoli/ember-app');
 
 const environment = EmberApp.env();
 const isProd = environment === 'production';
+const isTest = environment === 'test';
 
 module.exports = function(defaults) {
   var app = new EmberApp(defaults, {
@@ -11,6 +12,30 @@ module.exports = function(defaults) {
     },
     svg: {
       paths: ['public/images/icons'],
+      optimize: {
+        plugins: [{ removeViewBox: false }],
+      },
+    },
+    codemirror: {
+      modes: ['javascript'],
+    },
+    funnel: {
+      enabled: isProd,
+      exclude: [
+        `${defaults.project.pkg.name}/components/freestyle/**/*`,
+        `${defaults.project.pkg.name}/templates/components/freestyle/**/*`,
+      ],
+    },
+    babel: {
+      plugins: ['@babel/plugin-proposal-object-rest-spread'],
+    },
+    'ember-cli-babel': {
+      includePolyfill: isProd,
+    },
+    hinting: isTest,
+    tests: isTest,
+    sourcemaps: {
+      enabled: false,
     },
   });
 

@@ -54,7 +54,7 @@ func (c *JobHistoryCommand) Synopsis() string {
 	return "Display all tracked versions of a job"
 }
 
-func (c *JobHistoryCommand) Autocompleteflags() complete.Flags {
+func (c *JobHistoryCommand) AutocompleteFlags() complete.Flags {
 	return mergeAutocompleteFlags(c.Meta.AutocompleteFlags(FlagSetClient),
 		complete.Flags{
 			"-p":       complete.PredictNothing,
@@ -248,6 +248,10 @@ func (c *JobHistoryCommand) formatJobVersions(versions []*api.Job, diffs []*api.
 }
 
 func (c *JobHistoryCommand) formatJobVersion(job *api.Job, diff *api.JobDiff, nextVersion uint64, full bool) error {
+	if job == nil {
+		return fmt.Errorf("Error printing job history for non-existing job or job version")
+	}
+
 	basic := []string{
 		fmt.Sprintf("Version|%d", *job.Version),
 		fmt.Sprintf("Stable|%v", *job.Stable),

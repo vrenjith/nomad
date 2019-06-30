@@ -14,8 +14,12 @@ export default Component.extend({
   }.on('init'),
 
   willDestroy() {
-    clearInterval(this.get('timer'));
+    clearInterval(this.timer);
   },
+
+  distributionBarDatum: computed(() => {
+    return [{ label: 'one', value: 10 }];
+  }),
 
   distributionBarData: computed(() => {
     return [

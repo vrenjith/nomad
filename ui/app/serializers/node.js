@@ -1,3 +1,4 @@
+import { assign } from '@ember/polyfills';
 import { inject as service } from '@ember/service';
 import ApplicationSerializer from './application';
 
@@ -5,15 +6,16 @@ export default ApplicationSerializer.extend({
   config: service(),
 
   attrs: {
+    isDraining: 'Drain',
     httpAddr: 'HTTPAddr',
   },
 
   normalize(modelClass, hash) {
-    // Proxy local agent to the same proxy express server Ember is using
-    // to avoid CORS
-    if (this.get('config.isDev') && hash.HTTPAddr === '127.0.0.1:4646') {
-      hash.HTTPAddr = '127.0.0.1:4200';
-    }
+    // Transform the map-based Drivers object into an array-based NodeDriver fragment list
+    const drivers = hash.Drivers || {};
+    hash.Drivers = Object.keys(drivers).map(key => {
+      return assign({}, drivers[key], { Name: key });
+    });
 
     return this._super(modelClass, hash);
   },

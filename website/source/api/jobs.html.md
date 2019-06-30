@@ -29,7 +29,7 @@ The table below shows this endpoint's support for
 ### Parameters
 
 - `prefix` `(string: "")` - Specifies a string to filter jobs on based on
-  an index prefix. This is specified as a querystring parameter.
+  an index prefix. This is specified as a query string parameter.
 
 ### Sample Request
 
@@ -189,9 +189,9 @@ The table below shows this endpoint's support for
                 "Attempts": 10,
                 "Delay": 30000000000,
                 "DelayFunction": "exponential",
-                "Interval": 0,
+                "Interval": 36000000000000,
                 "MaxDelay": 3600000000000,
-                "Unlimited": true
+                "Unlimited": false
             },
             "EphemeralDisk": {
                 "SizeMB": 300
@@ -213,7 +213,7 @@ The table below shows this endpoint's support for
 ```text
 $ curl \
     --request POST \
-    --data @my-job.nomad \
+    --data @my-job.json \
     https://localhost:4646/v1/jobs
 ```
 
@@ -279,6 +279,7 @@ $ curl \
 {
     "AllAtOnce": false,
     "Constraints": null,
+    "Affinities":null,
     "CreateIndex": 0,
     "Datacenters": null,
     "ID": "my-job",
@@ -369,6 +370,14 @@ $ curl \
           "Operand": "set_contains"
         }
       ],
+      "Affinities": [
+         {
+          "LTarget": "${meta.datacenter}",
+          "RTarget": "dc1",
+          "Operand": "=",
+          "Weight": 50,
+         }
+       ],
       "RestartPolicy": {
         "Attempts": 10,
         "Interval": 300000000000,
@@ -429,11 +438,11 @@ $ curl \
             }
           ],
           "Constraints": null,
+          "Affinities":null,
           "Resources": {
             "CPU": 500,
             "MemoryMB": 256,
             "DiskMB": 0,
-            "IOPS": 0,
             "Networks": [
               {
                 "Device": "",
@@ -568,6 +577,7 @@ $ curl \
       "dc1"
     ],
     "Constraints": null,
+    "Affinities":null,
     "TaskGroups": [
       {
         "Name": "cache",
@@ -582,12 +592,20 @@ $ curl \
           "Canary": 0
         },
         "Constraints": null,
+        "Affinities":null,
         "RestartPolicy": {
           "Attempts": 10,
           "Interval": 300000000000,
           "Delay": 25000000000,
           "Mode": "delay"
         },
+        "Spreads": [
+           {
+           "Attribute": "${node.datacenter}",
+           "SpreadTarget": null,
+           "Weight": 100
+           }
+        ],
         "Tasks": [
           {
             "Name": "redis",
@@ -630,11 +648,12 @@ $ curl \
             "Vault": null,
             "Templates": null,
             "Constraints": null,
+            "Affinities":null,
+            "Spreads":null,
             "Resources": {
               "CPU": 500,
               "MemoryMB": 256,
               "DiskMB": 0,
-              "IOPS": 0,
               "Networks": [
                 {
                   "Device": "",
@@ -684,6 +703,7 @@ $ curl \
     "Payload": null,
     "Meta": null,
     "VaultToken": "",
+    "Spreads": null,
     "Status": "pending",
     "StatusDescription": "",
     "Stable": false,
@@ -945,6 +965,10 @@ The table below shows this endpoint's support for
 
 - `:job_id` `(string: <required>)` - Specifies the ID of the job (as specified in
   the job file during submission). This is specified as part of the path.
+
+- `all` `(bool: false)` - Specifies whether the list of deployments should
+  include deployments from a previously registered job with the same ID. This is
+  possible if the job is deregistered and reregistered.
 
 ### Sample Request
 
@@ -1275,6 +1299,9 @@ The table below shows this endpoint's support for
   job's version. This is checked and acts as a check-and-set value before
   reverting to the specified job.
 
+- `VaultToken` `(string: "")` - Optional value specifying the [vault token](/docs/commands/job/revert.html)
+  used for Vault [policy authentication checking](/docs/configuration/vault.html#allow_unauthenticated).
+
 ### Sample Payload
 
 ```json
@@ -1361,7 +1388,9 @@ $ curl \
 ## Create Job Evaluation
 
 This endpoint creates a new evaluation for the given job. This can be used to
-force run the scheduling logic if necessary.
+force run the scheduling logic if necessary. Since Nomad 0.8.4, this endpoint
+supports a JSON payload with additional options. Support for calling this end point
+without a JSON payload will be removed in Nomad 0.9.
 
 | Method  | Path                       | Produces                   |
 | ------- | -------------------------- | -------------------------- |
@@ -1380,11 +1409,30 @@ The table below shows this endpoint's support for
 - `:job_id` `(string: <required>)` - Specifies the ID of the job (as specified in
   the job file during submission). This is specified as part of the path.
 
+- `JobID` `(string: <required>)` - Specify the ID of the job in the JSON payload
+
+- `EvalOptions` `(<optional>)` - Specify additional options to be used during the forced evaluation.
+    - `ForceReschedule` `(bool: false)` - If set, failed allocations of the job are rescheduled
+    immediately. This is useful for operators to force immediate placement even if the failed allocations are past
+    their reschedule limit, or are delayed by several hours because the allocation's reschedule policy has exponential delay.
+
+### Sample Payload
+
+```json
+{
+  "JobID": "my-job",
+  "EvalOptions": {
+     "ForceReschedule":true
+  }
+}
+```
+
 ### Sample Request
 
 ```text
 $ curl \
     --request POST \
+    -d @sample.json \
     https://localhost:4646/v1/job/my-job/evaluate
 ```
 
@@ -1678,7 +1726,7 @@ The table below shows this endpoint's support for
 - `:job_id` `(string: <required>)` - Specifies the ID of the job (as specified in
   the job file during submission). This is specified as part of the path.
 
-- `Purge` `(bool: false)` - Specifies that the job should stopped and purged
+- `purge` `(bool: false)` - Specifies that the job should stopped and purged
   immediately. This means the job will not be queryable after being stopped. If
   not set, the job will be purged by the garbage collector.
 

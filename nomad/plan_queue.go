@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/armon/go-metrics"
+	metrics "github.com/armon/go-metrics"
 	"github.com/hashicorp/nomad/nomad/structs"
 )
 
@@ -195,7 +195,7 @@ func (q *PlanQueue) Stats() *QueueStats {
 }
 
 // EmitStats is used to export metrics about the broker while enabled
-func (q *PlanQueue) EmitStats(period time.Duration, stopCh chan struct{}) {
+func (q *PlanQueue) EmitStats(period time.Duration, stopCh <-chan struct{}) {
 	for {
 		select {
 		case <-time.After(period):

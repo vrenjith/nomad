@@ -2,6 +2,7 @@ package command
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -26,6 +27,21 @@ func TestJobStatusCommand_Run(t *testing.T) {
 	t.Parallel()
 	srv, client, url := testServer(t, true, nil)
 	defer srv.Shutdown()
+	testutil.WaitForResult(func() (bool, error) {
+		nodes, _, err := client.Nodes().List(nil)
+		if err != nil {
+			return false, err
+		}
+		if len(nodes) == 0 {
+			return false, fmt.Errorf("missing node")
+		}
+		if _, ok := nodes[0].Drivers["mock_driver"]; !ok {
+			return false, fmt.Errorf("mock_driver not ready")
+		}
+		return true, nil
+	}, func(err error) {
+		t.Fatalf("err: %s", err)
+	})
 
 	ui := new(cli.MockUi)
 	cmd := &JobStatusCommand{Meta: Meta{Ui: ui}}
@@ -108,6 +124,14 @@ func TestJobStatusCommand_Run(t *testing.T) {
 	if code := cmd.Run([]string{"-address=" + url, "-verbose", "job2_sfx"}); code != 0 {
 		t.Fatalf("expected exit 0, got: %d", code)
 	}
+
+	nodeName := ""
+	if allocs, _, err := client.Jobs().Allocations("job2_sfx", false, nil); err == nil {
+		if len(allocs) > 0 {
+			nodeName = allocs[0].NodeName
+		}
+	}
+
 	out = ui.OutputWriter.String()
 	if strings.Contains(out, "job1_sfx") || !strings.Contains(out, "job2_sfx") {
 		t.Fatalf("expected only job2_sfx, got: %s", out)
@@ -124,6 +148,15 @@ func TestJobStatusCommand_Run(t *testing.T) {
 	if !strings.Contains(out, "Modified") {
 		t.Fatal("should have modified header")
 	}
+
+	// string calculations based on 1-byte chars, not using runes
+	allocationsTableName := "Allocations\n"
+	allocationsTableStr := strings.Split(out, allocationsTableName)[1]
+	nodeNameHeaderStr := "Node Name"
+	nodeNameHeaderIndex := strings.Index(allocationsTableStr, nodeNameHeaderStr)
+	nodeNameRegexpStr := fmt.Sprintf(`.*%s.*\n.{%d}%s`, nodeNameHeaderStr, nodeNameHeaderIndex, regexp.QuoteMeta(nodeName))
+	require.Regexp(t, regexp.MustCompile(nodeNameRegexpStr), out)
+
 	ui.ErrorWriter.Reset()
 	ui.OutputWriter.Reset()
 
@@ -246,6 +279,24 @@ func TestJobStatusCommand_WithAccessPolicy(t *testing.T) {
 	// Bootstrap an initial ACL token
 	token := srv.RootToken
 	assert.NotNil(token, "failed to bootstrap ACL token")
+
+	// Wait for client ready
+	client.SetSecretID(token.SecretID)
+	testutil.WaitForResult(func() (bool, error) {
+		nodes, _, err := client.Nodes().List(nil)
+		if err != nil {
+			return false, err
+		}
+		if len(nodes) == 0 {
+			return false, fmt.Errorf("missing node")
+		}
+		if _, ok := nodes[0].Drivers["mock_driver"]; !ok {
+			return false, fmt.Errorf("mock_driver not ready")
+		}
+		return true, nil
+	}, func(err error) {
+		t.Fatalf("err: %s", err)
+	})
 
 	// Register a job
 	j := testJob("job1_sfx")

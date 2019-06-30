@@ -27,7 +27,7 @@ job configurations or prototype interactions. It should _**not**_ be used in
 production as it does not persist state.
 
 ```text
-vagrant@nomad:~$ sudo nomad agent -dev
+$ sudo nomad agent -dev
 
 ==> Starting Nomad agent...
 ==> Nomad agent configuration:
@@ -78,9 +78,6 @@ If you run [`nomad node status`](/docs/commands/node/status.html) in another
 terminal, you can see the registered nodes of the Nomad cluster:
 
 ```text
-$ vagrant ssh
-...
-
 $ nomad node status
 ID        DC   Name   Class   Drain  Eligibility  Status
 171a583b  dc1  nomad  <none>  false  eligible     ready
@@ -110,7 +107,7 @@ Additional metadata can be viewed by providing the `-detailed` flag.
 
 You can use `Ctrl-C` (the interrupt signal) to halt the agent.
 By default, all signals will cause the agent to forcefully shutdown.
-The agent [can be configured](/docs/agent/configuration/index.html) to
+The agent [can be configured](/docs/configuration/index.html#leave_on_terminate) to
 gracefully leave on either the interrupt or terminate signals.
 
 After interrupting the agent, you should see it leave the cluster
@@ -134,10 +131,13 @@ replication continues to be attempted until the node recovers. Nomad will
 automatically try to reconnect to _failed_ nodes, allowing it to recover from
 certain network conditions, while _left_ nodes are no longer contacted.
 
-If an agent is operating as a server, a graceful leave is important to avoid
-causing a potential availability outage affecting the
-[consensus protocol](/docs/internals/consensus.html). If a server does
-forcefully exit and will not be returning into service, the
+If an agent is operating as a server, [`leave_on_terminate`](/docs/configuration/index.html#leave_on_terminate) should only
+be set if the server will never rejoin the cluster again. The default value of `false` for `leave_on_terminate` and `leave_on_interrupt`
+work well for most scenarios. If Nomad servers are part of an auto scaling group where new servers are brought up to replace
+failed servers, using graceful leave avoids causing a potential availability outage affecting the [consensus protocol](/docs/internals/consensus.html).
+As of Nomad 0.8, Nomad includes Autopilot which automatically removes failed or dead servers. This allows the operator to skip setting `leave_on_terminate`.
+
+If a server does forcefully exit and will not be returning into service, the
 [`server force-leave` command](/docs/commands/server/force-leave.html) should
 be used to force the server from a _failed_ to a _left_ state.
 

@@ -261,7 +261,7 @@ func (a allocSet) filterByRescheduleable(isBatch bool, now time.Time, evalID str
 		if !eligibleNow {
 			untainted[alloc.ID] = alloc
 			if eligibleLater {
-				rescheduleLater = append(rescheduleLater, &delayedRescheduleInfo{alloc.ID, rescheduleTime})
+				rescheduleLater = append(rescheduleLater, &delayedRescheduleInfo{alloc.ID, alloc, rescheduleTime})
 			}
 		} else {
 			rescheduleNow[alloc.ID] = alloc
@@ -325,6 +325,11 @@ func updateByReschedulable(alloc *structs.Allocation, now time.Time, evalID stri
 	// if it has been marked eligible
 	if d != nil && alloc.DeploymentID == d.ID && d.Active() && !alloc.DesiredTransition.ShouldReschedule() {
 		return
+	}
+
+	// Check if the allocation is marked as it should be force rescheduled
+	if alloc.DesiredTransition.ShouldForceReschedule() {
+		rescheduleNow = true
 	}
 
 	// Reschedule if the eval ID matches the alloc's followup evalID or if its close to its reschedule time

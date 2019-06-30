@@ -79,7 +79,7 @@ func TestRPC_forwardRegion(t *testing.T) {
 	s1 := TestServer(t, nil)
 	defer s1.Shutdown()
 	s2 := TestServer(t, func(c *Config) {
-		c.Region = "region2"
+		c.Region = "global"
 	})
 	defer s2.Shutdown()
 	TestJoin(t, s1, s2)
@@ -87,7 +87,7 @@ func TestRPC_forwardRegion(t *testing.T) {
 	testutil.WaitForLeader(t, s2.RPC)
 
 	var out struct{}
-	err := s1.forwardRegion("region2", "Status.Ping", struct{}{}, &out)
+	err := s1.forwardRegion("global", "Status.Ping", struct{}{}, &out)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -297,7 +297,8 @@ func TestRPC_handleMultiplexV2(t *testing.T) {
 
 	// Make two streams
 	conf := yamux.DefaultConfig()
-	conf.LogOutput = testlog.NewWriter(t)
+	conf.LogOutput = nil
+	conf.Logger = testlog.Logger(t)
 	session, err := yamux.Client(p1, conf)
 	require.Nil(err)
 

@@ -11,12 +11,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hashicorp/go-multierror"
+	multierror "github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/hcl"
 	"github.com/hashicorp/hcl/hcl/ast"
 	"github.com/hashicorp/nomad/api"
 	"github.com/hashicorp/nomad/helper"
-	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/mitchellh/mapstructure"
 )
 
@@ -103,6 +102,7 @@ func parseJob(result *api.Job, list *ast.ObjectList) error {
 		return err
 	}
 	delete(m, "constraint")
+	delete(m, "affinity")
 	delete(m, "meta")
 	delete(m, "migrate")
 	delete(m, "parameterized")
@@ -110,6 +110,7 @@ func parseJob(result *api.Job, list *ast.ObjectList) error {
 	delete(m, "reschedule")
 	delete(m, "update")
 	delete(m, "vault")
+	delete(m, "spread")
 
 	// Set the ID and name to the object key
 	result.ID = helper.StringToPtr(obj.Keys[0].Token.Value().(string))
@@ -132,6 +133,8 @@ func parseJob(result *api.Job, list *ast.ObjectList) error {
 	valid := []string{
 		"all_at_once",
 		"constraint",
+		"affinity",
+		"spread",
 		"datacenters",
 		"group",
 		"id",
@@ -161,6 +164,13 @@ func parseJob(result *api.Job, list *ast.ObjectList) error {
 		}
 	}
 
+	// Parse affinities
+	if o := listVal.Filter("affinity"); len(o.Items) > 0 {
+		if err := parseAffinities(&result.Affinities, o); err != nil {
+			return multierror.Prefix(err, "affinity ->")
+		}
+	}
+
 	// If we have an update strategy, then parse that
 	if o := listVal.Filter("update"); len(o.Items) > 0 {
 		if err := parseUpdate(&result.Update, o); err != nil {
@@ -172,6 +182,13 @@ func parseJob(result *api.Job, list *ast.ObjectList) error {
 	if o := listVal.Filter("periodic"); len(o.Items) > 0 {
 		if err := parsePeriodic(&result.Periodic, o); err != nil {
 			return multierror.Prefix(err, "periodic ->")
+		}
+	}
+
+	// Parse spread
+	if o := listVal.Filter("spread"); len(o.Items) > 0 {
+		if err := parseSpread(&result.Spreads, o); err != nil {
+			return multierror.Prefix(err, "spread ->")
 		}
 	}
 
@@ -287,6 +304,7 @@ func parseGroups(result *api.Job, list *ast.ObjectList) error {
 		valid := []string{
 			"count",
 			"constraint",
+			"affinity",
 			"restart",
 			"meta",
 			"task",
@@ -295,6 +313,7 @@ func parseGroups(result *api.Job, list *ast.ObjectList) error {
 			"reschedule",
 			"vault",
 			"migrate",
+			"spread",
 		}
 		if err := helper.CheckHCLKeys(listVal, valid); err != nil {
 			return multierror.Prefix(err, fmt.Sprintf("'%s' ->", n))
@@ -305,6 +324,7 @@ func parseGroups(result *api.Job, list *ast.ObjectList) error {
 			return err
 		}
 		delete(m, "constraint")
+		delete(m, "affinity")
 		delete(m, "meta")
 		delete(m, "task")
 		delete(m, "restart")
@@ -312,6 +332,7 @@ func parseGroups(result *api.Job, list *ast.ObjectList) error {
 		delete(m, "update")
 		delete(m, "vault")
 		delete(m, "migrate")
+		delete(m, "spread")
 
 		// Build the group with the basic decode
 		var g api.TaskGroup
@@ -327,10 +348,24 @@ func parseGroups(result *api.Job, list *ast.ObjectList) error {
 			}
 		}
 
+		// Parse affinities
+		if o := listVal.Filter("affinity"); len(o.Items) > 0 {
+			if err := parseAffinities(&g.Affinities, o); err != nil {
+				return multierror.Prefix(err, fmt.Sprintf("'%s', affinity ->", n))
+			}
+		}
+
 		// Parse restart policy
 		if o := listVal.Filter("restart"); len(o.Items) > 0 {
 			if err := parseRestartPolicy(&g.RestartPolicy, o); err != nil {
 				return multierror.Prefix(err, fmt.Sprintf("'%s', restart ->", n))
+			}
+		}
+
+		// Parse spread
+		if o := listVal.Filter("spread"); len(o.Items) > 0 {
+			if err := parseSpread(&g.Spreads, o); err != nil {
+				return multierror.Prefix(err, "spread ->")
 			}
 		}
 
@@ -523,26 +558,26 @@ func parseConstraints(result *[]*api.Constraint, list *ast.ObjectList) error {
 
 		// If "version" is provided, set the operand
 		// to "version" and the value to the "RTarget"
-		if constraint, ok := m[structs.ConstraintVersion]; ok {
-			m["Operand"] = structs.ConstraintVersion
+		if constraint, ok := m[api.ConstraintVersion]; ok {
+			m["Operand"] = api.ConstraintVersion
 			m["RTarget"] = constraint
 		}
 
 		// If "regexp" is provided, set the operand
 		// to "regexp" and the value to the "RTarget"
-		if constraint, ok := m[structs.ConstraintRegex]; ok {
-			m["Operand"] = structs.ConstraintRegex
+		if constraint, ok := m[api.ConstraintRegex]; ok {
+			m["Operand"] = api.ConstraintRegex
 			m["RTarget"] = constraint
 		}
 
 		// If "set_contains" is provided, set the operand
 		// to "set_contains" and the value to the "RTarget"
-		if constraint, ok := m[structs.ConstraintSetContains]; ok {
-			m["Operand"] = structs.ConstraintSetContains
+		if constraint, ok := m[api.ConstraintSetContains]; ok {
+			m["Operand"] = api.ConstraintSetContains
 			m["RTarget"] = constraint
 		}
 
-		if value, ok := m[structs.ConstraintDistinctHosts]; ok {
+		if value, ok := m[api.ConstraintDistinctHosts]; ok {
 			enabled, err := parseBool(value)
 			if err != nil {
 				return fmt.Errorf("distinct_hosts should be set to true or false; %v", err)
@@ -553,11 +588,11 @@ func parseConstraints(result *[]*api.Constraint, list *ast.ObjectList) error {
 				continue
 			}
 
-			m["Operand"] = structs.ConstraintDistinctHosts
+			m["Operand"] = api.ConstraintDistinctHosts
 		}
 
-		if property, ok := m[structs.ConstraintDistinctProperty]; ok {
-			m["Operand"] = structs.ConstraintDistinctProperty
+		if property, ok := m[api.ConstraintDistinctProperty]; ok {
+			m["Operand"] = api.ConstraintDistinctProperty
 			m["LTarget"] = property
 		}
 
@@ -571,6 +606,82 @@ func parseConstraints(result *[]*api.Constraint, list *ast.ObjectList) error {
 		}
 
 		*result = append(*result, &c)
+	}
+
+	return nil
+}
+
+func parseAffinities(result *[]*api.Affinity, list *ast.ObjectList) error {
+	for _, o := range list.Elem().Items {
+		// Check for invalid keys
+		valid := []string{
+			"attribute",
+			"operator",
+			"regexp",
+			"set_contains",
+			"set_contains_any",
+			"set_contains_all",
+			"value",
+			"version",
+			"weight",
+		}
+		if err := helper.CheckHCLKeys(o.Val, valid); err != nil {
+			return err
+		}
+
+		var m map[string]interface{}
+		if err := hcl.DecodeObject(&m, o.Val); err != nil {
+			return err
+		}
+
+		m["LTarget"] = m["attribute"]
+		m["RTarget"] = m["value"]
+		m["Operand"] = m["operator"]
+
+		// If "version" is provided, set the operand
+		// to "version" and the value to the "RTarget"
+		if affinity, ok := m[api.ConstraintVersion]; ok {
+			m["Operand"] = api.ConstraintVersion
+			m["RTarget"] = affinity
+		}
+
+		// If "regexp" is provided, set the operand
+		// to "regexp" and the value to the "RTarget"
+		if affinity, ok := m[api.ConstraintRegex]; ok {
+			m["Operand"] = api.ConstraintRegex
+			m["RTarget"] = affinity
+		}
+
+		// If "set_contains_any" is provided, set the operand
+		// to "set_contains_any" and the value to the "RTarget"
+		if affinity, ok := m[api.ConstraintSetContainsAny]; ok {
+			m["Operand"] = api.ConstraintSetContainsAny
+			m["RTarget"] = affinity
+		}
+
+		// If "set_contains_all" is provided, set the operand
+		// to "set_contains_all" and the value to the "RTarget"
+		if affinity, ok := m[api.ConstraintSetContainsAll]; ok {
+			m["Operand"] = api.ConstraintSetContainsAll
+			m["RTarget"] = affinity
+		}
+
+		// set_contains is a synonym of set_contains_all
+		if affinity, ok := m[api.ConstraintSetContains]; ok {
+			m["Operand"] = api.ConstraintSetContains
+			m["RTarget"] = affinity
+		}
+
+		// Build the affinity
+		var a api.Affinity
+		if err := mapstructure.WeakDecode(m, &a); err != nil {
+			return err
+		}
+		if a.Operand == "" {
+			a.Operand = "="
+		}
+
+		*result = append(*result, &a)
 	}
 
 	return nil
@@ -606,6 +717,97 @@ func parseEphemeralDisk(result **api.EphemeralDisk, list *ast.ObjectList) error 
 	}
 	*result = &ephemeralDisk
 
+	return nil
+}
+
+func parseSpread(result *[]*api.Spread, list *ast.ObjectList) error {
+	for _, o := range list.Elem().Items {
+		// Check for invalid keys
+		valid := []string{
+			"attribute",
+			"weight",
+			"target",
+		}
+		if err := helper.CheckHCLKeys(o.Val, valid); err != nil {
+			return err
+		}
+
+		// We need this later
+		var listVal *ast.ObjectList
+		if ot, ok := o.Val.(*ast.ObjectType); ok {
+			listVal = ot.List
+		} else {
+			return fmt.Errorf("spread should be an object")
+		}
+
+		var m map[string]interface{}
+		if err := hcl.DecodeObject(&m, o.Val); err != nil {
+			return err
+		}
+		delete(m, "target")
+		// Build spread
+		var s api.Spread
+		if err := mapstructure.WeakDecode(m, &s); err != nil {
+			return err
+		}
+
+		// Parse spread target
+		if o := listVal.Filter("target"); len(o.Items) > 0 {
+			if err := parseSpreadTarget(&s.SpreadTarget, o); err != nil {
+				return multierror.Prefix(err, fmt.Sprintf("target ->"))
+			}
+		}
+
+		*result = append(*result, &s)
+	}
+
+	return nil
+}
+
+func parseSpreadTarget(result *[]*api.SpreadTarget, list *ast.ObjectList) error {
+	seen := make(map[string]struct{})
+	for _, item := range list.Items {
+		if len(item.Keys) != 1 {
+			return fmt.Errorf("missing spread target")
+		}
+		n := item.Keys[0].Token.Value().(string)
+
+		// Make sure we haven't already found this
+		if _, ok := seen[n]; ok {
+			return fmt.Errorf("target '%s' defined more than once", n)
+		}
+		seen[n] = struct{}{}
+
+		// We need this later
+		var listVal *ast.ObjectList
+		if ot, ok := item.Val.(*ast.ObjectType); ok {
+			listVal = ot.List
+		} else {
+			return fmt.Errorf("target should be an object")
+		}
+
+		// Check for invalid keys
+		valid := []string{
+			"percent",
+			"value",
+		}
+		if err := helper.CheckHCLKeys(listVal, valid); err != nil {
+			return multierror.Prefix(err, fmt.Sprintf("'%s' ->", n))
+		}
+
+		var m map[string]interface{}
+		if err := hcl.DecodeObject(&m, item.Val); err != nil {
+			return err
+		}
+
+		// Decode spread target
+		var g api.SpreadTarget
+		g.Value = n
+		if err := mapstructure.WeakDecode(m, &g); err != nil {
+			return err
+		}
+		*result = append(*result, &g)
+	}
 	return nil
 }
 
@@ -656,6 +858,7 @@ func parseTasks(jobName string, taskGroupName string, result *[]*api.Task, list 
 			"artifact",
 			"config",
 			"constraint",
+			"affinity",
 			"dispatch_payload",
 			"driver",
 			"env",
@@ -682,6 +885,7 @@ func parseTasks(jobName string, taskGroupName string, result *[]*api.Task, list 
 		delete(m, "artifact")
 		delete(m, "config")
 		delete(m, "constraint")
+		delete(m, "affinity")
 		delete(m, "dispatch_payload")
 		delete(m, "env")
 		delete(m, "logs")
@@ -748,6 +952,13 @@ func parseTasks(jobName string, taskGroupName string, result *[]*api.Task, list 
 			if err := parseConstraints(&t.Constraints, o); err != nil {
 				return multierror.Prefix(err, fmt.Sprintf(
 					"'%s', constraint ->", n))
+			}
+		}
+
+		// Parse affinities
+		if o := listVal.Filter("affinity"); len(o.Items) > 0 {
+			if err := parseAffinities(&t.Affinities, o); err != nil {
+				return multierror.Prefix(err, "affinity ->")
 			}
 		}
 
@@ -1199,10 +1410,11 @@ func parseResources(result *api.Resources, list *ast.ObjectList) error {
 	// Check for invalid keys
 	valid := []string{
 		"cpu",
-		"iops",
+		"iops", // COMPAT(0.10): Remove after one release to allow it to be removed from jobspecs
 		"disk",
 		"memory",
 		"network",
+		"device",
 	}
 	if err := helper.CheckHCLKeys(listVal, valid); err != nil {
 		return multierror.Prefix(err, "resources ->")
@@ -1213,6 +1425,7 @@ func parseResources(result *api.Resources, list *ast.ObjectList) error {
 		return err
 	}
 	delete(m, "network")
+	delete(m, "device")
 
 	if err := mapstructure.WeakDecode(m, result); err != nil {
 		return err
@@ -1253,6 +1466,70 @@ func parseResources(result *api.Resources, list *ast.ObjectList) error {
 		}
 
 		result.Networks = []*api.NetworkResource{&r}
+	}
+
+	// Parse the device resources
+	if o := listVal.Filter("device"); len(o.Items) > 0 {
+		result.Devices = make([]*api.RequestedDevice, len(o.Items))
+		for idx, do := range o.Items {
+			if l := len(do.Keys); l == 0 {
+				return multierror.Prefix(fmt.Errorf("missing device name"), fmt.Sprintf("resources, device[%d]->", idx))
+			} else if l > 1 {
+				return multierror.Prefix(fmt.Errorf("only one name may be specified"), fmt.Sprintf("resources, device[%d]->", idx))
+			}
+			name := do.Keys[0].Token.Value().(string)
+
+			// Value should be an object
+			var listVal *ast.ObjectList
+			if ot, ok := do.Val.(*ast.ObjectType); ok {
+				listVal = ot.List
+			} else {
+				return fmt.Errorf("device should be an object")
+			}
+
+			// Check for invalid keys
+			valid := []string{
+				"name",
+				"count",
+				"affinity",
+				"constraint",
+			}
+			if err := helper.CheckHCLKeys(do.Val, valid); err != nil {
+				return multierror.Prefix(err, fmt.Sprintf("resources, device[%d]->", idx))
+			}
+
+			// Set the name
+			var r api.RequestedDevice
+			r.Name = name
+
+			var m map[string]interface{}
+			if err := hcl.DecodeObject(&m, do.Val); err != nil {
+				return err
+			}
+
+			delete(m, "constraint")
+			delete(m, "affinity")
+
+			if err := mapstructure.WeakDecode(m, &r); err != nil {
+				return err
+			}
+
+			// Parse constraints
+			if o := listVal.Filter("constraint"); len(o.Items) > 0 {
+				if err := parseConstraints(&r.Constraints, o); err != nil {
+					return multierror.Prefix(err, "constraint ->")
+				}
+			}
+
+			// Parse affinities
+			if o := listVal.Filter("affinity"); len(o.Items) > 0 {
+				if err := parseAffinities(&r.Affinities, o); err != nil {
+					return multierror.Prefix(err, "affinity ->")
+				}
+			}
+
+			result.Devices[idx] = &r
+		}
 	}
 
 	return nil
@@ -1317,7 +1594,6 @@ func parseUpdate(result **api.UpdateStrategy, list *ast.ObjectList) error {
 
 	// Check for invalid keys
 	valid := []string{
-		// COMPAT: Remove in 0.7.0. Stagger is deprecated in 0.6.0.
 		"stagger",
 		"max_parallel",
 		"health_check",
@@ -1325,6 +1601,7 @@ func parseUpdate(result **api.UpdateStrategy, list *ast.ObjectList) error {
 		"healthy_deadline",
 		"progress_deadline",
 		"auto_revert",
+		"auto_promote",
 		"canary",
 	}
 	if err := helper.CheckHCLKeys(o.Val, valid); err != nil {
@@ -1413,7 +1690,7 @@ func parsePeriodic(result **api.PeriodicConfig, list *ast.ObjectList) error {
 
 	// If "cron" is provided, set the type to "cron" and store the spec.
 	if cron, ok := m["cron"]; ok {
-		m["SpecType"] = structs.PeriodicSpecCron
+		m["SpecType"] = api.PeriodicSpecCron
 		m["Spec"] = cron
 	}
 

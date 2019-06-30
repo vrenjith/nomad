@@ -1,7 +1,7 @@
 import { get, computed } from '@ember/object';
 import attr from 'ember-data/attr';
 import Fragment from 'ember-data-model-fragments/fragment';
-import flat from 'npm:flat';
+import flat from 'flat';
 
 const { unflatten } = flat;
 
@@ -9,7 +9,7 @@ export default Fragment.extend({
   attributes: attr(),
 
   attributesStructured: computed('attributes', function() {
-    const original = this.get('attributes');
+    const original = this.attributes;
 
     if (!original) {
       return;
@@ -30,6 +30,6 @@ export default Fragment.extend({
     //
     // ex: nodeAttrs.get('driver.docker')
     // [ "1", { version: "17.05.0-ce", volumes: { enabled: "1" } } ]
-    return get(this.get('attributesStructured'), key);
+    return get(this.attributesStructured, key);
   },
 });

@@ -14,6 +14,10 @@
     }
   }
 
+  &.is-isolated {
+    margin-bottom: 0;
+  }
+
   &.with-foot {
     margin-bottom: 0;
     border-bottom-left-radius: 0;
@@ -86,6 +90,11 @@
 
     &.is-narrow {
       padding: 1.25em 0 1.25em 0.5em;
+
+      & + th,
+      & + td {
+        padding-left: 0.5em;
+      }
     }
 
     // Only use px modifiers when text needs to be truncated.
@@ -158,6 +167,7 @@
           bottom: 0.75em;
           position: absolute;
           display: block;
+          pointer-events: none;
         }
 
         &.asc::after {

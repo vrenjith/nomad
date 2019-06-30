@@ -2,10 +2,8 @@ package servers_test
 
 import (
 	"fmt"
-	"log"
 	"math/rand"
 	"net"
-	"os"
 	"strings"
 	"testing"
 
@@ -35,14 +33,14 @@ func (cp *fauxConnPool) Ping(net.Addr) error {
 }
 
 func testManager(t *testing.T) (m *servers.Manager) {
-	logger := testlog.Logger(t)
+	logger := testlog.HCLogger(t)
 	shutdownCh := make(chan struct{})
 	m = servers.New(logger, shutdownCh, &fauxConnPool{})
 	return m
 }
 
 func testManagerFailProb(t *testing.T, failPct float64) (m *servers.Manager) {
-	logger := testlog.Logger(t)
+	logger := testlog.HCLogger(t)
 	shutdownCh := make(chan struct{})
 	m = servers.New(logger, shutdownCh, &fauxConnPool{failPct: failPct})
 	return m
@@ -68,6 +66,19 @@ func TestServers_SetServers(t *testing.T) {
 	require.True(m.SetServers([]*servers.Server{s1}))
 	require.Equal(1, m.NumServers())
 	require.Len(m.GetServers(), 1)
+
+	// Test that the list of servers does not get shuffled
+	// as a side effect when incoming list is equal
+	require.True(m.SetServers([]*servers.Server{s1, s2}))
+	before := m.GetServers()
+	require.False(m.SetServers([]*servers.Server{s1, s2}))
+	after := m.GetServers()
+	require.Equal(before, after)
+
+	// Send a shuffled list, verify original order doesn't change
+	require.False(m.SetServers([]*servers.Server{s2, s1}))
+	afterShuffledInput := m.GetServers()
+	require.Equal(after, afterShuffledInput)
 }
 
 func TestServers_FindServer(t *testing.T) {
@@ -115,7 +126,7 @@ func TestServers_FindServer(t *testing.T) {
 }
 
 func TestServers_New(t *testing.T) {
-	logger := log.New(os.Stderr, "", log.LstdFlags)
+	logger := testlog.HCLogger(t)
 	shutdownCh := make(chan struct{})
 	m := servers.New(logger, shutdownCh, &fauxConnPool{})
 	if m == nil {

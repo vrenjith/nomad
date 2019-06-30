@@ -5,14 +5,16 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/hashicorp/nomad/helper/uuid"
-	"github.com/hashicorp/nomad/testutil"
+	"github.com/hashicorp/go-uuid"
+	"github.com/hashicorp/nomad/api/internal/testutil"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 type configCallback func(c *Config)
@@ -316,16 +318,24 @@ func TestQueryString(t *testing.T) {
 func TestClient_NodeClient(t *testing.T) {
 	http := "testdomain:4646"
 	tlsNode := func(string, *QueryOptions) (*Node, *QueryMeta, error) {
+		uu, err := uuid.GenerateUUID()
+		if err != nil {
+			t.Fatal(err)
+		}
 		return &Node{
-			ID:         uuid.Generate(),
+			ID:         uu,
 			Status:     "ready",
 			HTTPAddr:   http,
 			TLSEnabled: true,
 		}, nil, nil
 	}
 	noTlsNode := func(string, *QueryOptions) (*Node, *QueryMeta, error) {
+		uu, err := uuid.GenerateUUID()
+		if err != nil {
+			t.Fatal(err)
+		}
 		return &Node{
-			ID:         uuid.Generate(),
+			ID:         uu,
 			Status:     "ready",
 			HTTPAddr:   http,
 			TLSEnabled: false,
@@ -434,4 +444,41 @@ func TestClient_NodeClient(t *testing.T) {
 			assert.Equal(c.ExpectedTLSServerName, nodeClient.config.TLSConfig.TLSServerName)
 		})
 	}
+}
+
+func TestCloneHttpClient(t *testing.T) {
+	client := defaultHttpClient()
+	originalTransport := client.Transport.(*http.Transport)
+	originalTransport.Proxy = func(*http.Request) (*url.URL, error) {
+		return nil, fmt.Errorf("stub function")
+	}
+
+	t.Run("closing with negative timeout", func(t *testing.T) {
+		clone, err := cloneWithTimeout(client, -1)
+		require.True(t, originalTransport == client.Transport, "original transport changed")
+		require.NoError(t, err)
+		require.Equal(t, client, clone)
+		require.True(t, client == clone)
+	})
+
+	t.Run("closing with positive timeout", func(t *testing.T) {
+		clone, err := cloneWithTimeout(client, 1*time.Second)
+		require.True(t, originalTransport == client.Transport, "original transport changed")
+		require.NoError(t, err)
+		require.NotEqual(t, client, clone)
+		require.True(t, client != clone)
+		require.True(t, client.Transport != clone.Transport)
+
+		// test that proxy function is the same in clone
+		clonedProxy := clone.Transport.(*http.Transport).Proxy
+		require.NotNil(t, clonedProxy)
+		_, err = clonedProxy(nil)
+		require.Error(t, err)
+		require.Equal(t, "stub function", err.Error())
+
+		// if we reset transport, the strutcs are equal
+		clone.Transport = originalTransport
+		require.Equal(t, client, clone)
+	})
+
 }

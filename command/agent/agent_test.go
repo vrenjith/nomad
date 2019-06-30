@@ -2,14 +2,16 @@ package agent
 
 import (
 	"io/ioutil"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	cstructs "github.com/hashicorp/nomad/client/structs"
 	"github.com/hashicorp/nomad/helper"
+	"github.com/hashicorp/nomad/helper/testlog"
+	"github.com/hashicorp/nomad/nomad/structs"
 	sconfig "github.com/hashicorp/nomad/nomad/structs/config"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -331,10 +333,7 @@ func TestAget_Client_TelemetryConfiguration(t *testing.T) {
 // API health check depending on configuration.
 func TestAgent_HTTPCheck(t *testing.T) {
 	t.Parallel()
-	logger := log.New(ioutil.Discard, "", 0)
-	if testing.Verbose() {
-		logger = log.New(os.Stdout, "[TestAgent_HTTPCheck] ", log.Lshortfile)
-	}
+	logger := testlog.HCLogger(t)
 	agent := func() *Agent {
 		return &Agent{
 			logger: logger,
@@ -415,13 +414,10 @@ func TestAgent_HTTPCheckPath(t *testing.T) {
 	// Agent.agentHTTPCheck only needs a config and logger
 	a := &Agent{
 		config: DevConfig(),
-		logger: log.New(ioutil.Discard, "", 0),
+		logger: testlog.HCLogger(t),
 	}
 	if err := a.config.normalizeAddrs(); err != nil {
 		t.Fatalf("error normalizing config: %v", err)
-	}
-	if testing.Verbose() {
-		a.logger = log.New(os.Stderr, "", log.LstdFlags)
 	}
 
 	// Assert server check uses /v1/agent/health?type=server
@@ -636,7 +632,7 @@ func TestServer_Reload_TLS_WithNilConfiguration(t *testing.T) {
 	t.Parallel()
 	assert := assert.New(t)
 
-	logger := log.New(ioutil.Discard, "", 0)
+	logger := testlog.HCLogger(t)
 
 	agent := &Agent{
 		logger: logger,
@@ -660,7 +656,7 @@ func TestServer_Reload_TLS_UpgradeToTLS(t *testing.T) {
 	dir := tmpDir(t)
 	defer os.RemoveAll(dir)
 
-	logger := log.New(ioutil.Discard, "", 0)
+	logger := testlog.HCLogger(t)
 
 	agentConfig := &Config{
 		TLSConfig: &sconfig.TLSConfig{},
@@ -702,7 +698,7 @@ func TestServer_Reload_TLS_DowngradeFromTLS(t *testing.T) {
 	dir := tmpDir(t)
 	defer os.RemoveAll(dir)
 
-	logger := log.New(ioutil.Discard, "", 0)
+	logger := testlog.HCLogger(t)
 
 	agentConfig := &Config{
 		TLSConfig: &sconfig.TLSConfig{
@@ -767,10 +763,9 @@ func TestServer_ShouldReload_ReturnFalseForNoChanges(t *testing.T) {
 	})
 	defer agent.Shutdown()
 
-	shouldReloadAgent, shouldReloadHTTP, shouldReloadRPC := agent.ShouldReload(sameAgentConfig)
+	shouldReloadAgent, shouldReloadHTTP := agent.ShouldReload(sameAgentConfig)
 	assert.False(shouldReloadAgent)
 	assert.False(shouldReloadHTTP)
-	assert.False(shouldReloadRPC)
 }
 
 func TestServer_ShouldReload_ReturnTrueForOnlyHTTPChanges(t *testing.T) {
@@ -808,10 +803,9 @@ func TestServer_ShouldReload_ReturnTrueForOnlyHTTPChanges(t *testing.T) {
 	})
 	defer agent.Shutdown()
 
-	shouldReloadAgent, shouldReloadHTTP, shouldReloadRPC := agent.ShouldReload(sameAgentConfig)
+	shouldReloadAgent, shouldReloadHTTP := agent.ShouldReload(sameAgentConfig)
 	require.True(shouldReloadAgent)
 	require.True(shouldReloadHTTP)
-	require.False(shouldReloadRPC)
 }
 
 func TestServer_ShouldReload_ReturnTrueForOnlyRPCChanges(t *testing.T) {
@@ -849,10 +843,9 @@ func TestServer_ShouldReload_ReturnTrueForOnlyRPCChanges(t *testing.T) {
 	})
 	defer agent.Shutdown()
 
-	shouldReloadAgent, shouldReloadHTTP, shouldReloadRPC := agent.ShouldReload(sameAgentConfig)
+	shouldReloadAgent, shouldReloadHTTP := agent.ShouldReload(sameAgentConfig)
 	assert.True(shouldReloadAgent)
 	assert.False(shouldReloadHTTP)
-	assert.True(shouldReloadRPC)
 }
 
 func TestServer_ShouldReload_ReturnTrueForConfigChanges(t *testing.T) {
@@ -892,10 +885,9 @@ func TestServer_ShouldReload_ReturnTrueForConfigChanges(t *testing.T) {
 		},
 	}
 
-	shouldReloadAgent, shouldReloadHTTP, shouldReloadRPC := agent.ShouldReload(newConfig)
+	shouldReloadAgent, shouldReloadHTTP := agent.ShouldReload(newConfig)
 	assert.True(shouldReloadAgent)
 	assert.True(shouldReloadHTTP)
-	assert.True(shouldReloadRPC)
 }
 
 func TestServer_ShouldReload_ReturnTrueForFileChanges(t *testing.T) {
@@ -925,7 +917,7 @@ func TestServer_ShouldReload_ReturnTrueForFileChanges(t *testing.T) {
 	content := []byte(oldCertificate)
 	dir, err := ioutil.TempDir("", "certificate")
 	if err != nil {
-		log.Fatal(err)
+		t.Fatal(err)
 	}
 	defer os.RemoveAll(dir) // clean up
 
@@ -938,7 +930,7 @@ func TestServer_ShouldReload_ReturnTrueForFileChanges(t *testing.T) {
 		key    = "../../helper/tlsutil/testdata/nomad-foo-key.pem"
 	)
 
-	logger := log.New(ioutil.Discard, "", 0)
+	logger := testlog.HCLogger(t)
 
 	agentConfig := &Config{
 		TLSConfig: &sconfig.TLSConfig{
@@ -957,10 +949,9 @@ func TestServer_ShouldReload_ReturnTrueForFileChanges(t *testing.T) {
 	}
 	agent.config.TLSConfig.SetChecksum()
 
-	shouldReloadAgent, shouldReloadHTTP, shouldReloadRPC := agent.ShouldReload(agentConfig)
+	shouldReloadAgent, shouldReloadHTTP := agent.ShouldReload(agentConfig)
 	require.False(shouldReloadAgent)
 	require.False(shouldReloadHTTP)
-	require.False(shouldReloadRPC)
 
 	newCertificate := `
 	-----BEGIN CERTIFICATE-----
@@ -997,10 +988,9 @@ func TestServer_ShouldReload_ReturnTrueForFileChanges(t *testing.T) {
 		},
 	}
 
-	shouldReloadAgent, shouldReloadHTTP, shouldReloadRPC = agent.ShouldReload(newAgentConfig)
+	shouldReloadAgent, shouldReloadHTTP = agent.ShouldReload(newAgentConfig)
 	require.True(shouldReloadAgent)
 	require.True(shouldReloadHTTP)
-	require.True(shouldReloadRPC)
 }
 
 func TestServer_ShouldReload_ShouldHandleMultipleChanges(t *testing.T) {
@@ -1041,19 +1031,38 @@ func TestServer_ShouldReload_ShouldHandleMultipleChanges(t *testing.T) {
 	defer agent.Shutdown()
 
 	{
-		shouldReloadAgent, shouldReloadHTTP, shouldReloadRPC := agent.ShouldReload(sameAgentConfig)
+		shouldReloadAgent, shouldReloadHTTP := agent.ShouldReload(sameAgentConfig)
 		require.True(shouldReloadAgent)
 		require.True(shouldReloadHTTP)
-		require.True(shouldReloadRPC)
 	}
 
 	err := agent.Reload(sameAgentConfig)
 	require.Nil(err)
 
 	{
-		shouldReloadAgent, shouldReloadHTTP, shouldReloadRPC := agent.ShouldReload(sameAgentConfig)
+		shouldReloadAgent, shouldReloadHTTP := agent.ShouldReload(sameAgentConfig)
 		require.False(shouldReloadAgent)
 		require.False(shouldReloadHTTP)
-		require.False(shouldReloadRPC)
+	}
+}
+
+func TestAgent_ProxyRPC_Dev(t *testing.T) {
+	t.Parallel()
+	agent := NewTestAgent(t, t.Name(), nil)
+	defer agent.Shutdown()
+
+	id := agent.client.NodeID()
+	req := &structs.NodeSpecificRequest{
+		NodeID: id,
+		QueryOptions: structs.QueryOptions{
+			Region: agent.server.Region(),
+		},
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	var resp cstructs.ClientStatsResponse
+	if err := agent.RPC("ClientStats.Stats", req, &resp); err != nil {
+		t.Fatalf("err: %v", err)
 	}
 }

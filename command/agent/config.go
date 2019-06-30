@@ -15,337 +15,438 @@ import (
 	"time"
 
 	"github.com/hashicorp/go-sockaddr/template"
-
 	client "github.com/hashicorp/nomad/client/config"
 	"github.com/hashicorp/nomad/helper"
 	"github.com/hashicorp/nomad/nomad"
+	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/hashicorp/nomad/nomad/structs/config"
 	"github.com/hashicorp/nomad/version"
 )
 
 // Config is the configuration for the Nomad agent.
+//
+// time.Duration values have two parts:
+// - a string field tagged with an hcl:"foo" and json:"-"
+// - a time.Duration field in the same struct and a call to duration
+//   in config_parse.go ParseConfigFile
+//
+// All config structs should have an ExtraKeysHCL field to check for
+// unexpected keys
 type Config struct {
 	// Region is the region this agent is in. Defaults to global.
-	Region string `mapstructure:"region"`
+	Region string `hcl:"region"`
 
 	// Datacenter is the datacenter this agent is in. Defaults to dc1
-	Datacenter string `mapstructure:"datacenter"`
+	Datacenter string `hcl:"datacenter"`
 
 	// NodeName is the name we register as. Defaults to hostname.
-	NodeName string `mapstructure:"name"`
+	NodeName string `hcl:"name"`
 
 	// DataDir is the directory to store our state in
-	DataDir string `mapstructure:"data_dir"`
+	DataDir string `hcl:"data_dir"`
 
-	// LogLevel is the level of the logs to putout
-	LogLevel string `mapstructure:"log_level"`
+	// PluginDir is the directory to lookup plugins.
+	PluginDir string `hcl:"plugin_dir"`
+
+	// LogLevel is the level of the logs to put out
+	LogLevel string `hcl:"log_level"`
+
+	// LogJson enables log output in a JSON format
+	LogJson bool `hcl:"log_json"`
 
 	// BindAddr is the address on which all of nomad's services will
 	// be bound. If not specified, this defaults to 127.0.0.1.
-	BindAddr string `mapstructure:"bind_addr"`
+	BindAddr string `hcl:"bind_addr"`
 
 	// EnableDebug is used to enable debugging HTTP endpoints
-	EnableDebug bool `mapstructure:"enable_debug"`
+	EnableDebug bool `hcl:"enable_debug"`
 
 	// Ports is used to control the network ports we bind to.
-	Ports *Ports `mapstructure:"ports"`
+	Ports *Ports `hcl:"ports"`
 
 	// Addresses is used to override the network addresses we bind to.
 	//
 	// Use normalizedAddrs if you need the host+port to bind to.
-	Addresses *Addresses `mapstructure:"addresses"`
+	Addresses *Addresses `hcl:"addresses"`
 
 	// normalizedAddr is set to the Address+Port by normalizeAddrs()
 	normalizedAddrs *Addresses
 
 	// AdvertiseAddrs is used to control the addresses we advertise.
-	AdvertiseAddrs *AdvertiseAddrs `mapstructure:"advertise"`
+	AdvertiseAddrs *AdvertiseAddrs `hcl:"advertise"`
 
 	// Client has our client related settings
-	Client *ClientConfig `mapstructure:"client"`
+	Client *ClientConfig `hcl:"client"`
 
 	// Server has our server related settings
-	Server *ServerConfig `mapstructure:"server"`
+	Server *ServerConfig `hcl:"server"`
 
 	// ACL has our acl related settings
-	ACL *ACLConfig `mapstructure:"acl"`
+	ACL *ACLConfig `hcl:"acl"`
 
 	// Telemetry is used to configure sending telemetry
-	Telemetry *Telemetry `mapstructure:"telemetry"`
+	Telemetry *Telemetry `hcl:"telemetry"`
 
 	// LeaveOnInt is used to gracefully leave on the interrupt signal
-	LeaveOnInt bool `mapstructure:"leave_on_interrupt"`
+	LeaveOnInt bool `hcl:"leave_on_interrupt"`
 
 	// LeaveOnTerm is used to gracefully leave on the terminate signal
-	LeaveOnTerm bool `mapstructure:"leave_on_terminate"`
+	LeaveOnTerm bool `hcl:"leave_on_terminate"`
 
 	// EnableSyslog is used to enable sending logs to syslog
-	EnableSyslog bool `mapstructure:"enable_syslog"`
+	EnableSyslog bool `hcl:"enable_syslog"`
 
 	// SyslogFacility is used to control the syslog facility used.
-	SyslogFacility string `mapstructure:"syslog_facility"`
+	SyslogFacility string `hcl:"syslog_facility"`
 
 	// DisableUpdateCheck is used to disable the periodic update
 	// and security bulletin checking.
-	DisableUpdateCheck *bool `mapstructure:"disable_update_check"`
+	DisableUpdateCheck *bool `hcl:"disable_update_check"`
 
 	// DisableAnonymousSignature is used to disable setting the
 	// anonymous signature when doing the update check and looking
 	// for security bulletins
-	DisableAnonymousSignature bool `mapstructure:"disable_anonymous_signature"`
+	DisableAnonymousSignature bool `hcl:"disable_anonymous_signature"`
 
 	// Consul contains the configuration for the Consul Agent and
 	// parameters necessary to register services, their checks, and
 	// discover the current Nomad servers.
-	Consul *config.ConsulConfig `mapstructure:"consul"`
+	Consul *config.ConsulConfig `hcl:"consul"`
 
 	// Vault contains the configuration for the Vault Agent and
 	// parameters necessary to derive tokens.
-	Vault *config.VaultConfig `mapstructure:"vault"`
+	Vault *config.VaultConfig `hcl:"vault"`
 
 	// NomadConfig is used to override the default config.
 	// This is largely used for testing purposes.
-	NomadConfig *nomad.Config `mapstructure:"-" json:"-"`
+	NomadConfig *nomad.Config `hcl:"-" json:"-"`
 
 	// ClientConfig is used to override the default config.
 	// This is largely used for testing purposes.
-	ClientConfig *client.Config `mapstructure:"-" json:"-"`
+	ClientConfig *client.Config `hcl:"-" json:"-"`
 
 	// DevMode is set by the -dev CLI flag.
-	DevMode bool `mapstructure:"-"`
+	DevMode bool `hcl:"-"`
 
 	// Version information is set at compilation time
 	Version *version.VersionInfo
 
 	// List of config files that have been loaded (in order)
-	Files []string `mapstructure:"-"`
+	Files []string `hcl:"-"`
 
 	// TLSConfig provides TLS related configuration for the Nomad server and
 	// client
-	TLSConfig *config.TLSConfig `mapstructure:"tls"`
+	TLSConfig *config.TLSConfig `hcl:"tls"`
 
 	// HTTPAPIResponseHeaders allows users to configure the Nomad http agent to
 	// set arbitrary headers on API responses
-	HTTPAPIResponseHeaders map[string]string `mapstructure:"http_api_response_headers"`
+	HTTPAPIResponseHeaders map[string]string `hcl:"http_api_response_headers"`
 
 	// Sentinel holds sentinel related settings
-	Sentinel *config.SentinelConfig `mapstructure:"sentinel"`
+	Sentinel *config.SentinelConfig `hcl:"sentinel"`
 
 	// Autopilot contains the configuration for Autopilot behavior.
-	Autopilot *config.AutopilotConfig `mapstructure:"autopilot"`
+	Autopilot *config.AutopilotConfig `hcl:"autopilot"`
+
+	// Plugins is the set of configured plugins
+	Plugins []*config.PluginConfig `hcl:"plugin"`
+
+	// ExtraKeysHCL is used by hcl to surface unexpected keys
+	ExtraKeysHCL []string `hcl:",unusedKeys" json:"-"`
 }
 
 // ClientConfig is configuration specific to the client mode
 type ClientConfig struct {
 	// Enabled controls if we are a client
-	Enabled bool `mapstructure:"enabled"`
+	Enabled bool `hcl:"enabled"`
 
 	// StateDir is the state directory
-	StateDir string `mapstructure:"state_dir"`
+	StateDir string `hcl:"state_dir"`
 
 	// AllocDir is the directory for storing allocation data
-	AllocDir string `mapstructure:"alloc_dir"`
+	AllocDir string `hcl:"alloc_dir"`
 
 	// Servers is a list of known server addresses. These are as "host:port"
-	Servers []string `mapstructure:"servers"`
+	Servers []string `hcl:"servers"`
 
 	// NodeClass is used to group the node by class
-	NodeClass string `mapstructure:"node_class"`
+	NodeClass string `hcl:"node_class"`
 
 	// Options is used for configuration of nomad internals,
 	// like fingerprinters and drivers. The format is:
 	//
 	//  namespace.option = value
-	Options map[string]string `mapstructure:"options"`
+	Options map[string]string `hcl:"options"`
 
 	// Metadata associated with the node
-	Meta map[string]string `mapstructure:"meta"`
+	Meta map[string]string `hcl:"meta"`
 
 	// A mapping of directories on the host OS to attempt to embed inside each
 	// task's chroot.
-	ChrootEnv map[string]string `mapstructure:"chroot_env"`
+	ChrootEnv map[string]string `hcl:"chroot_env"`
 
 	// Interface to use for network fingerprinting
-	NetworkInterface string `mapstructure:"network_interface"`
+	NetworkInterface string `hcl:"network_interface"`
 
 	// NetworkSpeed is used to override any detected or default network link
 	// speed.
-	NetworkSpeed int `mapstructure:"network_speed"`
+	NetworkSpeed int `hcl:"network_speed"`
 
 	// CpuCompute is used to override any detected or default total CPU compute.
-	CpuCompute int `mapstructure:"cpu_total_compute"`
+	CpuCompute int `hcl:"cpu_total_compute"`
 
 	// MemoryMB is used to override any detected or default total memory.
-	MemoryMB int `mapstructure:"memory_total_mb"`
+	MemoryMB int `hcl:"memory_total_mb"`
 
 	// MaxKillTimeout allows capping the user-specifiable KillTimeout.
-	MaxKillTimeout string `mapstructure:"max_kill_timeout"`
+	MaxKillTimeout string `hcl:"max_kill_timeout"`
 
 	// ClientMaxPort is the upper range of the ports that the client uses for
 	// communicating with plugin subsystems
-	ClientMaxPort int `mapstructure:"client_max_port"`
+	ClientMaxPort int `hcl:"client_max_port"`
 
 	// ClientMinPort is the lower range of the ports that the client uses for
 	// communicating with plugin subsystems
-	ClientMinPort int `mapstructure:"client_min_port"`
+	ClientMinPort int `hcl:"client_min_port"`
 
 	// Reserved is used to reserve resources from being used by Nomad. This can
 	// be used to target a certain utilization or to prevent Nomad from using a
 	// particular set of ports.
-	Reserved *Resources `mapstructure:"reserved"`
+	Reserved *Resources `hcl:"reserved"`
 
 	// GCInterval is the time interval at which the client triggers garbage
 	// collection
-	GCInterval time.Duration `mapstructure:"gc_interval"`
+	GCInterval    time.Duration
+	GCIntervalHCL string `hcl:"gc_interval" json:"-"`
 
 	// GCParallelDestroys is the number of parallel destroys the garbage
 	// collector will allow.
-	GCParallelDestroys int `mapstructure:"gc_parallel_destroys"`
+	GCParallelDestroys int `hcl:"gc_parallel_destroys"`
 
 	// GCDiskUsageThreshold is the disk usage threshold given as a percent
 	// beyond which the Nomad client triggers GC of terminal allocations
-	GCDiskUsageThreshold float64 `mapstructure:"gc_disk_usage_threshold"`
+	GCDiskUsageThreshold float64 `hcl:"gc_disk_usage_threshold"`
 
 	// GCInodeUsageThreshold is the inode usage threshold beyond which the Nomad
 	// client triggers GC of the terminal allocations
-	GCInodeUsageThreshold float64 `mapstructure:"gc_inode_usage_threshold"`
+	GCInodeUsageThreshold float64 `hcl:"gc_inode_usage_threshold"`
 
 	// GCMaxAllocs is the maximum number of allocations a node can have
 	// before garbage collection is triggered.
-	GCMaxAllocs int `mapstructure:"gc_max_allocs"`
+	GCMaxAllocs int `hcl:"gc_max_allocs"`
 
 	// NoHostUUID disables using the host's UUID and will force generation of a
 	// random UUID.
-	NoHostUUID *bool `mapstructure:"no_host_uuid"`
+	NoHostUUID *bool `hcl:"no_host_uuid"`
+
+	// DisableRemoteExec disables remote exec targeting tasks on this client
+	DisableRemoteExec bool `hcl:"disable_remote_exec"`
+
+	// ServerJoin contains information that is used to attempt to join servers
+	ServerJoin *ServerJoin `hcl:"server_join"`
+
+	// ExtraKeysHCL is used by hcl to surface unexpected keys
+	ExtraKeysHCL []string `hcl:",unusedKeys" json:"-"`
 }
 
 // ACLConfig is configuration specific to the ACL system
 type ACLConfig struct {
 	// Enabled controls if we are enforce and manage ACLs
-	Enabled bool `mapstructure:"enabled"`
+	Enabled bool `hcl:"enabled"`
 
 	// TokenTTL controls how long we cache ACL tokens. This controls
 	// how stale they can be when we are enforcing policies. Defaults
 	// to "30s". Reducing this impacts performance by forcing more
 	// frequent resolution.
-	TokenTTL time.Duration `mapstructure:"token_ttl"`
+	TokenTTL    time.Duration
+	TokenTTLHCL string `hcl:"token_ttl" json:"-"`
 
 	// PolicyTTL controls how long we cache ACL policies. This controls
 	// how stale they can be when we are enforcing policies. Defaults
 	// to "30s". Reducing this impacts performance by forcing more
 	// frequent resolution.
-	PolicyTTL time.Duration `mapstructure:"policy_ttl"`
+	PolicyTTL    time.Duration
+	PolicyTTLHCL string `hcl:"policy_ttl" json:"-"`
 
 	// ReplicationToken is used by servers to replicate tokens and policies
 	// from the authoritative region. This must be a valid management token
 	// within the authoritative region.
-	ReplicationToken string `mapstructure:"replication_token"`
+	ReplicationToken string `hcl:"replication_token"`
+
+	// ExtraKeysHCL is used by hcl to surface unexpected keys
+	ExtraKeysHCL []string `hcl:",unusedKeys" json:"-"`
 }
 
 // ServerConfig is configuration specific to the server mode
 type ServerConfig struct {
 	// Enabled controls if we are a server
-	Enabled bool `mapstructure:"enabled"`
+	Enabled bool `hcl:"enabled"`
 
 	// AuthoritativeRegion is used to control which region is treated as
 	// the source of truth for global tokens and ACL policies.
-	AuthoritativeRegion string `mapstructure:"authoritative_region"`
+	AuthoritativeRegion string `hcl:"authoritative_region"`
 
 	// BootstrapExpect tries to automatically bootstrap the Consul cluster,
 	// by withholding peers until enough servers join.
-	BootstrapExpect int `mapstructure:"bootstrap_expect"`
+	BootstrapExpect int `hcl:"bootstrap_expect"`
 
 	// DataDir is the directory to store our state in
-	DataDir string `mapstructure:"data_dir"`
+	DataDir string `hcl:"data_dir"`
 
 	// ProtocolVersion is the protocol version to speak. This must be between
 	// ProtocolVersionMin and ProtocolVersionMax.
-	ProtocolVersion int `mapstructure:"protocol_version"`
+	ProtocolVersion int `hcl:"protocol_version"`
 
 	// RaftProtocol is the Raft protocol version to speak. This must be from [1-3].
-	RaftProtocol int `mapstructure:"raft_protocol"`
+	RaftProtocol int `hcl:"raft_protocol"`
 
 	// NumSchedulers is the number of scheduler thread that are run.
 	// This can be as many as one per core, or zero to disable this server
 	// from doing any scheduling work.
-	NumSchedulers int `mapstructure:"num_schedulers"`
+	NumSchedulers *int `hcl:"num_schedulers"`
 
 	// EnabledSchedulers controls the set of sub-schedulers that are
 	// enabled for this server to handle. This will restrict the evaluations
 	// that the workers dequeue for processing.
-	EnabledSchedulers []string `mapstructure:"enabled_schedulers"`
+	EnabledSchedulers []string `hcl:"enabled_schedulers"`
 
 	// NodeGCThreshold controls how "old" a node must be to be collected by GC.
 	// Age is not the only requirement for a node to be GCed but the threshold
 	// can be used to filter by age.
-	NodeGCThreshold string `mapstructure:"node_gc_threshold"`
+	NodeGCThreshold string `hcl:"node_gc_threshold"`
 
 	// JobGCThreshold controls how "old" a job must be to be collected by GC.
 	// Age is not the only requirement for a Job to be GCed but the threshold
 	// can be used to filter by age.
-	JobGCThreshold string `mapstructure:"job_gc_threshold"`
+	JobGCThreshold string `hcl:"job_gc_threshold"`
 
 	// EvalGCThreshold controls how "old" an eval must be to be collected by GC.
 	// Age is not the only requirement for a eval to be GCed but the threshold
 	// can be used to filter by age.
-	EvalGCThreshold string `mapstructure:"eval_gc_threshold"`
+	EvalGCThreshold string `hcl:"eval_gc_threshold"`
 
 	// DeploymentGCThreshold controls how "old" a deployment must be to be
 	// collected by GC.  Age is not the only requirement for a deployment to be
 	// GCed but the threshold can be used to filter by age.
-	DeploymentGCThreshold string `mapstructure:"deployment_gc_threshold"`
+	DeploymentGCThreshold string `hcl:"deployment_gc_threshold"`
 
 	// HeartbeatGrace is the grace period beyond the TTL to account for network,
 	// processing delays and clock skew before marking a node as "down".
-	HeartbeatGrace time.Duration `mapstructure:"heartbeat_grace"`
+	HeartbeatGrace    time.Duration
+	HeartbeatGraceHCL string `hcl:"heartbeat_grace" json:"-"`
 
 	// MinHeartbeatTTL is the minimum time between heartbeats. This is used as
 	// a floor to prevent excessive updates.
-	MinHeartbeatTTL time.Duration `mapstructure:"min_heartbeat_ttl"`
+	MinHeartbeatTTL    time.Duration
+	MinHeartbeatTTLHCL string `hcl:"min_heartbeat_ttl" json:"-"`
 
 	// MaxHeartbeatsPerSecond is the maximum target rate of heartbeats
 	// being processed per second. This allows the TTL to be increased
 	// to meet the target rate.
-	MaxHeartbeatsPerSecond float64 `mapstructure:"max_heartbeats_per_second"`
+	MaxHeartbeatsPerSecond float64 `hcl:"max_heartbeats_per_second"`
 
 	// StartJoin is a list of addresses to attempt to join when the
 	// agent starts. If Serf is unable to communicate with any of these
 	// addresses, then the agent will error and exit.
-	StartJoin []string `mapstructure:"start_join"`
+	// Deprecated in Nomad 0.10
+	StartJoin []string `hcl:"start_join"`
 
 	// RetryJoin is a list of addresses to join with retry enabled.
-	RetryJoin []string `mapstructure:"retry_join"`
+	// Deprecated in Nomad 0.10
+	RetryJoin []string `hcl:"retry_join"`
 
 	// RetryMaxAttempts specifies the maximum number of times to retry joining a
 	// host on startup. This is useful for cases where we know the node will be
 	// online eventually.
-	RetryMaxAttempts int `mapstructure:"retry_max"`
+	// Deprecated in Nomad 0.10
+	RetryMaxAttempts int `hcl:"retry_max"`
 
 	// RetryInterval specifies the amount of time to wait in between join
 	// attempts on agent start. The minimum allowed value is 1 second and
 	// the default is 30s.
-	RetryInterval string        `mapstructure:"retry_interval"`
-	retryInterval time.Duration `mapstructure:"-"`
+	// Deprecated in Nomad 0.10
+	RetryInterval    time.Duration
+	RetryIntervalHCL string `hcl:"retry_interval" json:"-"`
 
 	// RejoinAfterLeave controls our interaction with the cluster after leave.
 	// When set to false (default), a leave causes Consul to not rejoin
 	// the cluster until an explicit join is received. If this is set to
 	// true, we ignore the leave, and rejoin the cluster on start.
-	RejoinAfterLeave bool `mapstructure:"rejoin_after_leave"`
+	RejoinAfterLeave bool `hcl:"rejoin_after_leave"`
 
 	// (Enterprise-only) NonVotingServer is whether this server will act as a
 	// non-voting member of the cluster to help provide read scalability.
-	NonVotingServer bool `mapstructure:"non_voting_server"`
+	NonVotingServer bool `hcl:"non_voting_server"`
 
 	// (Enterprise-only) RedundancyZone is the redundancy zone to use for this server.
-	RedundancyZone string `mapstructure:"redundancy_zone"`
+	RedundancyZone string `hcl:"redundancy_zone"`
 
 	// (Enterprise-only) UpgradeVersion is the custom upgrade version to use when
 	// performing upgrade migrations.
-	UpgradeVersion string `mapstructure:"upgrade_version"`
+	UpgradeVersion string `hcl:"upgrade_version"`
 
 	// Encryption key to use for the Serf communication
-	EncryptKey string `mapstructure:"encrypt" json:"-"`
+	EncryptKey string `hcl:"encrypt" json:"-"`
+
+	// ServerJoin contains information that is used to attempt to join servers
+	ServerJoin *ServerJoin `hcl:"server_join"`
+
+	// ExtraKeysHCL is used by hcl to surface unexpected keys
+	ExtraKeysHCL []string `hcl:",unusedKeys" json:"-"`
+}
+
+// ServerJoin is used in both clients and servers to bootstrap connections to
+// servers
+type ServerJoin struct {
+	// StartJoin is a list of addresses to attempt to join when the
+	// agent starts. If Serf is unable to communicate with any of these
+	// addresses, then the agent will error and exit.
+	StartJoin []string `hcl:"start_join"`
+
+	// RetryJoin is a list of addresses to join with retry enabled, or a single
+	// value to find multiple servers using go-discover syntax.
+	RetryJoin []string `hcl:"retry_join"`
+
+	// RetryMaxAttempts specifies the maximum number of times to retry joining a
+	// host on startup. This is useful for cases where we know the node will be
+	// online eventually.
+	RetryMaxAttempts int `hcl:"retry_max"`
+
+	// RetryInterval specifies the amount of time to wait in between join
+	// attempts on agent start. The minimum allowed value is 1 second and
+	// the default is 30s.
+	RetryInterval    time.Duration
+	RetryIntervalHCL string `hcl:"retry_interval" json:"-"`
+
+	// ExtraKeysHCL is used by hcl to surface unexpected keys
+	ExtraKeysHCL []string `hcl:",unusedKeys" json:"-"`
+}
+
+func (s *ServerJoin) Merge(b *ServerJoin) *ServerJoin {
+	if s == nil {
+		return b
+	}
+
+	result := *s
+
+	if b == nil {
+		return &result
+	}
+
+	if len(b.StartJoin) != 0 {
+		result.StartJoin = b.StartJoin
+	}
+	if len(b.RetryJoin) != 0 {
+		result.RetryJoin = b.RetryJoin
+	}
+	if b.RetryMaxAttempts != 0 {
+		result.RetryMaxAttempts = b.RetryMaxAttempts
+	}
+	if b.RetryInterval != 0 {
+		result.RetryInterval = b.RetryInterval
+	}
+
+	return &result
 }
 
 // EncryptBytes returns the encryption key configured.
@@ -355,25 +456,38 @@ func (s *ServerConfig) EncryptBytes() ([]byte, error) {
 
 // Telemetry is the telemetry configuration for the server
 type Telemetry struct {
-	StatsiteAddr             string        `mapstructure:"statsite_address"`
-	StatsdAddr               string        `mapstructure:"statsd_address"`
-	DataDogAddr              string        `mapstructure:"datadog_address"`
-	DataDogTags              []string      `mapstructure:"datadog_tags"`
-	PrometheusMetrics        bool          `mapstructure:"prometheus_metrics"`
-	DisableHostname          bool          `mapstructure:"disable_hostname"`
-	UseNodeName              bool          `mapstructure:"use_node_name"`
-	CollectionInterval       string        `mapstructure:"collection_interval"`
-	collectionInterval       time.Duration `mapstructure:"-"`
-	PublishAllocationMetrics bool          `mapstructure:"publish_allocation_metrics"`
-	PublishNodeMetrics       bool          `mapstructure:"publish_node_metrics"`
+	StatsiteAddr             string        `hcl:"statsite_address"`
+	StatsdAddr               string        `hcl:"statsd_address"`
+	DataDogAddr              string        `hcl:"datadog_address"`
+	DataDogTags              []string      `hcl:"datadog_tags"`
+	PrometheusMetrics        bool          `hcl:"prometheus_metrics"`
+	DisableHostname          bool          `hcl:"disable_hostname"`
+	UseNodeName              bool          `hcl:"use_node_name"`
+	CollectionInterval       string        `hcl:"collection_interval"`
+	collectionInterval       time.Duration `hcl:"-"`
+	PublishAllocationMetrics bool          `hcl:"publish_allocation_metrics"`
+	PublishNodeMetrics       bool          `hcl:"publish_node_metrics"`
 
 	// DisableTaggedMetrics disables a new version of generating metrics which
 	// uses tags
-	DisableTaggedMetrics bool `mapstructure:"disable_tagged_metrics"`
+	DisableTaggedMetrics bool `hcl:"disable_tagged_metrics"`
 
 	// BackwardsCompatibleMetrics allows for generating metrics in a simple
 	// key/value structure as done in older versions of Nomad
-	BackwardsCompatibleMetrics bool `mapstructure:"backwards_compatible_metrics"`
+	BackwardsCompatibleMetrics bool `hcl:"backwards_compatible_metrics"`
+
+	// PrefixFilter allows for filtering out metrics from being collected
+	PrefixFilter []string `hcl:"prefix_filter"`
+
+	// FilterDefault controls whether to allow metrics that have not been specified
+	// by the filter
+	FilterDefault *bool `hcl:"filter_default"`
+
+	// DisableDispatchedJobSummaryMetrics allows ignoring dispatched jobs when
+	// publishing Job summary metrics. This is useful in environments that produce
+	// high numbers of single count dispatch jobs as the metrics for each take up
+	// a small memory overhead.
+	DisableDispatchedJobSummaryMetrics bool `hcl:"disable_dispatched_job_summary_metrics"`
 
 	// Circonus: see https://github.com/circonus-labs/circonus-gometrics
 	// for more details on the various configuration options.
@@ -391,46 +505,46 @@ type Telemetry struct {
 	// CirconusAPIToken is a valid API Token used to create/manage check. If provided,
 	// metric management is enabled.
 	// Default: none
-	CirconusAPIToken string `mapstructure:"circonus_api_token"`
+	CirconusAPIToken string `hcl:"circonus_api_token"`
 	// CirconusAPIApp is an app name associated with API token.
 	// Default: "nomad"
-	CirconusAPIApp string `mapstructure:"circonus_api_app"`
+	CirconusAPIApp string `hcl:"circonus_api_app"`
 	// CirconusAPIURL is the base URL to use for contacting the Circonus API.
 	// Default: "https://api.circonus.com/v2"
-	CirconusAPIURL string `mapstructure:"circonus_api_url"`
+	CirconusAPIURL string `hcl:"circonus_api_url"`
 	// CirconusSubmissionInterval is the interval at which metrics are submitted to Circonus.
 	// Default: 10s
-	CirconusSubmissionInterval string `mapstructure:"circonus_submission_interval"`
+	CirconusSubmissionInterval string `hcl:"circonus_submission_interval"`
 	// CirconusCheckSubmissionURL is the check.config.submission_url field from a
 	// previously created HTTPTRAP check.
 	// Default: none
-	CirconusCheckSubmissionURL string `mapstructure:"circonus_submission_url"`
+	CirconusCheckSubmissionURL string `hcl:"circonus_submission_url"`
 	// CirconusCheckID is the check id (not check bundle id) from a previously created
 	// HTTPTRAP check. The numeric portion of the check._cid field.
 	// Default: none
-	CirconusCheckID string `mapstructure:"circonus_check_id"`
+	CirconusCheckID string `hcl:"circonus_check_id"`
 	// CirconusCheckForceMetricActivation will force enabling metrics, as they are encountered,
 	// if the metric already exists and is NOT active. If check management is enabled, the default
 	// behavior is to add new metrics as they are encountered. If the metric already exists in the
 	// check, it will *NOT* be activated. This setting overrides that behavior.
 	// Default: "false"
-	CirconusCheckForceMetricActivation string `mapstructure:"circonus_check_force_metric_activation"`
+	CirconusCheckForceMetricActivation string `hcl:"circonus_check_force_metric_activation"`
 	// CirconusCheckInstanceID serves to uniquely identify the metrics coming from this "instance".
 	// It can be used to maintain metric continuity with transient or ephemeral instances as
 	// they move around within an infrastructure.
 	// Default: hostname:app
-	CirconusCheckInstanceID string `mapstructure:"circonus_check_instance_id"`
+	CirconusCheckInstanceID string `hcl:"circonus_check_instance_id"`
 	// CirconusCheckSearchTag is a special tag which, when coupled with the instance id, helps to
 	// narrow down the search results when neither a Submission URL or Check ID is provided.
 	// Default: service:app (e.g. service:nomad)
-	CirconusCheckSearchTag string `mapstructure:"circonus_check_search_tag"`
+	CirconusCheckSearchTag string `hcl:"circonus_check_search_tag"`
 	// CirconusCheckTags is a comma separated list of tags to apply to the check. Note that
 	// the value of CirconusCheckSearchTag will always be added to the check.
 	// Default: none
-	CirconusCheckTags string `mapstructure:"circonus_check_tags"`
+	CirconusCheckTags string `hcl:"circonus_check_tags"`
 	// CirconusCheckDisplayName is the name for the check which will be displayed in the Circonus UI.
 	// Default: value of CirconusCheckInstanceID
-	CirconusCheckDisplayName string `mapstructure:"circonus_check_display_name"`
+	CirconusCheckDisplayName string `hcl:"circonus_check_display_name"`
 	// CirconusBrokerID is an explicit broker to use when creating a new check. The numeric portion
 	// of broker._cid. If metric management is enabled and neither a Submission URL nor Check ID
 	// is provided, an attempt will be made to search for an existing check using Instance ID and
@@ -438,106 +552,82 @@ type Telemetry struct {
 	// Default: use Select Tag if provided, otherwise, a random Enterprise Broker associated
 	// with the specified API token or the default Circonus Broker.
 	// Default: none
-	CirconusBrokerID string `mapstructure:"circonus_broker_id"`
+	CirconusBrokerID string `hcl:"circonus_broker_id"`
 	// CirconusBrokerSelectTag is a special tag which will be used to select a broker when
 	// a Broker ID is not provided. The best use of this is to as a hint for which broker
 	// should be used based on *where* this particular instance is running.
 	// (e.g. a specific geo location or datacenter, dc:sfo)
 	// Default: none
-	CirconusBrokerSelectTag string `mapstructure:"circonus_broker_select_tag"`
+	CirconusBrokerSelectTag string `hcl:"circonus_broker_select_tag"`
+
+	// ExtraKeysHCL is used by hcl to surface unexpected keys
+	ExtraKeysHCL []string `hcl:",unusedKeys" json:"-"`
+}
+
+// PrefixFilters parses the PrefixFilter field and returns a list of allowed and blocked filters
+func (t *Telemetry) PrefixFilters() (allowed, blocked []string, err error) {
+	for _, rule := range t.PrefixFilter {
+		if rule == "" {
+			continue
+		}
+		switch rule[0] {
+		case '+':
+			allowed = append(allowed, rule[1:])
+		case '-':
+			blocked = append(blocked, rule[1:])
+		default:
+			return nil, nil, fmt.Errorf("Filter rule must begin with either '+' or '-': %q", rule)
+		}
+	}
+	return allowed, blocked, nil
 }
 
 // Ports encapsulates the various ports we bind to for network services. If any
 // are not specified then the defaults are used instead.
 type Ports struct {
-	HTTP int `mapstructure:"http"`
-	RPC  int `mapstructure:"rpc"`
-	Serf int `mapstructure:"serf"`
+	HTTP int `hcl:"http"`
+	RPC  int `hcl:"rpc"`
+	Serf int `hcl:"serf"`
+	// ExtraKeysHCL is used by hcl to surface unexpected keys
+	ExtraKeysHCL []string `hcl:",unusedKeys" json:"-"`
 }
 
 // Addresses encapsulates all of the addresses we bind to for various
 // network services. Everything is optional and defaults to BindAddr.
 type Addresses struct {
-	HTTP string `mapstructure:"http"`
-	RPC  string `mapstructure:"rpc"`
-	Serf string `mapstructure:"serf"`
+	HTTP string `hcl:"http"`
+	RPC  string `hcl:"rpc"`
+	Serf string `hcl:"serf"`
+	// ExtraKeysHCL is used by hcl to surface unexpected keys
+	ExtraKeysHCL []string `hcl:",unusedKeys" json:"-"`
 }
 
 // AdvertiseAddrs is used to control the addresses we advertise out for
 // different network services. All are optional and default to BindAddr and
 // their default Port.
 type AdvertiseAddrs struct {
-	HTTP string `mapstructure:"http"`
-	RPC  string `mapstructure:"rpc"`
-	Serf string `mapstructure:"serf"`
+	HTTP string `hcl:"http"`
+	RPC  string `hcl:"rpc"`
+	Serf string `hcl:"serf"`
+	// ExtraKeysHCL is used by hcl to surface unexpected keys
+	ExtraKeysHCL []string `hcl:",unusedKeys" json:"-"`
 }
 
 type Resources struct {
-	CPU                 int    `mapstructure:"cpu"`
-	MemoryMB            int    `mapstructure:"memory"`
-	DiskMB              int    `mapstructure:"disk"`
-	IOPS                int    `mapstructure:"iops"`
-	ReservedPorts       string `mapstructure:"reserved_ports"`
-	ParsedReservedPorts []int  `mapstructure:"-"`
+	CPU           int    `hcl:"cpu"`
+	MemoryMB      int    `hcl:"memory"`
+	DiskMB        int    `hcl:"disk"`
+	ReservedPorts string `hcl:"reserved_ports"`
+	// ExtraKeysHCL is used by hcl to surface unexpected keys
+	ExtraKeysHCL []string `hcl:",unusedKeys" json:"-"`
 }
 
-// ParseReserved expands the ReservedPorts string into a slice of port numbers.
+// CanParseReserved returns if the reserved ports specification is parsable.
 // The supported syntax is comma separated integers or ranges separated by
 // hyphens. For example, "80,120-150,160"
-func (r *Resources) ParseReserved() error {
-	parts := strings.Split(r.ReservedPorts, ",")
-
-	// Hot path the empty case
-	if len(parts) == 1 && parts[0] == "" {
-		return nil
-	}
-
-	ports := make(map[int]struct{})
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		rangeParts := strings.Split(part, "-")
-		l := len(rangeParts)
-		switch l {
-		case 1:
-			if val := rangeParts[0]; val == "" {
-				return fmt.Errorf("can't specify empty port")
-			} else {
-				port, err := strconv.Atoi(val)
-				if err != nil {
-					return err
-				}
-				ports[port] = struct{}{}
-			}
-		case 2:
-			// We are parsing a range
-			start, err := strconv.Atoi(rangeParts[0])
-			if err != nil {
-				return err
-			}
-
-			end, err := strconv.Atoi(rangeParts[1])
-			if err != nil {
-				return err
-			}
-
-			if end < start {
-				return fmt.Errorf("invalid range: starting value (%v) less than ending (%v) value", end, start)
-			}
-
-			for i := start; i <= end; i++ {
-				ports[i] = struct{}{}
-			}
-		default:
-			return fmt.Errorf("can only parse single port numbers or port ranges (ex. 80,100-120,150)")
-		}
-	}
-
-	for port := range ports {
-		r.ParsedReservedPorts = append(r.ParsedReservedPorts, port)
-	}
-
-	sort.Ints(r.ParsedReservedPorts)
-	return nil
+func (r *Resources) CanParseReserved() error {
+	_, err := structs.ParsePortRanges(r.ReservedPorts)
+	return err
 }
 
 // DevConfig is a Config that is used for dev mode of Nomad.
@@ -558,9 +648,7 @@ func DevConfig() *Config {
 	}
 	conf.Client.Options = map[string]string{
 		"driver.raw_exec.enable": "true",
-	}
-	conf.Client.Options = map[string]string{
-		"driver.docker.volumes": "true",
+		"driver.docker.volumes":  "true",
 	}
 	conf.Client.GCInterval = 10 * time.Minute
 	conf.Client.GCDiskUsageThreshold = 99
@@ -601,13 +689,21 @@ func DefaultConfig() *Config {
 			GCInodeUsageThreshold: 70,
 			GCMaxAllocs:           50,
 			NoHostUUID:            helper.BoolToPtr(true),
+			DisableRemoteExec:     false,
+			ServerJoin: &ServerJoin{
+				RetryJoin:        []string{},
+				RetryInterval:    30 * time.Second,
+				RetryMaxAttempts: 0,
+			},
 		},
 		Server: &ServerConfig{
-			Enabled:          false,
-			StartJoin:        []string{},
-			RetryJoin:        []string{},
-			RetryInterval:    "30s",
-			RetryMaxAttempts: 0,
+			Enabled:   false,
+			StartJoin: []string{},
+			ServerJoin: &ServerJoin{
+				RetryJoin:        []string{},
+				RetryInterval:    30 * time.Second,
+				RetryMaxAttempts: 0,
+			},
 		},
 		ACL: &ACLConfig{
 			Enabled:   false,
@@ -668,8 +764,14 @@ func (c *Config) Merge(b *Config) *Config {
 	if b.DataDir != "" {
 		result.DataDir = b.DataDir
 	}
+	if b.PluginDir != "" {
+		result.PluginDir = b.PluginDir
+	}
 	if b.LogLevel != "" {
 		result.LogLevel = b.LogLevel
+	}
+	if b.LogJson {
+		result.LogJson = true
 	}
 	if b.BindAddr != "" {
 		result.BindAddr = b.BindAddr
@@ -787,6 +889,16 @@ func (c *Config) Merge(b *Config) *Config {
 		result.Autopilot = &autopilot
 	} else if b.Autopilot != nil {
 		result.Autopilot = result.Autopilot.Merge(b.Autopilot)
+	}
+
+	if len(result.Plugins) == 0 && len(b.Plugins) != 0 {
+		copy := make([]*config.PluginConfig, len(b.Plugins))
+		for i, v := range b.Plugins {
+			copy[i] = v.Copy()
+		}
+		result.Plugins = copy
+	} else if len(b.Plugins) != 0 {
+		result.Plugins = config.PluginConfigSetMerge(result.Plugins, b.Plugins)
 	}
 
 	// Merge config files lists
@@ -978,8 +1090,14 @@ func (a *ACLConfig) Merge(b *ACLConfig) *ACLConfig {
 	if b.TokenTTL != 0 {
 		result.TokenTTL = b.TokenTTL
 	}
+	if b.TokenTTLHCL != "" {
+		result.TokenTTLHCL = b.TokenTTLHCL
+	}
 	if b.PolicyTTL != 0 {
 		result.PolicyTTL = b.PolicyTTL
+	}
+	if b.PolicyTTLHCL != "" {
+		result.PolicyTTLHCL = b.PolicyTTLHCL
 	}
 	if b.ReplicationToken != "" {
 		result.ReplicationToken = b.ReplicationToken
@@ -1009,8 +1127,8 @@ func (a *ServerConfig) Merge(b *ServerConfig) *ServerConfig {
 	if b.RaftProtocol != 0 {
 		result.RaftProtocol = b.RaftProtocol
 	}
-	if b.NumSchedulers != 0 {
-		result.NumSchedulers = b.NumSchedulers
+	if b.NumSchedulers != nil {
+		result.NumSchedulers = helper.IntToPtr(*b.NumSchedulers)
 	}
 	if b.NodeGCThreshold != "" {
 		result.NodeGCThreshold = b.NodeGCThreshold
@@ -1027,8 +1145,14 @@ func (a *ServerConfig) Merge(b *ServerConfig) *ServerConfig {
 	if b.HeartbeatGrace != 0 {
 		result.HeartbeatGrace = b.HeartbeatGrace
 	}
+	if b.HeartbeatGraceHCL != "" {
+		result.HeartbeatGraceHCL = b.HeartbeatGraceHCL
+	}
 	if b.MinHeartbeatTTL != 0 {
 		result.MinHeartbeatTTL = b.MinHeartbeatTTL
+	}
+	if b.MinHeartbeatTTLHCL != "" {
+		result.MinHeartbeatTTLHCL = b.MinHeartbeatTTLHCL
 	}
 	if b.MaxHeartbeatsPerSecond != 0.0 {
 		result.MaxHeartbeatsPerSecond = b.MaxHeartbeatsPerSecond
@@ -1036,9 +1160,11 @@ func (a *ServerConfig) Merge(b *ServerConfig) *ServerConfig {
 	if b.RetryMaxAttempts != 0 {
 		result.RetryMaxAttempts = b.RetryMaxAttempts
 	}
-	if b.RetryInterval != "" {
+	if b.RetryInterval != 0 {
 		result.RetryInterval = b.RetryInterval
-		result.retryInterval = b.retryInterval
+	}
+	if b.RetryIntervalHCL != "" {
+		result.RetryIntervalHCL = b.RetryIntervalHCL
 	}
 	if b.RejoinAfterLeave {
 		result.RejoinAfterLeave = true
@@ -1054,6 +1180,9 @@ func (a *ServerConfig) Merge(b *ServerConfig) *ServerConfig {
 	}
 	if b.EncryptKey != "" {
 		result.EncryptKey = b.EncryptKey
+	}
+	if b.ServerJoin != nil {
+		result.ServerJoin = result.ServerJoin.Merge(b.ServerJoin)
 	}
 
 	// Add the schedulers
@@ -1118,6 +1247,9 @@ func (a *ClientConfig) Merge(b *ClientConfig) *ClientConfig {
 	if b.GCInterval != 0 {
 		result.GCInterval = b.GCInterval
 	}
+	if b.GCIntervalHCL != "" {
+		result.GCIntervalHCL = b.GCIntervalHCL
+	}
 	if b.GCParallelDestroys != 0 {
 		result.GCParallelDestroys = b.GCParallelDestroys
 	}
@@ -1133,6 +1265,10 @@ func (a *ClientConfig) Merge(b *ClientConfig) *ClientConfig {
 	// NoHostUUID defaults to true, merge if false
 	if b.NoHostUUID != nil {
 		result.NoHostUUID = b.NoHostUUID
+	}
+
+	if b.DisableRemoteExec {
+		result.DisableRemoteExec = b.DisableRemoteExec
 	}
 
 	// Add the servers
@@ -1160,6 +1296,10 @@ func (a *ClientConfig) Merge(b *ClientConfig) *ClientConfig {
 	}
 	for k, v := range b.ChrootEnv {
 		result.ChrootEnv[k] = v
+	}
+
+	if b.ServerJoin != nil {
+		result.ServerJoin = result.ServerJoin.Merge(b.ServerJoin)
 	}
 
 	return &result
@@ -1251,6 +1391,18 @@ func (a *Telemetry) Merge(b *Telemetry) *Telemetry {
 		result.BackwardsCompatibleMetrics = b.BackwardsCompatibleMetrics
 	}
 
+	if b.PrefixFilter != nil {
+		result.PrefixFilter = b.PrefixFilter
+	}
+
+	if b.FilterDefault != nil {
+		result.FilterDefault = b.FilterDefault
+	}
+
+	if b.DisableDispatchedJobSummaryMetrics {
+		result.DisableDispatchedJobSummaryMetrics = b.DisableDispatchedJobSummaryMetrics
+	}
+
 	return &result
 }
 
@@ -1313,20 +1465,15 @@ func (r *Resources) Merge(b *Resources) *Resources {
 	if b.DiskMB != 0 {
 		result.DiskMB = b.DiskMB
 	}
-	if b.IOPS != 0 {
-		result.IOPS = b.IOPS
-	}
 	if b.ReservedPorts != "" {
 		result.ReservedPorts = b.ReservedPorts
-	}
-	if len(b.ParsedReservedPorts) != 0 {
-		result.ParsedReservedPorts = b.ParsedReservedPorts
 	}
 	return &result
 }
 
-// LoadConfig loads the configuration at the given path, regardless if
-// its a file or directory.
+// LoadConfig loads the configuration at the given path, regardless if its a file or
+// directory. Called for each -config to build up the runtime config value. Do not apply any
+// default values, defaults should be added once in DefaultConfig
 func LoadConfig(path string) (*Config, error) {
 	fi, err := os.Stat(path)
 	if err != nil {

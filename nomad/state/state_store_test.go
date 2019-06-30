@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	memdb "github.com/hashicorp/go-memdb"
+	"github.com/hashicorp/go-memdb"
 	"github.com/hashicorp/nomad/helper"
 	"github.com/hashicorp/nomad/helper/uuid"
 	"github.com/hashicorp/nomad/nomad/mock"
@@ -88,6 +88,7 @@ func TestStateStore_Blocking_MinQuery(t *testing.T) {
 	}
 }
 
+// COMPAT 0.11: Uses AllocUpdateRequest.Alloc
 // This test checks that:
 // 1) The job is denormalized
 // 2) Allocations are created
@@ -138,6 +139,101 @@ func TestStateStore_UpsertPlanResults_AllocationsCreated_Denormalized(t *testing
 	assert.Nil(err)
 	assert.NotNil(evalOut)
 	assert.EqualValues(1000, evalOut.ModifyIndex)
+}
+
+// This test checks that:
+// 1) The job is denormalized
+// 2) Allocations are denormalized and updated with the diff
+// That stopped allocs Job is unmodified
+func TestStateStore_UpsertPlanResults_AllocationsDenormalized(t *testing.T) {
+	state := testStateStore(t)
+	alloc := mock.Alloc()
+	job := alloc.Job
+	alloc.Job = nil
+
+	stoppedAlloc := mock.Alloc()
+	stoppedAlloc.Job = job
+	stoppedAllocDiff := &structs.AllocationDiff{
+		ID:                 stoppedAlloc.ID,
+		DesiredDescription: "desired desc",
+		ClientStatus:       structs.AllocClientStatusLost,
+	}
+	preemptedAlloc := mock.Alloc()
+	preemptedAlloc.Job = job
+	preemptedAllocDiff := &structs.AllocationDiff{
+		ID:                    preemptedAlloc.ID,
+		PreemptedByAllocation: alloc.ID,
+	}
+
+	require := require.New(t)
+	require.NoError(state.UpsertAllocs(900, []*structs.Allocation{stoppedAlloc, preemptedAlloc}))
+	require.NoError(state.UpsertJob(999, job))
+
+	// modify job and ensure that stopped and preempted alloc point to original Job
+	mJob := job.Copy()
+	mJob.TaskGroups[0].Name = "other"
+
+	require.NoError(state.UpsertJob(1001, mJob))
+
+	eval := mock.Eval()
+	eval.JobID = job.ID
+
+	// Create an eval
+	require.NoError(state.UpsertEvals(1, []*structs.Evaluation{eval}))
+
+	// Create a plan result
+	res := structs.ApplyPlanResultsRequest{
+		AllocUpdateRequest: structs.AllocUpdateRequest{
+			AllocsUpdated: []*structs.Allocation{alloc},
+			AllocsStopped: []*structs.AllocationDiff{stoppedAllocDiff},
+			Job:           mJob,
+		},
+		EvalID:          eval.ID,
+		AllocsPreempted: []*structs.AllocationDiff{preemptedAllocDiff},
+	}
+	assert := assert.New(t)
+	planModifyIndex := uint64(1000)
+	err := state.UpsertPlanResults(planModifyIndex, &res)
+	require.NoError(err)
+
+	ws := memdb.NewWatchSet()
+	out, err := state.AllocByID(ws, alloc.ID)
+	require.NoError(err)
+	assert.Equal(alloc, out)
+
+	outJob, err := state.JobByID(ws, job.Namespace, job.ID)
+	require.NoError(err)
+	require.Equal(mJob.TaskGroups, outJob.TaskGroups)
+	require.NotEmpty(job.TaskGroups, outJob.TaskGroups)
+
+	updatedStoppedAlloc, err := state.AllocByID(ws, stoppedAlloc.ID)
+	require.NoError(err)
+	assert.Equal(stoppedAllocDiff.DesiredDescription, updatedStoppedAlloc.DesiredDescription)
+	assert.Equal(structs.AllocDesiredStatusStop, updatedStoppedAlloc.DesiredStatus)
+	assert.Equal(stoppedAllocDiff.ClientStatus, updatedStoppedAlloc.ClientStatus)
+	assert.Equal(planModifyIndex, updatedStoppedAlloc.AllocModifyIndex)
+	assert.Equal(planModifyIndex, updatedStoppedAlloc.AllocModifyIndex)
+	assert.Equal(job.TaskGroups, updatedStoppedAlloc.Job.TaskGroups)
+
+	updatedPreemptedAlloc, err := state.AllocByID(ws, preemptedAlloc.ID)
+	require.NoError(err)
+	assert.Equal(structs.AllocDesiredStatusEvict, updatedPreemptedAlloc.DesiredStatus)
+	assert.Equal(preemptedAllocDiff.PreemptedByAllocation, updatedPreemptedAlloc.PreemptedByAllocation)
+	assert.Equal(planModifyIndex, updatedPreemptedAlloc.AllocModifyIndex)
+	assert.Equal(planModifyIndex, updatedPreemptedAlloc.AllocModifyIndex)
+	assert.Equal(job.TaskGroups, updatedPreemptedAlloc.Job.TaskGroups)
+
+	index, err := state.Index("allocs")
+	require.NoError(err)
+	assert.EqualValues(planModifyIndex, index)
+
+	require.False(watchFired(ws))
+
+	evalOut, err := state.EvalByID(ws, eval.ID)
+	require.NoError(err)
+	require.NotNil(evalOut)
+	assert.EqualValues(planModifyIndex, evalOut.ModifyIndex)
+
 }
 
 // This test checks that the deployment is created and allocations count towards
@@ -244,6 +340,88 @@ func TestStateStore_UpsertPlanResults_Deployment(t *testing.T) {
 	assert.EqualValues(1001, evalOut.ModifyIndex)
 }
 
+// This test checks that:
+// 1) Preempted allocations in plan results are updated
+// 2) Evals are inserted for preempted jobs
+func TestStateStore_UpsertPlanResults_PreemptedAllocs(t *testing.T) {
+	require := require.New(t)
+
+	state := testStateStore(t)
+	alloc := mock.Alloc()
+	job := alloc.Job
+	alloc.Job = nil
+
+	// Insert job
+	err := state.UpsertJob(999, job)
+	require.NoError(err)
+
+	// Create an eval
+	eval := mock.Eval()
+	eval.JobID = job.ID
+	err = state.UpsertEvals(1, []*structs.Evaluation{eval})
+	require.NoError(err)
+
+	// Insert alloc that will be preempted in the plan
+	preemptedAlloc := mock.Alloc()
+	err = state.UpsertAllocs(2, []*structs.Allocation{preemptedAlloc})
+	require.NoError(err)
+
+	minimalPreemptedAlloc := &structs.Allocation{
+		ID:                    preemptedAlloc.ID,
+		PreemptedByAllocation: alloc.ID,
+		ModifyTime:            time.Now().Unix(),
+	}
+
+	// Create eval for preempted job
+	eval2 := mock.Eval()
+	eval2.JobID = preemptedAlloc.JobID
+
+	// Create a plan result
+	res := structs.ApplyPlanResultsRequest{
+		AllocUpdateRequest: structs.AllocUpdateRequest{
+			Alloc: []*structs.Allocation{alloc},
+			Job:   job,
+		},
+		EvalID:          eval.ID,
+		NodePreemptions: []*structs.Allocation{minimalPreemptedAlloc},
+		PreemptionEvals: []*structs.Evaluation{eval2},
+	}
+
+	err = state.UpsertPlanResults(1000, &res)
+	require.NoError(err)
+
+	ws := memdb.NewWatchSet()
+
+	// Verify alloc and eval created by plan
+	out, err := state.AllocByID(ws, alloc.ID)
+	require.NoError(err)
+	require.Equal(alloc, out)
+
+	index, err := state.Index("allocs")
+	require.NoError(err)
+	require.EqualValues(1000, index)
+
+	evalOut, err := state.EvalByID(ws, eval.ID)
+	require.NoError(err)
+	require.NotNil(evalOut)
+	require.EqualValues(1000, evalOut.ModifyIndex)
+
+	// Verify preempted alloc
+	preempted, err := state.AllocByID(ws, preemptedAlloc.ID)
+	require.NoError(err)
+	require.Equal(preempted.DesiredStatus, structs.AllocDesiredStatusEvict)
+	require.Equal(preempted.DesiredDescription, fmt.Sprintf("Preempted by alloc ID %v", alloc.ID))
+	require.Equal(preempted.Job.ID, preemptedAlloc.Job.ID)
+	require.Equal(preempted.Job, preemptedAlloc.Job)
+
+	// Verify eval for preempted job
+	preemptedJobEval, err := state.EvalByID(ws, eval2.ID)
+	require.NoError(err)
+	require.NotNil(preemptedJobEval)
+	require.EqualValues(1000, preemptedJobEval.ModifyIndex)
+
+}
+
 // This test checks that deployment updates are applied correctly
 func TestStateStore_UpsertPlanResults_DeploymentUpdates(t *testing.T) {
 	state := testStateStore(t)
@@ -333,7 +511,7 @@ func TestStateStore_UpsertDeployment(t *testing.T) {
 
 	// Create a watchset so we can test that upsert fires the watch
 	ws := memdb.NewWatchSet()
-	_, err := state.DeploymentsByJobID(ws, deployment.Namespace, deployment.ID)
+	_, err := state.DeploymentsByJobID(ws, deployment.Namespace, deployment.ID, true)
 	if err != nil {
 		t.Fatalf("bad: %v", err)
 	}
@@ -367,6 +545,43 @@ func TestStateStore_UpsertDeployment(t *testing.T) {
 	if watchFired(ws) {
 		t.Fatalf("bad")
 	}
+}
+
+// Tests that deployments of older create index and same job id are not returned
+func TestStateStore_OldDeployment(t *testing.T) {
+	state := testStateStore(t)
+	job := mock.Job()
+	job.ID = "job1"
+	state.UpsertJob(1000, job)
+
+	deploy1 := mock.Deployment()
+	deploy1.JobID = job.ID
+	deploy1.JobCreateIndex = job.CreateIndex
+
+	deploy2 := mock.Deployment()
+	deploy2.JobID = job.ID
+	deploy2.JobCreateIndex = 11
+
+	require := require.New(t)
+
+	// Insert both deployments
+	err := state.UpsertDeployment(1001, deploy1)
+	require.Nil(err)
+
+	err = state.UpsertDeployment(1002, deploy2)
+	require.Nil(err)
+
+	ws := memdb.NewWatchSet()
+	// Should return both deployments
+	deploys, err := state.DeploymentsByJobID(ws, deploy1.Namespace, job.ID, true)
+	require.Nil(err)
+	require.Len(deploys, 2)
+
+	// Should only return deploy1
+	deploys, err = state.DeploymentsByJobID(ws, deploy1.Namespace, job.ID, false)
+	require.Nil(err)
+	require.Len(deploys, 1)
+	require.Equal(deploy1.ID, deploys[0].ID)
 }
 
 func TestStateStore_DeleteDeployment(t *testing.T) {
@@ -551,54 +766,45 @@ func TestStateStore_DeploymentsByIDPrefix(t *testing.T) {
 }
 
 func TestStateStore_UpsertNode_Node(t *testing.T) {
+	require := require.New(t)
 	state := testStateStore(t)
 	node := mock.Node()
 
 	// Create a watchset so we can test that upsert fires the watch
 	ws := memdb.NewWatchSet()
 	_, err := state.NodeByID(ws, node.ID)
-	if err != nil {
-		t.Fatalf("bad: %v", err)
-	}
+	require.NoError(err)
 
-	err = state.UpsertNode(1000, node)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	if !watchFired(ws) {
-		t.Fatalf("bad")
-	}
+	require.NoError(state.UpsertNode(1000, node))
+	require.True(watchFired(ws))
 
 	ws = memdb.NewWatchSet()
 	out, err := state.NodeByID(ws, node.ID)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
+	require.NoError(err)
 
 	out2, err := state.NodeBySecretID(ws, node.SecretID)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-
-	if !reflect.DeepEqual(node, out2) {
-		t.Fatalf("bad: %#v %#v", node, out2)
-	}
-
-	if !reflect.DeepEqual(node, out) {
-		t.Fatalf("bad: %#v %#v", node, out)
-	}
+	require.NoError(err)
+	require.EqualValues(node, out)
+	require.EqualValues(node, out2)
+	require.Len(out.Events, 1)
+	require.Equal(NodeRegisterEventRegistered, out.Events[0].Message)
 
 	index, err := state.Index("nodes")
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	if index != 1000 {
-		t.Fatalf("bad: %d", index)
-	}
+	require.NoError(err)
+	require.EqualValues(1000, index)
+	require.False(watchFired(ws))
 
-	if watchFired(ws) {
-		t.Fatalf("bad")
-	}
+	// Transition the node to down and then up and ensure we get a re-register
+	// event
+	down := out.Copy()
+	down.Status = structs.NodeStatusDown
+	require.NoError(state.UpsertNode(1001, down))
+	require.NoError(state.UpsertNode(1002, out))
+
+	out, err = state.NodeByID(ws, node.ID)
+	require.NoError(err)
+	require.Len(out.Events, 2)
+	require.Equal(NodeRegisterEventReregistered, out.Events[1].Message)
 }
 
 func TestStateStore_DeleteNode_Node(t *testing.T) {
@@ -649,53 +855,39 @@ func TestStateStore_DeleteNode_Node(t *testing.T) {
 }
 
 func TestStateStore_UpdateNodeStatus_Node(t *testing.T) {
+	require := require.New(t)
 	state := testStateStore(t)
 	node := mock.Node()
 
-	err := state.UpsertNode(800, node)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
+	require.NoError(state.UpsertNode(800, node))
 
 	// Create a watchset so we can test that update node status fires the watch
 	ws := memdb.NewWatchSet()
-	if _, err := state.NodeByID(ws, node.ID); err != nil {
-		t.Fatalf("bad: %v", err)
+	_, err := state.NodeByID(ws, node.ID)
+	require.NoError(err)
+
+	event := &structs.NodeEvent{
+		Message:   "Node ready foo",
+		Subsystem: structs.NodeEventSubsystemCluster,
+		Timestamp: time.Now(),
 	}
 
-	err = state.UpdateNodeStatus(801, node.ID, structs.NodeStatusReady)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-
-	if !watchFired(ws) {
-		t.Fatalf("bad")
-	}
+	require.NoError(state.UpdateNodeStatus(801, node.ID, structs.NodeStatusReady, 70, event))
+	require.True(watchFired(ws))
 
 	ws = memdb.NewWatchSet()
 	out, err := state.NodeByID(ws, node.ID)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-
-	if out.Status != structs.NodeStatusReady {
-		t.Fatalf("bad: %#v", out)
-	}
-	if out.ModifyIndex != 801 {
-		t.Fatalf("bad: %#v", out)
-	}
+	require.NoError(err)
+	require.Equal(structs.NodeStatusReady, out.Status)
+	require.EqualValues(801, out.ModifyIndex)
+	require.EqualValues(70, out.StatusUpdatedAt)
+	require.Len(out.Events, 2)
+	require.Equal(event.Message, out.Events[1].Message)
 
 	index, err := state.Index("nodes")
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	if index != 801 {
-		t.Fatalf("bad: %d", index)
-	}
-
-	if watchFired(ws) {
-		t.Fatalf("bad")
-	}
+	require.NoError(err)
+	require.EqualValues(801, index)
+	require.False(watchFired(ws))
 }
 
 func TestStateStore_BatchUpdateNodeDrain(t *testing.T) {
@@ -726,7 +918,17 @@ func TestStateStore_BatchUpdateNodeDrain(t *testing.T) {
 		},
 	}
 
-	require.Nil(state.BatchUpdateNodeDrain(1002, update))
+	event := &structs.NodeEvent{
+		Message:   "Drain strategy enabled",
+		Subsystem: structs.NodeEventSubsystemDrain,
+		Timestamp: time.Now(),
+	}
+	events := map[string]*structs.NodeEvent{
+		n1.ID: event,
+		n2.ID: event,
+	}
+
+	require.Nil(state.BatchUpdateNodeDrain(1002, 7, update, events))
 	require.True(watchFired(ws))
 
 	ws = memdb.NewWatchSet()
@@ -736,7 +938,9 @@ func TestStateStore_BatchUpdateNodeDrain(t *testing.T) {
 		require.True(out.Drain)
 		require.NotNil(out.DrainStrategy)
 		require.Equal(out.DrainStrategy, expectedDrain)
+		require.Len(out.Events, 2)
 		require.EqualValues(1002, out.ModifyIndex)
+		require.EqualValues(7, out.StatusUpdatedAt)
 	}
 
 	index, err := state.Index("nodes")
@@ -763,7 +967,12 @@ func TestStateStore_UpdateNodeDrain_Node(t *testing.T) {
 		},
 	}
 
-	require.Nil(state.UpdateNodeDrain(1001, node.ID, expectedDrain, false))
+	event := &structs.NodeEvent{
+		Message:   "Drain strategy enabled",
+		Subsystem: structs.NodeEventSubsystemDrain,
+		Timestamp: time.Now(),
+	}
+	require.Nil(state.UpdateNodeDrain(1001, node.ID, expectedDrain, false, 7, event))
 	require.True(watchFired(ws))
 
 	ws = memdb.NewWatchSet()
@@ -772,7 +981,9 @@ func TestStateStore_UpdateNodeDrain_Node(t *testing.T) {
 	require.True(out.Drain)
 	require.NotNil(out.DrainStrategy)
 	require.Equal(out.DrainStrategy, expectedDrain)
+	require.Len(out.Events, 2)
 	require.EqualValues(1001, out.ModifyIndex)
+	require.EqualValues(7, out.StatusUpdatedAt)
 
 	index, err := state.Index("nodes")
 	require.Nil(err)
@@ -792,7 +1003,7 @@ func TestStateStore_AddSingleNodeEvent(t *testing.T) {
 
 	require.Equal(1, len(node.Events))
 	require.Equal(structs.NodeEventSubsystemCluster, node.Events[0].Subsystem)
-	require.Equal("Node Registered", node.Events[0].Message)
+	require.Equal(NodeRegisterEventRegistered, node.Events[0].Message)
 
 	// Create a watchset so we can test that AddNodeEvent fires the watch
 	ws := memdb.NewWatchSet()
@@ -834,7 +1045,7 @@ func TestStateStore_NodeEvents_RetentionWindow(t *testing.T) {
 	}
 	require.Equal(1, len(node.Events))
 	require.Equal(structs.NodeEventSubsystemCluster, node.Events[0].Subsystem)
-	require.Equal("Node Registered", node.Events[0].Message)
+	require.Equal(NodeRegisterEventRegistered, node.Events[0].Message)
 
 	var out *structs.Node
 	for i := 1; i <= 20; i++ {
@@ -886,11 +1097,21 @@ func TestStateStore_UpdateNodeDrain_ResetEligiblity(t *testing.T) {
 		},
 	}
 
-	require.Nil(state.UpdateNodeDrain(1001, node.ID, drain, false))
+	event1 := &structs.NodeEvent{
+		Message:   "Drain strategy enabled",
+		Subsystem: structs.NodeEventSubsystemDrain,
+		Timestamp: time.Now(),
+	}
+	require.Nil(state.UpdateNodeDrain(1001, node.ID, drain, false, 7, event1))
 	require.True(watchFired(ws))
 
 	// Remove the drain
-	require.Nil(state.UpdateNodeDrain(1002, node.ID, nil, true))
+	event2 := &structs.NodeEvent{
+		Message:   "Drain strategy disabled",
+		Subsystem: structs.NodeEventSubsystemDrain,
+		Timestamp: time.Now(),
+	}
+	require.Nil(state.UpdateNodeDrain(1002, node.ID, nil, true, 9, event2))
 
 	ws = memdb.NewWatchSet()
 	out, err := state.NodeByID(ws, node.ID)
@@ -898,7 +1119,9 @@ func TestStateStore_UpdateNodeDrain_ResetEligiblity(t *testing.T) {
 	require.False(out.Drain)
 	require.Nil(out.DrainStrategy)
 	require.Equal(out.SchedulingEligibility, structs.NodeSchedulingEligible)
+	require.Len(out.Events, 3)
 	require.EqualValues(1002, out.ModifyIndex)
+	require.EqualValues(9, out.StatusUpdatedAt)
 
 	index, err := state.Index("nodes")
 	require.Nil(err)
@@ -924,14 +1147,22 @@ func TestStateStore_UpdateNodeEligibility(t *testing.T) {
 		t.Fatalf("bad: %v", err)
 	}
 
-	require.Nil(state.UpdateNodeEligibility(1001, node.ID, expectedEligibility))
+	event := &structs.NodeEvent{
+		Message:   "Node marked as ineligible",
+		Subsystem: structs.NodeEventSubsystemCluster,
+		Timestamp: time.Now(),
+	}
+	require.Nil(state.UpdateNodeEligibility(1001, node.ID, expectedEligibility, 7, event))
 	require.True(watchFired(ws))
 
 	ws = memdb.NewWatchSet()
 	out, err := state.NodeByID(ws, node.ID)
 	require.Nil(err)
 	require.Equal(out.SchedulingEligibility, expectedEligibility)
+	require.Len(out.Events, 2)
+	require.Equal(out.Events[1], event)
 	require.EqualValues(1001, out.ModifyIndex)
+	require.EqualValues(7, out.StatusUpdatedAt)
 
 	index, err := state.Index("nodes")
 	require.Nil(err)
@@ -944,10 +1175,10 @@ func TestStateStore_UpdateNodeEligibility(t *testing.T) {
 			Deadline: -1 * time.Second,
 		},
 	}
-	require.Nil(state.UpdateNodeDrain(1002, node.ID, expectedDrain, false))
+	require.Nil(state.UpdateNodeDrain(1002, node.ID, expectedDrain, false, 7, nil))
 
 	// Try to set the node to eligible
-	err = state.UpdateNodeEligibility(1003, node.ID, structs.NodeSchedulingEligible)
+	err = state.UpdateNodeEligibility(1003, node.ID, structs.NodeSchedulingEligible, 9, nil)
 	require.NotNil(err)
 	require.Contains(err.Error(), "while it is draining")
 }
@@ -1341,41 +1572,6 @@ func TestStateStore_UpdateUpsertJob_PeriodicJob(t *testing.T) {
 
 }
 
-// This test ensures that UpsertJob creates the EphemeralDisk is a job doesn't have
-// one and clear out the task's disk resource asks
-// COMPAT 0.4.1 -> 0.5
-func TestStateStore_UpsertJob_NoEphemeralDisk(t *testing.T) {
-	state := testStateStore(t)
-	job := mock.Job()
-
-	// Set the EphemeralDisk to nil and set the tasks's DiskMB to 150
-	job.TaskGroups[0].EphemeralDisk = nil
-	job.TaskGroups[0].Tasks[0].Resources.DiskMB = 150
-
-	err := state.UpsertJob(1000, job)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-
-	ws := memdb.NewWatchSet()
-	out, err := state.JobByID(ws, job.Namespace, job.ID)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-
-	// Expect the state store to create the EphemeralDisk and clear out Tasks's
-	// DiskMB
-	expected := job.Copy()
-	expected.TaskGroups[0].EphemeralDisk = &structs.EphemeralDisk{
-		SizeMB: 150,
-	}
-	expected.TaskGroups[0].Tasks[0].Resources.DiskMB = 0
-
-	if !reflect.DeepEqual(expected, out) {
-		t.Fatalf("bad: %#v %#v", expected, out)
-	}
-}
-
 func TestStateStore_UpsertJob_BadNamespace(t *testing.T) {
 	assert := assert.New(t)
 	state := testStateStore(t)
@@ -1601,6 +1797,75 @@ func TestStateStore_DeleteJob_Job(t *testing.T) {
 	if watchFired(ws) {
 		t.Fatalf("bad")
 	}
+}
+
+func TestStateStore_DeleteJobTxn_BatchDeletes(t *testing.T) {
+	state := testStateStore(t)
+
+	const testJobCount = 10
+	const jobVersionCount = 4
+
+	stateIndex := uint64(1000)
+
+	jobs := make([]*structs.Job, testJobCount)
+	for i := 0; i < testJobCount; i++ {
+		stateIndex++
+		job := mock.BatchJob()
+
+		err := state.UpsertJob(stateIndex, job)
+		require.NoError(t, err)
+
+		jobs[i] = job
+
+		// Create some versions
+		for vi := 1; vi < jobVersionCount; vi++ {
+			stateIndex++
+
+			job := job.Copy()
+			job.TaskGroups[0].Tasks[0].Env = map[string]string{
+				"Version": fmt.Sprintf("%d", vi),
+			}
+
+			require.NoError(t, state.UpsertJob(stateIndex, job))
+		}
+	}
+
+	ws := memdb.NewWatchSet()
+
+	// Sanity check that jobs are present in DB
+	job, err := state.JobByID(ws, jobs[0].Namespace, jobs[0].ID)
+	require.NoError(t, err)
+	require.Equal(t, jobs[0].ID, job.ID)
+
+	jobVersions, err := state.JobVersionsByID(ws, jobs[0].Namespace, jobs[0].ID)
+	require.NoError(t, err)
+	require.Equal(t, jobVersionCount, len(jobVersions))
+
+	// Actually delete
+	const deletionIndex = uint64(10001)
+	err = state.WithWriteTransaction(func(txn Txn) error {
+		for i, job := range jobs {
+			err := state.DeleteJobTxn(deletionIndex, job.Namespace, job.ID, txn)
+			require.NoError(t, err, "failed at %d %e", i, err)
+		}
+		return nil
+	})
+	assert.NoError(t, err)
+
+	assert.True(t, watchFired(ws))
+
+	ws = memdb.NewWatchSet()
+	out, err := state.JobByID(ws, jobs[0].Namespace, jobs[0].ID)
+	require.NoError(t, err)
+	require.Nil(t, out)
+
+	jobVersions, err = state.JobVersionsByID(ws, jobs[0].Namespace, jobs[0].ID)
+	require.NoError(t, err)
+	require.Empty(t, jobVersions)
+
+	index, err := state.Index("jobs")
+	require.NoError(t, err)
+	require.Equal(t, deletionIndex, index)
 }
 
 func TestStateStore_DeleteJob_MultipleVersions(t *testing.T) {
@@ -2107,45 +2372,6 @@ func TestStateStore_RestoreJob(t *testing.T) {
 	}
 
 	if !reflect.DeepEqual(out, job) {
-		t.Fatalf("Bad: %#v %#v", out, job)
-	}
-}
-
-// This test ensures that the state restore creates the EphemeralDisk for a job if
-// it doesn't have one
-// COMPAT 0.4.1 -> 0.5
-func TestStateStore_Jobs_NoEphemeralDisk(t *testing.T) {
-	state := testStateStore(t)
-	job := mock.Job()
-
-	// Set EphemeralDisk to nil and set the DiskMB to 150
-	job.TaskGroups[0].EphemeralDisk = nil
-	job.TaskGroups[0].Tasks[0].Resources.DiskMB = 150
-
-	restore, err := state.Restore()
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-
-	err = restore.JobRestore(job)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	restore.Commit()
-
-	ws := memdb.NewWatchSet()
-	out, err := state.JobByID(ws, job.Namespace, job.ID)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-
-	// Expect job to have local disk and clear out the task's disk resource ask
-	expected := job.Copy()
-	expected.TaskGroups[0].EphemeralDisk = &structs.EphemeralDisk{
-		SizeMB: 150,
-	}
-	expected.TaskGroups[0].Tasks[0].Resources.DiskMB = 0
-	if !reflect.DeepEqual(out, expected) {
 		t.Fatalf("Bad: %#v %#v", out, job)
 	}
 }
@@ -3614,6 +3840,8 @@ func TestStateStore_UpdateAllocsFromClient_DeploymentStateMerges(t *testing.T) {
 	require.Nil(err)
 	require.NotNil(out)
 	require.True(out.DeploymentStatus.Canary)
+	require.NotNil(out.DeploymentStatus.Healthy)
+	require.True(*out.DeploymentStatus.Healthy)
 }
 
 func TestStateStore_UpsertAlloc_Alloc(t *testing.T) {
@@ -3749,34 +3977,6 @@ func TestStateStore_UpsertAlloc_No_Job(t *testing.T) {
 	err := state.UpsertAllocs(999, []*structs.Allocation{alloc})
 	if err == nil || !strings.Contains(err.Error(), "without a job") {
 		t.Fatalf("expect err: %v", err)
-	}
-}
-
-func TestStateStore_UpsertAlloc_NoEphemeralDisk(t *testing.T) {
-	state := testStateStore(t)
-	alloc := mock.Alloc()
-	alloc.Job.TaskGroups[0].EphemeralDisk = nil
-	alloc.Job.TaskGroups[0].Tasks[0].Resources.DiskMB = 120
-
-	if err := state.UpsertJob(999, alloc.Job); err != nil {
-		t.Fatalf("err: %v", err)
-	}
-
-	err := state.UpsertAllocs(1000, []*structs.Allocation{alloc})
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-
-	ws := memdb.NewWatchSet()
-	out, err := state.AllocByID(ws, alloc.ID)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-
-	expected := alloc.Copy()
-	expected.Job.TaskGroups[0].EphemeralDisk = &structs.EphemeralDisk{SizeMB: 120}
-	if !reflect.DeepEqual(expected, out) {
-		t.Fatalf("bad: %#v %#v", expected, out)
 	}
 }
 
@@ -4292,6 +4492,95 @@ func TestStateStore_ReconcileJobSummary(t *testing.T) {
 	}
 }
 
+func TestStateStore_ReconcileParentJobSummary(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	state := testStateStore(t)
+
+	// Add a node
+	node := mock.Node()
+	state.UpsertNode(80, node)
+
+	// Make a parameterized job
+	job1 := mock.BatchJob()
+	job1.ID = "test"
+	job1.ParameterizedJob = &structs.ParameterizedJobConfig{
+		Payload: "random",
+	}
+	job1.TaskGroups[0].Count = 1
+	state.UpsertJob(100, job1)
+
+	// Make a child job
+	childJob := job1.Copy()
+	childJob.ID = job1.ID + "dispatch-23423423"
+	childJob.ParentID = job1.ID
+	childJob.Dispatched = true
+	childJob.Status = structs.JobStatusRunning
+
+	// Make some allocs for child job
+	alloc := mock.Alloc()
+	alloc.NodeID = node.ID
+	alloc.Job = childJob
+	alloc.JobID = childJob.ID
+	alloc.ClientStatus = structs.AllocClientStatusRunning
+
+	alloc2 := mock.Alloc()
+	alloc2.NodeID = node.ID
+	alloc2.Job = childJob
+	alloc2.JobID = childJob.ID
+	alloc2.ClientStatus = structs.AllocClientStatusFailed
+
+	require.Nil(state.UpsertJob(110, childJob))
+	require.Nil(state.UpsertAllocs(111, []*structs.Allocation{alloc, alloc2}))
+
+	// Make the summary incorrect in the state store
+	summary, err := state.JobSummaryByID(nil, job1.Namespace, job1.ID)
+	require.Nil(err)
+
+	summary.Children = nil
+	summary.Summary = make(map[string]structs.TaskGroupSummary)
+	summary.Summary["web"] = structs.TaskGroupSummary{
+		Queued: 1,
+	}
+
+	// Delete the child job summary
+	state.DeleteJobSummary(125, childJob.Namespace, childJob.ID)
+
+	state.ReconcileJobSummaries(120)
+
+	ws := memdb.NewWatchSet()
+
+	// Verify parent summary is corrected
+	summary, _ = state.JobSummaryByID(ws, alloc.Namespace, job1.ID)
+	expectedSummary := structs.JobSummary{
+		JobID:     job1.ID,
+		Namespace: job1.Namespace,
+		Summary:   make(map[string]structs.TaskGroupSummary),
+		Children: &structs.JobChildrenSummary{
+			Running: 1,
+		},
+		CreateIndex: 100,
+		ModifyIndex: 120,
+	}
+	require.Equal(&expectedSummary, summary)
+
+	// Verify child job summary is also correct
+	childSummary, _ := state.JobSummaryByID(ws, childJob.Namespace, childJob.ID)
+	expectedChildSummary := structs.JobSummary{
+		JobID:     childJob.ID,
+		Namespace: childJob.Namespace,
+		Summary: map[string]structs.TaskGroupSummary{
+			"web": {
+				Running: 1,
+				Failed:  1,
+			},
+		},
+		CreateIndex: 110,
+		ModifyIndex: 120,
+	}
+	require.Equal(&expectedChildSummary, childSummary)
+}
+
 func TestStateStore_UpdateAlloc_JobNotPresent(t *testing.T) {
 	state := testStateStore(t)
 
@@ -4768,43 +5057,6 @@ func TestStateStore_RestoreAlloc(t *testing.T) {
 
 	if !reflect.DeepEqual(out, alloc) {
 		t.Fatalf("Bad: %#v %#v", out, alloc)
-	}
-
-	if watchFired(ws) {
-		t.Fatalf("bad")
-	}
-}
-
-func TestStateStore_RestoreAlloc_NoEphemeralDisk(t *testing.T) {
-	state := testStateStore(t)
-	alloc := mock.Alloc()
-	alloc.Job.TaskGroups[0].EphemeralDisk = nil
-	alloc.Job.TaskGroups[0].Tasks[0].Resources.DiskMB = 120
-
-	restore, err := state.Restore()
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-
-	err = restore.AllocRestore(alloc)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-
-	restore.Commit()
-
-	ws := memdb.NewWatchSet()
-	out, err := state.AllocByID(ws, alloc.ID)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-
-	expected := alloc.Copy()
-	expected.Job.TaskGroups[0].EphemeralDisk = &structs.EphemeralDisk{SizeMB: 120}
-	expected.Job.TaskGroups[0].Tasks[0].Resources.DiskMB = 0
-
-	if !reflect.DeepEqual(out, expected) {
-		t.Fatalf("Bad: %#v %#v", out, expected)
 	}
 
 	if watchFired(ws) {
@@ -5596,7 +5848,15 @@ func TestStateStore_UpsertDeploymentPromotion_Unhealthy(t *testing.T) {
 	c2.DeploymentID = d.ID
 	d.TaskGroups[c2.TaskGroup].PlacedCanaries = append(d.TaskGroups[c2.TaskGroup].PlacedCanaries, c2.ID)
 
-	require.Nil(state.UpsertAllocs(3, []*structs.Allocation{c1, c2}))
+	// Create a healthy but terminal alloc
+	c3 := mock.Alloc()
+	c3.JobID = j.ID
+	c3.DeploymentID = d.ID
+	c3.DesiredStatus = structs.AllocDesiredStatusStop
+	c3.DeploymentStatus = &structs.AllocDeploymentStatus{Healthy: helper.BoolToPtr(true)}
+	d.TaskGroups[c3.TaskGroup].PlacedCanaries = append(d.TaskGroups[c3.TaskGroup].PlacedCanaries, c3.ID)
+
+	require.Nil(state.UpsertAllocs(3, []*structs.Allocation{c1, c2, c3}))
 
 	// Promote the canaries
 	req := &structs.ApplyDeploymentPromoteRequest{
@@ -6815,6 +7075,33 @@ func TestStateStore_RestoreACLToken(t *testing.T) {
 	assert.Equal(t, token, out)
 }
 
+func TestStateStore_SchedulerConfig(t *testing.T) {
+	state := testStateStore(t)
+	schedConfig := &structs.SchedulerConfiguration{
+		PreemptionConfig: structs.PreemptionConfig{
+			SystemSchedulerEnabled: false,
+		},
+		CreateIndex: 100,
+		ModifyIndex: 200,
+	}
+
+	require := require.New(t)
+	restore, err := state.Restore()
+
+	require.Nil(err)
+
+	err = restore.SchedulerConfigRestore(schedConfig)
+	require.Nil(err)
+
+	restore.Commit()
+
+	modIndex, out, err := state.SchedulerConfig()
+	require.Nil(err)
+	require.Equal(schedConfig.ModifyIndex, modIndex)
+
+	require.Equal(schedConfig, out)
+}
+
 func TestStateStore_Abandon(t *testing.T) {
 	s := testStateStore(t)
 	abandonCh := s.AbandonCh()
@@ -6824,6 +7111,125 @@ func TestStateStore_Abandon(t *testing.T) {
 	default:
 		t.Fatalf("bad")
 	}
+}
+
+// Verifies that an error is returned when an allocation doesn't exist in the state store.
+func TestStateSnapshot_DenormalizeAllocationDiffSlice_AllocDoesNotExist(t *testing.T) {
+	state := testStateStore(t)
+	alloc := mock.Alloc()
+	require := require.New(t)
+
+	// Insert job
+	err := state.UpsertJob(999, alloc.Job)
+	require.NoError(err)
+
+	allocDiffs := []*structs.AllocationDiff{
+		{
+			ID: alloc.ID,
+		},
+	}
+
+	snap, err := state.Snapshot()
+	require.NoError(err)
+
+	denormalizedAllocs, err := snap.DenormalizeAllocationDiffSlice(allocDiffs)
+
+	require.EqualError(err, fmt.Sprintf("alloc %v doesn't exist", alloc.ID))
+	require.Nil(denormalizedAllocs)
+}
+
+// TestStateStore_SnapshotAfter_OK asserts StateStore.SnapshotAfter blocks
+// until the StateStore's latest index is >= the requested index.
+func TestStateStore_SnapshotAfter_OK(t *testing.T) {
+	t.Parallel()
+
+	s := testStateStore(t)
+	index, err := s.LatestIndex()
+	require.NoError(t, err)
+
+	node := mock.Node()
+	require.NoError(t, s.UpsertNode(index+1, node))
+
+	// Assert SnapshotAfter returns immediately if index < latest index
+	ctx, cancel := context.WithTimeout(context.Background(), 0)
+	snap, err := s.SnapshotAfter(ctx, index)
+	cancel()
+	require.NoError(t, err)
+
+	snapIndex, err := snap.LatestIndex()
+	require.NoError(t, err)
+	if snapIndex <= index {
+		require.Fail(t, "snapshot index should be greater than index")
+	}
+
+	// Assert SnapshotAfter returns immediately if index == latest index
+	ctx, cancel = context.WithTimeout(context.Background(), 0)
+	snap, err = s.SnapshotAfter(ctx, index+1)
+	cancel()
+	require.NoError(t, err)
+
+	snapIndex, err = snap.LatestIndex()
+	require.NoError(t, err)
+	require.Equal(t, snapIndex, index+1)
+
+	// Assert SnapshotAfter blocks if index > latest index
+	errCh := make(chan error, 1)
+	ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	go func() {
+		defer close(errCh)
+		waitIndex := index + 2
+		snap, err := s.SnapshotAfter(ctx, waitIndex)
+		if err != nil {
+			errCh <- err
+			return
+		}
+
+		snapIndex, err := snap.LatestIndex()
+		if err != nil {
+			errCh <- err
+			return
+		}
+
+		if snapIndex < waitIndex {
+			errCh <- fmt.Errorf("snapshot index < wait index: %d < %d", snapIndex, waitIndex)
+			return
+		}
+	}()
+
+	select {
+	case err := <-errCh:
+		require.NoError(t, err)
+	case <-time.After(500 * time.Millisecond):
+		// Let it block for a bit before unblocking by upserting
+	}
+
+	node.Name = "hal"
+	require.NoError(t, s.UpsertNode(index+2, node))
+
+	select {
+	case err := <-errCh:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "timed out waiting for SnapshotAfter to unblock")
+	}
+}
+
+// TestStateStore_SnapshotAfter_Timeout asserts StateStore.SnapshotAfter
+// returns an error if the desired index is not reached within the deadline.
+func TestStateStore_SnapshotAfter_Timeout(t *testing.T) {
+	t.Parallel()
+
+	s := testStateStore(t)
+	index, err := s.LatestIndex()
+	require.NoError(t, err)
+
+	// Assert SnapshotAfter blocks if index > latest index
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	snap, err := s.SnapshotAfter(ctx, index+1)
+	require.EqualError(t, err, context.DeadlineExceeded.Error())
+	require.Nil(t, snap)
 }
 
 // watchFired is a helper for unit tests that returns if the given watch set

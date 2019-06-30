@@ -1,10 +1,12 @@
-import { none } from '@ember/object/computed';
 import { computed } from '@ember/object';
+import { alias, none, and } from '@ember/object/computed';
 import Fragment from 'ember-data-model-fragments/fragment';
 import attr from 'ember-data/attr';
 import { fragment, fragmentOwner, fragmentArray } from 'ember-data-model-fragments/attributes';
 
 export default Fragment.extend({
+  allocation: fragmentOwner(),
+
   name: attr('string'),
   state: attr('string'),
   startedAt: attr('date'),
@@ -12,11 +14,20 @@ export default Fragment.extend({
   failed: attr('boolean'),
 
   isActive: none('finishedAt'),
+  isRunning: and('isActive', 'allocation.isRunning'),
 
-  allocation: fragmentOwner(),
   task: computed('allocation.taskGroup.tasks.[]', function() {
     const tasks = this.get('allocation.taskGroup.tasks');
-    return tasks && tasks.findBy('name', this.get('name'));
+    return tasks && tasks.findBy('name', this.name);
+  }),
+
+  driver: alias('task.driver'),
+
+  // TaskState represents a task running on a node, so in addition to knowing the
+  // driver via the task, the health of the driver is also known via the node
+  driverStatus: computed('task.driver', 'allocation.node.drivers.[]', function() {
+    const nodeDrivers = this.get('allocation.node.drivers') || [];
+    return nodeDrivers.findBy('name', this.get('task.driver'));
   }),
 
   resources: fragment('resources'),
@@ -30,6 +41,10 @@ export default Fragment.extend({
       failed: 'is-error',
     };
 
-    return classMap[this.get('state')] || 'is-dark';
+    return classMap[this.state] || 'is-dark';
   }),
+
+  restart() {
+    return this.allocation.restart(this.name);
+  },
 });

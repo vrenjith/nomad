@@ -8,10 +8,14 @@ const JOB_TYPES = ['service', 'batch', 'system'];
 const JOB_STATUSES = ['pending', 'running', 'dead'];
 
 export default Factory.extend({
-  id: i => `job-${i}`,
-  name: i => `${faker.list.random(...JOB_PREFIXES)()}-${faker.hacker.noun().dasherize()}-${i}`,
+  id: i =>
+    `${faker.list.random(...JOB_PREFIXES)()}-${faker.hacker.noun().dasherize()}-${i}`.toLowerCase(),
 
-  groupsCount: () => faker.random.number({ min: 1, max: 5 }),
+  name() {
+    return this.id;
+  },
+
+  groupsCount: () => faker.random.number({ min: 1, max: 2 }),
 
   region: () => 'global',
   type: faker.list.random(...JOB_TYPES),
@@ -23,7 +27,7 @@ export default Factory.extend({
     faker.list.random(...DATACENTERS)
   ),
 
-  childrenCount: () => faker.random.number({ min: 1, max: 5 }),
+  childrenCount: () => faker.random.number({ min: 1, max: 2 }),
 
   periodic: trait({
     type: 'batch',
@@ -63,6 +67,8 @@ export default Factory.extend({
     // It is the Parameterized job's responsibility to create
     // parameterizedChild jobs and provide a parent job.
     type: 'batch',
+    parameterized: true,
+    dispatched: true,
     payload: window.btoa(faker.lorem.sentence()),
   }),
 
@@ -80,6 +86,9 @@ export default Factory.extend({
   // When true, deployments for the job will always have a 'running' status
   activeDeployment: false,
 
+  // When true, the job will have no versions or deployments (and in turn no latest deployment)
+  noDeployments: false,
+
   // When true, an evaluation with a high modify index and placement failures is created
   failedPlacements: false,
 
@@ -88,6 +97,9 @@ export default Factory.extend({
 
   // When true, allocations for this job will fail and reschedule, randomly succeeding or not
   withRescheduling: false,
+
+  // When true, only task groups and allocations are made
+  shallow: false,
 
   afterCreate(job, server) {
     if (!job.namespaceId) {
@@ -106,6 +118,7 @@ export default Factory.extend({
       job,
       createAllocations: job.createAllocations,
       withRescheduling: job.withRescheduling,
+      shallow: job.shallow,
     });
 
     job.update({
@@ -113,7 +126,7 @@ export default Factory.extend({
       task_group_ids: groups.mapBy('id'),
     });
 
-    const hasChildren = job.periodic || job.parameterized;
+    const hasChildren = job.periodic || (job.parameterized && !job.parentId);
     const jobSummary = server.create('job-summary', hasChildren ? 'withChildren' : 'withSummary', {
       groupNames: groups.mapBy('name'),
       job,
@@ -127,44 +140,48 @@ export default Factory.extend({
       job_summary_id: jobSummary.id,
     });
 
-    Array(faker.random.number({ min: 1, max: 10 }))
-      .fill(null)
-      .map((_, index) => {
-        return server.create('job-version', {
-          job,
-          namespace: job.namespace,
-          version: index,
-          noActiveDeployment: job.noActiveDeployment,
-          activeDeployment: job.activeDeployment,
+    if (!job.noDeployments) {
+      Array(faker.random.number({ min: 1, max: 3 }))
+        .fill(null)
+        .map((_, index) => {
+          return server.create('job-version', {
+            job,
+            namespace: job.namespace,
+            version: index,
+            noActiveDeployment: job.noActiveDeployment,
+            activeDeployment: job.activeDeployment,
+          });
         });
-      });
-
-    const knownEvaluationProperties = {
-      job,
-      namespace: job.namespace,
-    };
-    server.createList(
-      'evaluation',
-      faker.random.number({ min: 1, max: 5 }),
-      knownEvaluationProperties
-    );
-    if (!job.noFailedPlacements) {
-      server.createList(
-        'evaluation',
-        faker.random.number(3),
-        'withPlacementFailures',
-        knownEvaluationProperties
-      );
     }
 
-    if (job.failedPlacements) {
-      server.create(
+    if (!job.shallow) {
+      const knownEvaluationProperties = {
+        job,
+        namespace: job.namespace,
+      };
+      server.createList(
         'evaluation',
-        'withPlacementFailures',
-        assign(knownEvaluationProperties, {
-          modifyIndex: 4000,
-        })
+        faker.random.number({ min: 1, max: 5 }),
+        knownEvaluationProperties
       );
+      if (!job.noFailedPlacements) {
+        server.createList(
+          'evaluation',
+          faker.random.number(3),
+          'withPlacementFailures',
+          knownEvaluationProperties
+        );
+      }
+
+      if (job.failedPlacements) {
+        server.create(
+          'evaluation',
+          'withPlacementFailures',
+          assign(knownEvaluationProperties, {
+            modifyIndex: 4000,
+          })
+        );
+      }
     }
 
     if (job.periodic) {
@@ -174,16 +191,18 @@ export default Factory.extend({
         namespaceId: job.namespaceId,
         namespace: job.namespace,
         createAllocations: job.createAllocations,
+        shallow: job.shallow,
       });
     }
 
-    if (job.parameterized) {
+    if (job.parameterized && !job.parentId) {
       // Create parameterizedChild jobs
       server.createList('job', job.childrenCount, 'parameterizedChild', {
         parentId: job.id,
         namespaceId: job.namespaceId,
         namespace: job.namespace,
         createAllocations: job.createAllocations,
+        shallow: job.shallow,
       });
     }
   },

@@ -2,8 +2,9 @@ import Ember from 'ember';
 import Response from 'ember-cli-mirage/response';
 import { HOSTS } from './common';
 import { logFrames, logEncode } from './data/logs';
-
-const { copy } = Ember;
+import { generateDiff } from './factories/job-version';
+import { generateTaskGroupFailures } from './factories/evaluation';
+import { copy } from 'ember-copy';
 
 export function findLeader(schema) {
   const agent = schema.agents.first();
@@ -45,15 +46,57 @@ export default function() {
       const json = this.serialize(jobs.all());
       const namespace = queryParams.namespace || 'default';
       return json
-        .filter(
-          job =>
-            namespace === 'default'
-              ? !job.NamespaceID || job.NamespaceID === namespace
-              : job.NamespaceID === namespace
+        .filter(job =>
+          namespace === 'default'
+            ? !job.NamespaceID || job.NamespaceID === namespace
+            : job.NamespaceID === namespace
         )
         .map(job => filterKeys(job, 'TaskGroups', 'NamespaceID'));
     })
   );
+
+  this.post('/jobs', function(schema, req) {
+    const body = JSON.parse(req.requestBody);
+
+    if (!body.Job) return new Response(400, {}, 'Job is a required field on the request payload');
+
+    return okEmpty();
+  });
+
+  this.post('/jobs/parse', function(schema, req) {
+    const body = JSON.parse(req.requestBody);
+
+    if (!body.JobHCL)
+      return new Response(400, {}, 'JobHCL is a required field on the request payload');
+    if (!body.Canonicalize) return new Response(400, {}, 'Expected Canonicalize to be true');
+
+    // Parse the name out of the first real line of HCL to match IDs in the new job record
+    // Regex expectation:
+    //   in:  job "job-name" {
+    //   out: job-name
+    const nameFromHCLBlock = /.+?"(.+?)"/;
+    const jobName = body.JobHCL.trim()
+      .split('\n')[0]
+      .match(nameFromHCLBlock)[1];
+
+    const job = server.create('job', { id: jobName });
+    return new Response(200, {}, this.serialize(job));
+  });
+
+  this.post('/job/:id/plan', function(schema, req) {
+    const body = JSON.parse(req.requestBody);
+
+    if (!body.Job) return new Response(400, {}, 'Job is a required field on the request payload');
+    if (!body.Diff) return new Response(400, {}, 'Expected Diff to be true');
+
+    const FailedTGAllocs = body.Job.Unschedulable && generateFailedTGAllocs(body.Job);
+
+    return new Response(
+      200,
+      {},
+      JSON.stringify({ FailedTGAllocs, Diff: generateDiff(req.params.id) })
+    );
+  });
 
   this.get(
     '/job/:id',
@@ -70,6 +113,14 @@ export default function() {
       return job ? this.serialize(job) : new Response(404, {}, null);
     })
   );
+
+  this.post('/job/:id', function(schema, req) {
+    const body = JSON.parse(req.requestBody);
+
+    if (!body.Job) return new Response(400, {}, 'Job is a required field on the request payload');
+
+    return okEmpty();
+  });
 
   this.get(
     '/job/:id/summary',
@@ -90,6 +141,11 @@ export default function() {
     return this.serialize(deployments.where({ jobId: params.id }));
   });
 
+  this.get('/job/:id/deployment', function({ deployments }, { params }) {
+    const deployment = deployments.where({ jobId: params.id }).models[0];
+    return deployment ? this.serialize(deployment) : new Response(200, {}, 'null');
+  });
+
   this.post('/job/:id/periodic/force', function(schema, { params }) {
     // Create the child job
     const parent = schema.jobs.find(params.id);
@@ -102,8 +158,7 @@ export default function() {
       createAllocations: parent.createAllocations,
     });
 
-    // Return bogus, since the response is normally just eval information
-    return new Response(200, {}, '{}');
+    return okEmpty();
   });
 
   this.delete('/job/:id', function(schema, { params }) {
@@ -113,6 +168,9 @@ export default function() {
   });
 
   this.get('/deployment/:id');
+  this.post('/deployment/promote/:id', function() {
+    return new Response(204, {}, '');
+  });
 
   this.get('/job/:id/evaluations', function({ evaluations }, { params }) {
     return this.serialize(evaluations.where({ jobId: params.id }));
@@ -142,6 +200,10 @@ export default function() {
 
   this.get('/allocation/:id');
 
+  this.post('/allocation/:id/stop', function() {
+    return new Response(204, {}, '');
+  });
+
   this.get('/namespaces', function({ namespaces }) {
     const records = namespaces.all();
 
@@ -160,8 +222,10 @@ export default function() {
     return new Response(501, {}, null);
   });
 
-  this.get('/agent/members', function({ agents }) {
+  this.get('/agent/members', function({ agents, regions }) {
+    const firstRegion = regions.first();
     return {
+      ServerRegion: firstRegion ? firstRegion.id : null,
       Members: this.serialize(agents.all()),
     };
   });
@@ -217,6 +281,10 @@ export default function() {
     return new Response(403, {}, null);
   });
 
+  this.get('/regions', function({ regions }) {
+    return this.serialize(regions.all());
+  });
+
   const clientAllocationStatsHandler = function({ clientAllocationStats }, { params }) {
     return this.serialize(clientAllocationStats.find(params.id));
   };
@@ -237,11 +305,25 @@ export default function() {
   };
 
   // Client requests are available on the server and the client
+  this.put('/client/allocation/:id/restart', function() {
+    return new Response(204, {}, '');
+  });
+
   this.get('/client/allocation/:id/stats', clientAllocationStatsHandler);
   this.get('/client/fs/logs/:allocation_id', clientAllocationLog);
 
-  this.get('/client/v1/client/stats', function({ clientStats }, { queryParams }) {
-    return this.serialize(clientStats.find(queryParams.node_id));
+  this.get('/client/stats', function({ clientStats }, { queryParams }) {
+    const seed = Math.random();
+    if (seed > 0.8) {
+      const stats = clientStats.find(queryParams.node_id);
+      stats.update({
+        timestamp: Date.now() * 1000000,
+        CPUTicksConsumed: stats.CPUTicksConsumed + (Math.random() * 20 - 10),
+      });
+      return this.serialize(stats);
+    } else {
+      return new Response(500, {}, null);
+    }
   });
 
   // TODO: in the future, this hack may be replaceable with dynamic host name
@@ -264,4 +346,23 @@ function filterKeys(object, ...keys) {
   });
 
   return clone;
+}
+
+// An empty response but not a 204 No Content. This is still a valid JSON
+// response that represents a payload with no worthwhile data.
+function okEmpty() {
+  return new Response(200, {}, '{}');
+}
+
+function generateFailedTGAllocs(job, taskGroups) {
+  const taskGroupsFromSpec = job.TaskGroups && job.TaskGroups.mapBy('Name');
+
+  let tgNames = ['tg-one', 'tg-two'];
+  if (taskGroupsFromSpec && taskGroupsFromSpec.length) tgNames = taskGroupsFromSpec;
+  if (taskGroups && taskGroups.length) tgNames = taskGroups;
+
+  return tgNames.reduce((hash, tgName) => {
+    hash[tgName] = generateTaskGroupFailures();
+    return hash;
+  }, {});
 }

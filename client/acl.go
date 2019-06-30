@@ -70,38 +70,43 @@ func (c *cachedACLValue) Age() time.Duration {
 // ResolveToken is used to translate an ACL Token Secret ID into
 // an ACL object, nil if ACLs are disabled, or an error.
 func (c *Client) ResolveToken(secretID string) (*acl.ACL, error) {
+	a, _, err := c.resolveTokenAndACL(secretID)
+	return a, err
+}
+
+func (c *Client) resolveTokenAndACL(secretID string) (*acl.ACL, *structs.ACLToken, error) {
 	// Fast-path if ACLs are disabled
 	if !c.config.ACLEnabled {
-		return nil, nil
+		return nil, nil, nil
 	}
 	defer metrics.MeasureSince([]string{"client", "acl", "resolve_token"}, time.Now())
 
 	// Resolve the token value
 	token, err := c.resolveTokenValue(secretID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if token == nil {
-		return nil, structs.ErrTokenNotFound
+		return nil, nil, structs.ErrTokenNotFound
 	}
 
 	// Check if this is a management token
 	if token.Type == structs.ACLManagementToken {
-		return acl.ManagementACL, nil
+		return acl.ManagementACL, token, nil
 	}
 
 	// Resolve the policies
 	policies, err := c.resolvePolicies(token.SecretID, token.Policies)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Resolve the ACL object
 	aclObj, err := structs.CompileACLObject(c.aclCache, policies)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return aclObj, nil
+	return aclObj, token, nil
 }
 
 // resolveTokenValue is used to translate a secret ID into an ACL token with caching
@@ -134,7 +139,7 @@ func (c *Client) resolveTokenValue(secretID string) (*structs.ACLToken, error) {
 	if err := c.RPC("ACL.ResolveToken", &req, &resp); err != nil {
 		// If we encounter an error but have a cached value, mask the error and extend the cache
 		if ok {
-			c.logger.Printf("[WARN] client: failed to resolve token, using expired cached value: %v", err)
+			c.logger.Warn("failed to resolve token, using expired cached value", "error", err)
 			cached := raw.(*cachedACLValue)
 			return cached.Token, nil
 		}
@@ -198,7 +203,7 @@ func (c *Client) resolvePolicies(secretID string, policies []string) ([]*structs
 	if err := c.RPC("ACL.GetPolicies", &req, &resp); err != nil {
 		// If we encounter an error but have cached policies, mask the error and extend the cache
 		if len(missing) == 0 {
-			c.logger.Printf("[WARN] client: failed to resolve policies, using expired cached value: %v", err)
+			c.logger.Warn("failed to resolve policies, using expired cached value", "error", err)
 			out = append(out, expired...)
 			return out, nil
 		}

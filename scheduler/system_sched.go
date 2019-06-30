@@ -2,9 +2,9 @@ package scheduler
 
 import (
 	"fmt"
-	"log"
 
-	memdb "github.com/hashicorp/go-memdb"
+	log "github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/go-memdb"
 	"github.com/hashicorp/nomad/helper/uuid"
 	"github.com/hashicorp/nomad/nomad/structs"
 )
@@ -19,7 +19,7 @@ const (
 // SystemScheduler is used for 'system' jobs. This scheduler is
 // designed for services that should be run on every client.
 type SystemScheduler struct {
-	logger  *log.Logger
+	logger  log.Logger
 	state   State
 	planner Planner
 
@@ -41,9 +41,9 @@ type SystemScheduler struct {
 
 // NewSystemScheduler is a factory function to instantiate a new system
 // scheduler.
-func NewSystemScheduler(logger *log.Logger, state State, planner Planner) Scheduler {
+func NewSystemScheduler(logger log.Logger, state State, planner Planner) Scheduler {
 	return &SystemScheduler{
-		logger:  logger,
+		logger:  logger.Named("system_sched"),
 		state:   state,
 		planner: planner,
 	}
@@ -54,11 +54,14 @@ func (s *SystemScheduler) Process(eval *structs.Evaluation) error {
 	// Store the evaluation
 	s.eval = eval
 
+	// Update our logger with the eval's information
+	s.logger = s.logger.With("eval_id", eval.ID, "job_id", eval.JobID, "namespace", eval.Namespace)
+
 	// Verify the evaluation trigger reason is understood
 	switch eval.TriggeredBy {
-	case structs.EvalTriggerJobRegister, structs.EvalTriggerNodeUpdate,
-		structs.EvalTriggerJobDeregister, structs.EvalTriggerRollingUpdate,
-		structs.EvalTriggerDeploymentWatcher, structs.EvalTriggerNodeDrain:
+	case structs.EvalTriggerJobRegister, structs.EvalTriggerNodeUpdate, structs.EvalTriggerFailedFollowUp,
+		structs.EvalTriggerJobDeregister, structs.EvalTriggerRollingUpdate, structs.EvalTriggerPreemption,
+		structs.EvalTriggerDeploymentWatcher, structs.EvalTriggerNodeDrain, structs.EvalTriggerAllocStop:
 	default:
 		desc := fmt.Sprintf("scheduler cannot handle '%s' evaluation reason",
 			eval.TriggeredBy)
@@ -123,7 +126,7 @@ func (s *SystemScheduler) process() (bool, error) {
 
 	// Compute the target job allocations
 	if err := s.computeJobAllocs(); err != nil {
-		s.logger.Printf("[ERR] sched: %#v: %v", s.eval, err)
+		s.logger.Error("failed to compute job allocations", "error", err)
 		return false, err
 	}
 
@@ -138,10 +141,10 @@ func (s *SystemScheduler) process() (bool, error) {
 	if s.limitReached && s.nextEval == nil {
 		s.nextEval = s.eval.NextRollingEval(s.job.Update.Stagger)
 		if err := s.planner.CreateEval(s.nextEval); err != nil {
-			s.logger.Printf("[ERR] sched: %#v failed to make next eval for rolling update: %v", s.eval, err)
+			s.logger.Error("failed to make next eval for rolling update", "error", err)
 			return false, err
 		}
-		s.logger.Printf("[DEBUG] sched: %#v: rolling update limit reached, next eval '%s' created", s.eval, s.nextEval.ID)
+		s.logger.Debug("rolling update limit reached, next eval created", "next_eval_id", s.nextEval.ID)
 	}
 
 	// Submit the plan
@@ -157,7 +160,7 @@ func (s *SystemScheduler) process() (bool, error) {
 
 	// If we got a state refresh, try again since we have stale data
 	if newState != nil {
-		s.logger.Printf("[DEBUG] sched: %#v: refresh forced", s.eval)
+		s.logger.Debug("refresh forced")
 		s.state = newState
 		return false, nil
 	}
@@ -165,8 +168,7 @@ func (s *SystemScheduler) process() (bool, error) {
 	// Try again if the plan was not fully committed, potential conflict
 	fullCommit, expected, actual := result.FullCommit(s.plan)
 	if !fullCommit {
-		s.logger.Printf("[DEBUG] sched: %#v: attempted %d placements, %d placed",
-			s.eval, expected, actual)
+		s.logger.Debug("plan didn't fully commit", "attempted", expected, "placed", actual)
 		return false, nil
 	}
 
@@ -201,22 +203,25 @@ func (s *SystemScheduler) computeJobAllocs() error {
 
 	// Diff the required and existing allocations
 	diff := diffSystemAllocs(s.job, s.nodes, tainted, allocs, terminalAllocs)
-	s.logger.Printf("[DEBUG] sched: %#v: %#v", s.eval, diff)
+	s.logger.Debug("reconciled current state with desired state",
+		"place", len(diff.place), "update", len(diff.update),
+		"migrate", len(diff.migrate), "stop", len(diff.stop),
+		"ignore", len(diff.ignore), "lost", len(diff.lost))
 
 	// Add all the allocs to stop
 	for _, e := range diff.stop {
-		s.plan.AppendUpdate(e.Alloc, structs.AllocDesiredStatusStop, allocNotNeeded, "")
+		s.plan.AppendStoppedAlloc(e.Alloc, allocNotNeeded, "")
 	}
 
 	// Add all the allocs to migrate
 	for _, e := range diff.migrate {
-		s.plan.AppendUpdate(e.Alloc, structs.AllocDesiredStatusStop, allocNodeTainted, "")
+		s.plan.AppendStoppedAlloc(e.Alloc, allocNodeTainted, "")
 	}
 
 	// Lost allocations should be transitioned to desired status stop and client
 	// status lost.
 	for _, e := range diff.lost {
-		s.plan.AppendUpdate(e.Alloc, structs.AllocDesiredStatusStop, allocLost, structs.AllocClientStatusLost)
+		s.plan.AppendStoppedAlloc(e.Alloc, allocLost, structs.AllocClientStatusLost)
 	}
 
 	// Attempt to do the upgrades in place
@@ -276,10 +281,13 @@ func (s *SystemScheduler) computePlacements(place []allocTuple) error {
 		s.stack.SetNodes(nodes)
 
 		// Attempt to match the task group
-		option, _ := s.stack.Select(missing.TaskGroup, nil)
+		option := s.stack.Select(missing.TaskGroup, nil)
 
 		if option == nil {
-			// If nodes were filtered because of constraint mismatches and we
+			// If the task can't be placed on this node, update reporting data
+			// and continue to short circuit the loop
+
+			// If this node was filtered because of constraint mismatches and we
 			// couldn't create an allocation then decrementing queued for that
 			// task group
 			if s.ctx.metrics.NodesFiltered > 0 {
@@ -292,54 +300,92 @@ func (s *SystemScheduler) computePlacements(place []allocTuple) error {
 					desired := s.plan.Annotations.DesiredTGUpdates[missing.TaskGroup.Name]
 					desired.Place -= 1
 				}
+
+				// Filtered nodes are not reported to users, just omitted from the job status
+				continue
 			}
 
-			// Check if this task group has already failed
+			// Check if this task group has already failed, reported to the user as a count
 			if metric, ok := s.failedTGAllocs[missing.TaskGroup.Name]; ok {
 				metric.CoalescedFailures += 1
 				continue
 			}
-		}
 
-		// Store the available nodes by datacenter
-		s.ctx.Metrics().NodesAvailable = s.nodesByDC
+			// Store the available nodes by datacenter
+			s.ctx.Metrics().NodesAvailable = s.nodesByDC
 
-		// Set fields based on if we found an allocation option
-		if option != nil {
-			// Create an allocation for this
-			alloc := &structs.Allocation{
-				ID:            uuid.Generate(),
-				Namespace:     s.job.Namespace,
-				EvalID:        s.eval.ID,
-				Name:          missing.Name,
-				JobID:         s.job.ID,
-				TaskGroup:     missing.TaskGroup.Name,
-				Metrics:       s.ctx.Metrics(),
-				NodeID:        option.Node.ID,
-				TaskResources: option.TaskResources,
-				DesiredStatus: structs.AllocDesiredStatusRun,
-				ClientStatus:  structs.AllocClientStatusPending,
+			// Compute top K scoring node metadata
+			s.ctx.Metrics().PopulateScoreMetaData()
 
-				SharedResources: &structs.Resources{
-					DiskMB: missing.TaskGroup.EphemeralDisk.SizeMB,
-				},
-			}
-
-			// If the new allocation is replacing an older allocation then we
-			// set the record the older allocation id so that they are chained
-			if missing.Alloc != nil {
-				alloc.PreviousAllocation = missing.Alloc.ID
-			}
-
-			s.plan.AppendAlloc(alloc)
-		} else {
 			// Lazy initialize the failed map
 			if s.failedTGAllocs == nil {
 				s.failedTGAllocs = make(map[string]*structs.AllocMetric)
 			}
 
+			// Actual failure to start this task on this candidate node, report it individually
 			s.failedTGAllocs[missing.TaskGroup.Name] = s.ctx.Metrics()
+			continue
 		}
+
+		// Store the available nodes by datacenter
+		s.ctx.Metrics().NodesAvailable = s.nodesByDC
+
+		// Compute top K scoring node metadata
+		s.ctx.Metrics().PopulateScoreMetaData()
+
+		// Set fields based on if we found an allocation option
+		resources := &structs.AllocatedResources{
+			Tasks: option.TaskResources,
+			Shared: structs.AllocatedSharedResources{
+				DiskMB: int64(missing.TaskGroup.EphemeralDisk.SizeMB),
+			},
+		}
+
+		// Create an allocation for this
+		alloc := &structs.Allocation{
+			ID:                 uuid.Generate(),
+			Namespace:          s.job.Namespace,
+			EvalID:             s.eval.ID,
+			Name:               missing.Name,
+			JobID:              s.job.ID,
+			TaskGroup:          missing.TaskGroup.Name,
+			Metrics:            s.ctx.Metrics(),
+			NodeID:             option.Node.ID,
+			NodeName:           option.Node.Name,
+			TaskResources:      resources.OldTaskResources(),
+			AllocatedResources: resources,
+			DesiredStatus:      structs.AllocDesiredStatusRun,
+			ClientStatus:       structs.AllocClientStatusPending,
+			SharedResources: &structs.Resources{
+				DiskMB: missing.TaskGroup.EphemeralDisk.SizeMB,
+			},
+		}
+
+		// If the new allocation is replacing an older allocation then we record the
+		// older allocation id so that they are chained
+		if missing.Alloc != nil {
+			alloc.PreviousAllocation = missing.Alloc.ID
+		}
+
+		// If this placement involves preemption, set DesiredState to evict for those allocations
+		if option.PreemptedAllocs != nil {
+			var preemptedAllocIDs []string
+			for _, stop := range option.PreemptedAllocs {
+				s.plan.AppendPreemptedAlloc(stop, alloc.ID)
+
+				preemptedAllocIDs = append(preemptedAllocIDs, stop.ID)
+				if s.eval.AnnotatePlan && s.plan.Annotations != nil {
+					s.plan.Annotations.PreemptedAllocs = append(s.plan.Annotations.PreemptedAllocs, stop.Stub())
+					if s.plan.Annotations.DesiredTGUpdates != nil {
+						desired := s.plan.Annotations.DesiredTGUpdates[missing.TaskGroup.Name]
+						desired.Preemptions += 1
+					}
+				}
+			}
+			alloc.PreemptedAllocations = preemptedAllocIDs
+		}
+
+		s.plan.AppendAlloc(alloc)
 	}
 
 	return nil

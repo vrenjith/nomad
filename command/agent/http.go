@@ -5,7 +5,6 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net"
 	"net/http"
 	"net/http/pprof"
@@ -16,6 +15,8 @@ import (
 
 	"github.com/NYTimes/gziphandler"
 	assetfs "github.com/elazarl/go-bindata-assetfs"
+	"github.com/gorilla/websocket"
+	log "github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/nomad/helper/tlsutil"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/rs/cors"
@@ -52,8 +53,10 @@ type HTTPServer struct {
 	mux        *http.ServeMux
 	listener   net.Listener
 	listenerCh chan struct{}
-	logger     *log.Logger
+	logger     log.Logger
 	Addr       string
+
+	wsUpgrader *websocket.Upgrader
 }
 
 // NewHTTPServer starts new HTTP server over the agent
@@ -70,15 +73,11 @@ func NewHTTPServer(agent *Agent, config *Config) (*HTTPServer, error) {
 
 	// If TLS is enabled, wrap the listener with a TLS listener
 	if config.TLSConfig.EnableHTTP {
-		tlsConf := &tlsutil.Config{
-			VerifyIncoming:       config.TLSConfig.VerifyHTTPSClient,
-			VerifyOutgoing:       true,
-			VerifyServerHostname: config.TLSConfig.VerifyServerHostname,
-			CAFile:               config.TLSConfig.CAFile,
-			CertFile:             config.TLSConfig.CertFile,
-			KeyFile:              config.TLSConfig.KeyFile,
-			KeyLoader:            config.TLSConfig.GetKeyLoader(),
+		tlsConf, err := tlsutil.NewTLSConfiguration(config.TLSConfig, config.TLSConfig.VerifyHTTPSClient, true)
+		if err != nil {
+			return nil, err
 		}
+
 		tlsConfig, err := tlsConf.IncomingTLSConfig()
 		if err != nil {
 			return nil, err
@@ -89,14 +88,20 @@ func NewHTTPServer(agent *Agent, config *Config) (*HTTPServer, error) {
 	// Create the mux
 	mux := http.NewServeMux()
 
+	wsUpgrader := &websocket.Upgrader{
+		ReadBufferSize:  2048,
+		WriteBufferSize: 2048,
+	}
+
 	// Create the server
 	srv := &HTTPServer{
 		agent:      agent,
 		mux:        mux,
 		listener:   ln,
 		listenerCh: make(chan struct{}),
-		logger:     agent.logger,
+		logger:     agent.httpLogger,
 		Addr:       ln.Addr().String(),
+		wsUpgrader: wsUpgrader,
 	}
 	srv.registerHandlers(config.EnableDebug)
 
@@ -134,7 +139,7 @@ func (ln tcpKeepAliveListener) Accept() (c net.Conn, err error) {
 // Shutdown is used to shutdown the HTTP server
 func (s *HTTPServer) Shutdown() {
 	if s != nil {
-		s.logger.Printf("[DEBUG] http: Shutting down http server")
+		s.logger.Debug("shutting down http server")
 		s.listener.Close()
 		<-s.listenerCh // block until http.Serve has returned.
 	}
@@ -196,6 +201,8 @@ func (s *HTTPServer) registerHandlers(enableDebug bool) {
 
 	s.mux.HandleFunc("/v1/system/gc", s.wrap(s.GarbageCollectRequest))
 	s.mux.HandleFunc("/v1/system/reconcile/summaries", s.wrap(s.ReconcileJobSummaries))
+
+	s.mux.HandleFunc("/v1/operator/scheduler/configuration", s.wrap(s.OperatorSchedulerConfiguration))
 
 	if uiEnabled {
 		s.mux.Handle("/ui/", http.StripPrefix("/ui/", handleUI(http.FileServer(&UIAssetWrapper{FileSystem: assetFS()}))))
@@ -282,14 +289,13 @@ func (s *HTTPServer) wrap(handler func(resp http.ResponseWriter, req *http.Reque
 		reqURL := req.URL.String()
 		start := time.Now()
 		defer func() {
-			s.logger.Printf("[DEBUG] http: Request %v %v (%v)", req.Method, reqURL, time.Now().Sub(start))
+			s.logger.Debug("request complete", "method", req.Method, "path", reqURL, "duration", time.Now().Sub(start))
 		}()
 		obj, err := handler(resp, req)
 
 		// Check for an error
 	HAS_ERR:
 		if err != nil {
-			s.logger.Printf("[ERR] http: Request %v, error: %v", reqURL, err)
 			code := 500
 			errMsg := err.Error()
 			if http, ok := err.(HTTPCodedError); ok {
@@ -307,6 +313,7 @@ func (s *HTTPServer) wrap(handler func(resp http.ResponseWriter, req *http.Reque
 
 			resp.WriteHeader(code)
 			resp.Write([]byte(errMsg))
+			s.logger.Error("request failed", "method", req.Method, "path", reqURL, "error", err, "code", code)
 			return
 		}
 

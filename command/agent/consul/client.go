@@ -3,9 +3,9 @@ package consul
 import (
 	"context"
 	"fmt"
-	"log"
 	"net"
 	"net/url"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,10 +13,12 @@ import (
 	"time"
 
 	metrics "github.com/armon/go-metrics"
+	log "github.com/hashicorp/go-hclog"
+
 	"github.com/hashicorp/consul/api"
-	cstructs "github.com/hashicorp/nomad/client/structs"
 	"github.com/hashicorp/nomad/helper"
 	"github.com/hashicorp/nomad/nomad/structs"
+	"github.com/hashicorp/nomad/plugins/drivers"
 )
 
 const (
@@ -27,6 +29,10 @@ const (
 	// nomadTaskPrefix is the prefix that scopes Nomad registered services
 	// for tasks.
 	nomadTaskPrefix = nomadServicePrefix + "-task-"
+
+	// nomadCheckPrefix is the prefix that scopes Nomad registered checks for
+	// services.
+	nomadCheckPrefix = nomadServicePrefix + "-check-"
 
 	// defaultRetryInterval is how quickly to retry syncing services and
 	// checks to Consul when an error occurs. Will backoff up to a max.
@@ -80,6 +86,15 @@ type AgentAPI interface {
 	ServiceRegister(service *api.AgentServiceRegistration) error
 	ServiceDeregister(serviceID string) error
 	UpdateTTL(id, output, status string) error
+}
+
+func agentServiceUpdateRequired(reg *api.AgentServiceRegistration, svc *api.AgentService) bool {
+	return !(reg.Kind == svc.Kind &&
+		reg.ID == svc.ID &&
+		reg.Port == svc.Port &&
+		reg.Address == svc.Address &&
+		reg.Name == svc.Service &&
+		reflect.DeepEqual(reg.Tags, svc.Tags))
 }
 
 // operations are submitted to the main loop via commit() for synchronizing
@@ -193,7 +208,7 @@ func (s *ServiceRegistration) copy() *ServiceRegistration {
 // ServiceClient handles task and agent service registration with Consul.
 type ServiceClient struct {
 	client           AgentAPI
-	logger           *log.Logger
+	logger           log.Logger
 	retryInterval    time.Duration
 	maxRetryInterval time.Duration
 	periodicInterval time.Duration
@@ -232,11 +247,18 @@ type ServiceClient struct {
 
 	// checkWatcher restarts checks that are unhealthy.
 	checkWatcher *checkWatcher
+
+	// isClientAgent specifies whether this Consul client is being used
+	// by a Nomad client.
+	isClientAgent bool
 }
 
 // NewServiceClient creates a new Consul ServiceClient from an existing Consul API
-// Client and logger.
-func NewServiceClient(consulClient AgentAPI, logger *log.Logger) *ServiceClient {
+// Client, logger and takes whether the client is being used by a Nomad Client agent.
+// When being used by a Nomad client, this Consul client reconciles all services and
+// checks created by Nomad on behalf of running tasks.
+func NewServiceClient(consulClient AgentAPI, logger log.Logger, isNomadClient bool) *ServiceClient {
+	logger = logger.ResetNamed("consul.sync")
 	return &ServiceClient{
 		client:             consulClient,
 		logger:             logger,
@@ -255,6 +277,7 @@ func NewServiceClient(consulClient AgentAPI, logger *log.Logger) *ServiceClient 
 		agentServices:      make(map[string]struct{}),
 		agentChecks:        make(map[string]struct{}),
 		checkWatcher:       newCheckWatcher(logger, consulClient),
+		isClientAgent:      isNomadClient,
 	}
 }
 
@@ -299,7 +322,7 @@ INIT:
 			c.merge(ops)
 		}
 	}
-	c.logger.Printf("[TRACE] consul.sync: able to contact Consul")
+	c.logger.Trace("able to contact Consul")
 
 	// Block until contact with Consul has been established
 	// Start checkWatcher
@@ -322,10 +345,10 @@ INIT:
 		if err := c.sync(); err != nil {
 			if failures == 0 {
 				// Log on the first failure
-				c.logger.Printf("[WARN] consul.sync: failed to update services in Consul: %v", err)
+				c.logger.Warn("failed to update services in Consul", "error", err)
 			} else if failures%10 == 0 {
 				// Log every 10th consecutive failure
-				c.logger.Printf("[ERR] consul.sync: still unable to update services in Consul after %d failures; latest error: %v", failures, err)
+				c.logger.Error("still unable to update services in Consul", "failures", failures, "error", err)
 			}
 
 			failures++
@@ -345,7 +368,7 @@ INIT:
 			retryTimer.Reset(backoff)
 		} else {
 			if failures > 0 {
-				c.logger.Printf("[INFO] consul.sync: successfully updated services in Consul")
+				c.logger.Info("successfully updated services in Consul")
 				failures = 0
 			}
 
@@ -433,7 +456,12 @@ func (c *ServiceClient) sync() error {
 			// Known service, skip
 			continue
 		}
-		if !isNomadService(id) {
+
+		// Ignore if this is not a Nomad managed service. Also ignore
+		// Nomad managed services if this is not a client agent.
+		// This is to prevent server agents from removing services
+		// registered by client agents
+		if !isNomadService(id) || !c.isClientAgent {
 			// Not managed by Nomad, skip
 			continue
 		}
@@ -452,16 +480,26 @@ func (c *ServiceClient) sync() error {
 		metrics.IncrCounter([]string{"client", "consul", "service_deregistrations"}, 1)
 	}
 
-	// Add Nomad services missing from Consul
+	// Add Nomad services missing from Consul, or where the service has been updated.
 	for id, locals := range c.services {
-		if _, ok := consulServices[id]; !ok {
-			if err = c.client.ServiceRegister(locals); err != nil {
-				metrics.IncrCounter([]string{"client", "consul", "sync_failure"}, 1)
-				return err
+		existingSvc, ok := consulServices[id]
+
+		if ok {
+			// There is an existing registration of this service in Consul, so here
+			// we validate to see if the service has been invalidated to see if it
+			// should be updated.
+			if !agentServiceUpdateRequired(locals, existingSvc) {
+				// No Need to update services that have not changed
+				continue
 			}
-			sreg++
-			metrics.IncrCounter([]string{"client", "consul", "service_registrations"}, 1)
 		}
+
+		if err = c.client.ServiceRegister(locals); err != nil {
+			metrics.IncrCounter([]string{"client", "consul", "sync_failure"}, 1)
+			return err
+		}
+		sreg++
+		metrics.IncrCounter([]string{"client", "consul", "service_registrations"}, 1)
 	}
 
 	// Remove Nomad checks in Consul but unknown locally
@@ -470,7 +508,12 @@ func (c *ServiceClient) sync() error {
 			// Known check, leave it
 			continue
 		}
-		if !isNomadService(check.ServiceID) {
+
+		// Ignore if this is not a Nomad managed check. Also ignore
+		// Nomad managed checks if this is not a client agent.
+		// This is to prevent server agents from removing checks
+		// registered by client agents
+		if !isNomadService(check.ServiceID) || !c.isClientAgent || !isNomadCheck(check.CheckID) {
 			// Service not managed by Nomad, skip
 			continue
 		}
@@ -514,8 +557,11 @@ func (c *ServiceClient) sync() error {
 		}
 	}
 
-	c.logger.Printf("[DEBUG] consul.sync: registered %d services, %d checks; deregistered %d services, %d checks",
-		sreg, creg, sdereg, cdereg)
+	// Only log if something was actually synced
+	if sreg > 0 || sdereg > 0 || creg > 0 || cdereg > 0 {
+		c.logger.Debug("sync complete", "registered_services", sreg, "deregistered_services", sdereg,
+			"registered_checks", creg, "deregistered_checks", cdereg)
+	}
 	return nil
 }
 
@@ -547,6 +593,10 @@ func (c *ServiceClient) RegisterAgent(role string, services []*structs.Service) 
 			Tags:    service.Tags,
 			Address: host,
 			Port:    port,
+			// This enables the consul UI to show that Nomad registered this service
+			Meta: map[string]string{
+				"external-source": "nomad",
+			},
 		}
 		ops.regServices = append(ops.regServices, serviceReg)
 
@@ -626,7 +676,7 @@ func (c *ServiceClient) serviceRegs(ops *operations, service *structs.Service, t
 
 	// Determine whether to use tags or canary_tags
 	var tags []string
-	if task.Canary {
+	if task.Canary && len(service.CanaryTags) > 0 {
 		tags = make([]string, len(service.CanaryTags))
 		copy(tags, service.CanaryTags)
 	} else {
@@ -641,6 +691,10 @@ func (c *ServiceClient) serviceRegs(ops *operations, service *structs.Service, t
 		Tags:    tags,
 		Address: ip,
 		Port:    port,
+		// This enables the consul UI to show that Nomad registered this service
+		Meta: map[string]string{
+			"external-source": "nomad",
+		},
 	}
 	ops.regServices = append(ops.regServices, serviceReg)
 
@@ -779,10 +833,10 @@ func (c *ServiceClient) UpdateTask(old, newTask *TaskServices) error {
 		newIDs[makeTaskServiceID(newTask.AllocID, newTask.Name, s, newTask.Canary)] = s
 	}
 
-	// Loop over existing Service IDs to see if they have been removed or
-	// updated.
+	// Loop over existing Service IDs to see if they have been removed
 	for existingID, existingSvc := range existingIDs {
 		newSvc, ok := newIDs[existingID]
+
 		if !ok {
 			// Existing service entry removed
 			ops.deregServices = append(ops.deregServices, existingID)
@@ -798,8 +852,12 @@ func (c *ServiceClient) UpdateTask(old, newTask *TaskServices) error {
 			continue
 		}
 
-		// Service exists and hasn't changed, don't re-add it later
-		delete(newIDs, existingID)
+		oldHash := existingSvc.Hash(old.AllocID, old.Name, old.Canary)
+		newHash := newSvc.Hash(newTask.AllocID, newTask.Name, newTask.Canary)
+		if oldHash == newHash {
+			// Service exists and hasn't changed, don't re-add it later
+			delete(newIDs, existingID)
+		}
 
 		// Service still exists so add it to the task's registration
 		sreg := &ServiceRegistration{
@@ -818,7 +876,8 @@ func (c *ServiceClient) UpdateTask(old, newTask *TaskServices) error {
 		for _, check := range newSvc.Checks {
 			checkID := makeCheckID(existingID, check)
 			if _, exists := existingChecks[checkID]; exists {
-				// Check exists, so don't remove it
+				// Check is still required. Remove it from the map so it doesn't get
+				// deleted later.
 				delete(existingChecks, checkID)
 				sreg.checkIDs[checkID] = struct{}{}
 			}
@@ -831,7 +890,6 @@ func (c *ServiceClient) UpdateTask(old, newTask *TaskServices) error {
 
 			for _, checkID := range newCheckIDs {
 				sreg.checkIDs[checkID] = struct{}{}
-
 			}
 
 			// Update all watched checks as CheckRestart fields aren't part of ID
@@ -982,12 +1040,12 @@ func (c *ServiceClient) Shutdown() error {
 	// deadline was reached
 	for id := range c.agentServices {
 		if err := c.client.ServiceDeregister(id); err != nil {
-			c.logger.Printf("[ERR] consul.sync: error deregistering agent service (id: %q): %v", id, err)
+			c.logger.Error("failed deregistering agent service", "service_id", id, "error", err)
 		}
 	}
 	for id := range c.agentChecks {
 		if err := c.client.CheckDeregister(id); err != nil {
-			c.logger.Printf("[ERR] consul.sync: error deregistering agent service (id: %q): %v", id, err)
+			c.logger.Error("failed deregistering agent check", "check_id", id, "error", err)
 		}
 	}
 
@@ -1049,17 +1107,18 @@ func makeAgentServiceID(role string, service *structs.Service) string {
 }
 
 // makeTaskServiceID creates a unique ID for identifying a task service in
-// Consul. All structs.Service fields are included in the ID's hash except
-// Checks. This allows updates to merely compare IDs.
+// Consul.
 //
-//	Example Service ID: _nomad-task-TNM333JKJPM5AK4FAS3VXQLXFDWOF4VH
+//	Example Service ID: _nomad-task-b4e61df9-b095-d64e-f241-23860da1375f-redis-http-http
 func makeTaskServiceID(allocID, taskName string, service *structs.Service, canary bool) string {
-	return nomadTaskPrefix + service.Hash(allocID, taskName, canary)
+	return fmt.Sprintf("%s%s-%s-%s-%s", nomadTaskPrefix, allocID, taskName, service.Name, service.PortLabel)
 }
 
 // makeCheckID creates a unique ID for a check.
+//
+//  Example Check ID: _nomad-check-434ae42f9a57c5705344974ac38de2aee0ee089d
 func makeCheckID(serviceID string, check *structs.ServiceCheck) string {
-	return check.Hash(serviceID)
+	return fmt.Sprintf("%s%s", nomadCheckPrefix, check.Hash(serviceID))
 }
 
 // createCheckReg creates a Check that can be registered with Consul.
@@ -1124,6 +1183,12 @@ func createCheckReg(serviceID, checkID string, check *structs.ServiceCheck, host
 	return &chkReg, nil
 }
 
+// isNomadCheck returns true if the ID matches the pattern of a Nomad managed
+// check.
+func isNomadCheck(id string) bool {
+	return strings.HasPrefix(id, nomadCheckPrefix)
+}
+
 // isNomadService returns true if the ID matches the pattern of a Nomad managed
 // service (new or old formats). Agent services return false as independent
 // client and server agents may be running on the same machine. #2827
@@ -1147,7 +1212,7 @@ func isOldNomadService(id string) bool {
 // getAddress returns the IP and port to use for a service or check. If no port
 // label is specified (an empty value), zero values are returned because no
 // address could be resolved.
-func getAddress(addrMode, portLabel string, networks structs.Networks, driverNet *cstructs.DriverNetwork) (string, int, error) {
+func getAddress(addrMode, portLabel string, networks structs.Networks, driverNet *drivers.DriverNetwork) (string, int, error) {
 	switch addrMode {
 	case structs.AddressModeAuto:
 		if driverNet.Advertise() {

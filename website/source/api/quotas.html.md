@@ -32,7 +32,7 @@ The table below shows this endpoint's support for
 ### Parameters
 
 - `prefix` `(string: "")`- Specifies a string to filter quota specifications on
-  based on an index prefix. This is specified as a querystring parameter.
+  based on an index prefix. This is specified as a query string parameter.
 
 ### Sample Request
 
@@ -61,7 +61,6 @@ $ curl \
         "RegionLimit": {
           "CPU": 2500,
           "DiskMB": 0,
-          "IOPS": 0,
           "MemoryMB": 2000,
           "Networks": null
         }
@@ -115,7 +114,6 @@ $ curl \
       "RegionLimit": {
         "CPU": 2500,
         "DiskMB": 0,
-        "IOPS": 0,
         "MemoryMB": 2000,
         "Networks": null
       }
@@ -230,7 +228,7 @@ The table below shows this endpoint's support for
 ### Parameters
 
 - `prefix` `(string: "")`- Specifies a string to filter quota specifications on
-  based on an index prefix. This is specified as a querystring parameter.
+  based on an index prefix. This is specified as a query string parameter.
 
 ### Sample Request
 
@@ -256,7 +254,6 @@ $ curl \
           "CPU": 500,
           "MemoryMB": 256,
           "DiskMB": 0,
-          "IOPS": 0,
           "Networks": null
         },
         "Hash": "NLOoV2WBU8ieJIrYXXx8NRb5C2xU61pVVWRDLEIMxlU="
@@ -308,7 +305,6 @@ $ curl \
         "CPU": 500,
         "MemoryMB": 256,
         "DiskMB": 0,
-        "IOPS": 0,
         "Networks": null
       },
       "Hash": "NLOoV2WBU8ieJIrYXXx8NRb5C2xU61pVVWRDLEIMxlU="

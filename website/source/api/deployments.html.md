@@ -28,8 +28,8 @@ The table below shows this endpoint's support for
 
 ### Parameters
 
-- `prefix` `(string: "")`- Specifies a string to filter deployments on based on
-  an index prefix. This is specified as a querystring parameter.
+- `prefix` `(string: "")`- Specifies a string to filter deployments based on
+  an index prefix. This is specified as a query string parameter.
 
 ### Sample Request
 
@@ -52,6 +52,7 @@ $ curl \
     "JobID": "example",
     "JobVersion": 1,
     "JobModifyIndex": 17,
+    "JobSpecModifyIndex": 17,
     "JobCreateIndex": 7,
     "TaskGroups": {
       "cache": {
@@ -108,6 +109,7 @@ $ curl \
   "JobID": "example",
   "JobVersion": 1,
   "JobModifyIndex": 17,
+  "JobSpecModifyIndex": 17,
   "JobCreateIndex": 7,
   "TaskGroups": {
     "cache": {

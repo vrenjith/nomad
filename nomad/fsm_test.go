@@ -3,7 +3,6 @@ package nomad
 import (
 	"bytes"
 	"fmt"
-	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -12,6 +11,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	memdb "github.com/hashicorp/go-memdb"
 	"github.com/hashicorp/nomad/helper"
+	"github.com/hashicorp/nomad/helper/testlog"
 	"github.com/hashicorp/nomad/helper/uuid"
 	"github.com/hashicorp/nomad/nomad/mock"
 	"github.com/hashicorp/nomad/nomad/state"
@@ -47,12 +47,13 @@ func testStateStore(t *testing.T) *state.StateStore {
 
 func testFSM(t *testing.T) *nomadFSM {
 	broker := testBroker(t, 0)
-	dispatcher, _ := testPeriodicDispatcher()
+	dispatcher, _ := testPeriodicDispatcher(t)
+	logger := testlog.HCLogger(t)
 	fsmConfig := &FSMConfig{
 		EvalBroker: broker,
 		Periodic:   dispatcher,
-		Blocked:    NewBlockedEvals(broker),
-		LogOutput:  os.Stderr,
+		Blocked:    NewBlockedEvals(broker, logger),
+		Logger:     logger,
 		Region:     "global",
 	}
 	fsm, err := NewFSM(fsmConfig)
@@ -249,6 +250,7 @@ func TestFSM_DeregisterNode(t *testing.T) {
 
 func TestFSM_UpdateNodeStatus(t *testing.T) {
 	t.Parallel()
+	require := require.New(t)
 	fsm := testFSM(t)
 	fsm.blockedEvals.SetEnabled(true)
 
@@ -257,43 +259,39 @@ func TestFSM_UpdateNodeStatus(t *testing.T) {
 		Node: node,
 	}
 	buf, err := structs.Encode(structs.NodeRegisterRequestType, req)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
+	require.NoError(err)
 
 	resp := fsm.Apply(makeLog(buf))
-	if resp != nil {
-		t.Fatalf("resp: %v", resp)
-	}
+	require.Nil(resp)
 
 	// Mark an eval as blocked.
 	eval := mock.Eval()
 	eval.ClassEligibility = map[string]bool{node.ComputedClass: true}
 	fsm.blockedEvals.Block(eval)
 
+	event := &structs.NodeEvent{
+		Message:   "Node ready foo",
+		Subsystem: structs.NodeEventSubsystemCluster,
+		Timestamp: time.Now(),
+	}
 	req2 := structs.NodeUpdateStatusRequest{
-		NodeID: node.ID,
-		Status: structs.NodeStatusReady,
+		NodeID:    node.ID,
+		Status:    structs.NodeStatusReady,
+		NodeEvent: event,
 	}
 	buf, err = structs.Encode(structs.NodeUpdateStatusRequestType, req2)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
+	require.NoError(err)
 
 	resp = fsm.Apply(makeLog(buf))
-	if resp != nil {
-		t.Fatalf("resp: %v", resp)
-	}
+	require.Nil(resp)
 
 	// Verify the status is ready.
 	ws := memdb.NewWatchSet()
 	node, err = fsm.State().NodeByID(ws, req.Node.ID)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	if node.Status != structs.NodeStatusReady {
-		t.Fatalf("bad node: %#v", node)
-	}
+	require.NoError(err)
+	require.Equal(structs.NodeStatusReady, node.Status)
+	require.Len(node.Events, 2)
+	require.Equal(event.Message, node.Events[1].Message)
 
 	// Verify the eval was unblocked.
 	testutil.WaitForResult(func() (bool, error) {
@@ -327,11 +325,19 @@ func TestFSM_BatchUpdateNodeDrain(t *testing.T) {
 			Deadline: 10 * time.Second,
 		},
 	}
+	event := &structs.NodeEvent{
+		Message:   "Drain strategy enabled",
+		Subsystem: structs.NodeEventSubsystemDrain,
+		Timestamp: time.Now(),
+	}
 	req2 := structs.BatchNodeUpdateDrainRequest{
 		Updates: map[string]*structs.DrainUpdate{
 			node.ID: {
 				DrainStrategy: strategy,
 			},
+		},
+		NodeEvents: map[string]*structs.NodeEvent{
+			node.ID: event,
 		},
 	}
 	buf, err = structs.Encode(structs.BatchNodeUpdateDrainRequestType, req2)
@@ -346,6 +352,7 @@ func TestFSM_BatchUpdateNodeDrain(t *testing.T) {
 	require.Nil(err)
 	require.True(node.Drain)
 	require.Equal(node.DrainStrategy, strategy)
+	require.Len(node.Events, 2)
 }
 
 func TestFSM_UpdateNodeDrain(t *testing.T) {
@@ -371,6 +378,11 @@ func TestFSM_UpdateNodeDrain(t *testing.T) {
 	req2 := structs.NodeUpdateDrainRequest{
 		NodeID:        node.ID,
 		DrainStrategy: strategy,
+		NodeEvent: &structs.NodeEvent{
+			Message:   "Drain strategy enabled",
+			Subsystem: structs.NodeEventSubsystemDrain,
+			Timestamp: time.Now(),
+		},
 	}
 	buf, err = structs.Encode(structs.NodeUpdateDrainRequestType, req2)
 	require.Nil(err)
@@ -384,6 +396,7 @@ func TestFSM_UpdateNodeDrain(t *testing.T) {
 	require.Nil(err)
 	require.True(node.Drain)
 	require.Equal(node.DrainStrategy, strategy)
+	require.Len(node.Events, 2)
 }
 
 func TestFSM_UpdateNodeDrain_Pre08_Compatibility(t *testing.T) {
@@ -436,10 +449,17 @@ func TestFSM_UpdateNodeEligibility(t *testing.T) {
 	resp := fsm.Apply(makeLog(buf))
 	require.Nil(resp)
 
+	event := &structs.NodeEvent{
+		Message:   "Node marked as ineligible",
+		Subsystem: structs.NodeEventSubsystemCluster,
+		Timestamp: time.Now(),
+	}
+
 	// Set the eligibility
 	req2 := structs.NodeUpdateEligibilityRequest{
 		NodeID:      node.ID,
 		Eligibility: structs.NodeSchedulingIneligible,
+		NodeEvent:   event,
 	}
 	buf, err = structs.Encode(structs.NodeUpdateEligibilityRequestType, req2)
 	require.Nil(err)
@@ -451,6 +471,8 @@ func TestFSM_UpdateNodeEligibility(t *testing.T) {
 	node, err = fsm.State().NodeByID(nil, req.Node.ID)
 	require.Nil(err)
 	require.Equal(node.SchedulingEligibility, structs.NodeSchedulingIneligible)
+	require.Len(node.Events, 2)
+	require.Equal(event.Message, node.Events[1].Message)
 
 	// Update the drain
 	strategy := &structs.DrainStrategy{
@@ -1152,6 +1174,7 @@ func TestFSM_UpsertAllocs(t *testing.T) {
 	fsm := testFSM(t)
 
 	alloc := mock.Alloc()
+	alloc.Resources = &structs.Resources{} // COMPAT(0.11): Remove in 0.11, used to bypass resource creation in state store
 	fsm.State().UpsertJobSummary(1, mock.JobSummary(alloc.JobID))
 	req := structs.AllocUpdateRequest{
 		Alloc: []*structs.Allocation{alloc},
@@ -1210,6 +1233,7 @@ func TestFSM_UpsertAllocs_SharedJob(t *testing.T) {
 	fsm := testFSM(t)
 
 	alloc := mock.Alloc()
+	alloc.Resources = &structs.Resources{} // COMPAT(0.11): Remove in 0.11, used to bypass resource creation in state store
 	fsm.State().UpsertJobSummary(1, mock.JobSummary(alloc.JobID))
 	job := alloc.Job
 	alloc.Job = nil
@@ -1239,9 +1263,7 @@ func TestFSM_UpsertAllocs_SharedJob(t *testing.T) {
 
 	// Job should be re-attached
 	alloc.Job = job
-	if !reflect.DeepEqual(alloc, out) {
-		t.Fatalf("bad: %#v %#v", alloc, out)
-	}
+	require.Equal(t, alloc, out)
 
 	// Ensure that the original job is used
 	evictAlloc := new(structs.Allocation)
@@ -1278,11 +1300,44 @@ func TestFSM_UpsertAllocs_SharedJob(t *testing.T) {
 	}
 }
 
+// COMPAT(0.11): Remove in 0.11
 func TestFSM_UpsertAllocs_StrippedResources(t *testing.T) {
 	t.Parallel()
 	fsm := testFSM(t)
 
 	alloc := mock.Alloc()
+	alloc.Resources = &structs.Resources{
+		CPU:      500,
+		MemoryMB: 256,
+		DiskMB:   150,
+		Networks: []*structs.NetworkResource{
+			{
+				Device:        "eth0",
+				IP:            "192.168.0.100",
+				ReservedPorts: []structs.Port{{Label: "admin", Value: 5000}},
+				MBits:         50,
+				DynamicPorts:  []structs.Port{{Label: "http"}},
+			},
+		},
+	}
+	alloc.TaskResources = map[string]*structs.Resources{
+		"web": {
+			CPU:      500,
+			MemoryMB: 256,
+			Networks: []*structs.NetworkResource{
+				{
+					Device:        "eth0",
+					IP:            "192.168.0.100",
+					ReservedPorts: []structs.Port{{Label: "admin", Value: 5000}},
+					MBits:         50,
+					DynamicPorts:  []structs.Port{{Label: "http", Value: 9876}},
+				},
+			},
+		},
+	}
+	alloc.SharedResources = &structs.Resources{
+		DiskMB: 150,
+	}
 
 	// Need to remove mock dynamic port from alloc as it won't be computed
 	// in this test
@@ -1610,9 +1665,10 @@ func TestFSM_DeregisterVaultAccessor(t *testing.T) {
 func TestFSM_ApplyPlanResults(t *testing.T) {
 	t.Parallel()
 	fsm := testFSM(t)
-
+	fsm.evalBroker.SetEnabled(true)
 	// Create the request and create a deployment
 	alloc := mock.Alloc()
+	alloc.Resources = &structs.Resources{} // COMPAT(0.11): Remove in 0.11, used to bypass resource creation in state store
 	job := alloc.Job
 	alloc.Job = nil
 
@@ -1628,13 +1684,39 @@ func TestFSM_ApplyPlanResults(t *testing.T) {
 	fsm.State().UpsertEvals(1, []*structs.Evaluation{eval})
 
 	fsm.State().UpsertJobSummary(1, mock.JobSummary(alloc.JobID))
+
+	// set up preempted jobs and allocs
+	job1 := mock.Job()
+	job2 := mock.Job()
+
+	alloc1 := mock.Alloc()
+	alloc1.Job = job1
+	alloc1.JobID = job1.ID
+	alloc1.PreemptedByAllocation = alloc.ID
+
+	alloc2 := mock.Alloc()
+	alloc2.Job = job2
+	alloc2.JobID = job2.ID
+	alloc2.PreemptedByAllocation = alloc.ID
+
+	fsm.State().UpsertAllocs(1, []*structs.Allocation{alloc1, alloc2})
+
+	// evals for preempted jobs
+	eval1 := mock.Eval()
+	eval1.JobID = job1.ID
+
+	eval2 := mock.Eval()
+	eval2.JobID = job2.ID
+
 	req := structs.ApplyPlanResultsRequest{
 		AllocUpdateRequest: structs.AllocUpdateRequest{
 			Job:   job,
 			Alloc: []*structs.Allocation{alloc},
 		},
-		Deployment: d,
-		EvalID:     eval.ID,
+		Deployment:      d,
+		EvalID:          eval.ID,
+		NodePreemptions: []*structs.Allocation{alloc1, alloc2},
+		PreemptionEvals: []*structs.Evaluation{eval1, eval2},
 	}
 	buf, err := structs.Encode(structs.ApplyPlanResultsRequestType, req)
 	if err != nil {
@@ -1658,6 +1740,23 @@ func TestFSM_ApplyPlanResults(t *testing.T) {
 	// Job should be re-attached
 	alloc.Job = job
 	assert.Equal(alloc, out)
+
+	// Verify that evals for preempted jobs have been created
+	e1, err := fsm.State().EvalByID(ws, eval1.ID)
+	require := require.New(t)
+	require.Nil(err)
+	require.NotNil(e1)
+
+	e2, err := fsm.State().EvalByID(ws, eval2.ID)
+	require.Nil(err)
+	require.NotNil(e2)
+
+	// Verify that eval broker has both evals
+	_, ok := fsm.evalBroker.evals[e1.ID]
+	require.True(ok)
+
+	_, ok = fsm.evalBroker.evals[e1.ID]
+	require.True(ok)
 
 	dout, err := fsm.State().DeploymentByID(ws, d.ID)
 	assert.Nil(err)
@@ -2354,37 +2453,6 @@ func TestFSM_SnapshotRestore_Allocs(t *testing.T) {
 	}
 }
 
-func TestFSM_SnapshotRestore_Allocs_NoSharedResources(t *testing.T) {
-	t.Parallel()
-	// Add some state
-	fsm := testFSM(t)
-	state := fsm.State()
-	alloc1 := mock.Alloc()
-	alloc2 := mock.Alloc()
-	alloc1.SharedResources = nil
-	alloc2.SharedResources = nil
-	state.UpsertJobSummary(998, mock.JobSummary(alloc1.JobID))
-	state.UpsertJobSummary(999, mock.JobSummary(alloc2.JobID))
-	state.UpsertAllocs(1000, []*structs.Allocation{alloc1})
-	state.UpsertAllocs(1001, []*structs.Allocation{alloc2})
-
-	// Verify the contents
-	fsm2 := testSnapshotRestore(t, fsm)
-	state2 := fsm2.State()
-	ws := memdb.NewWatchSet()
-	out1, _ := state2.AllocByID(ws, alloc1.ID)
-	out2, _ := state2.AllocByID(ws, alloc2.ID)
-	alloc1.SharedResources = &structs.Resources{DiskMB: 150}
-	alloc2.SharedResources = &structs.Resources{DiskMB: 150}
-
-	if !reflect.DeepEqual(alloc1, out1) {
-		t.Fatalf("bad: \n%#v\n%#v", out1, alloc1)
-	}
-	if !reflect.DeepEqual(alloc2, out2) {
-		t.Fatalf("bad: \n%#v\n%#v", out2, alloc2)
-	}
-}
-
 func TestFSM_SnapshotRestore_Indexes(t *testing.T) {
 	t.Parallel()
 	// Add some state
@@ -2549,6 +2617,12 @@ func TestFSM_SnapshotRestore_Deployments(t *testing.T) {
 	state := fsm.State()
 	d1 := mock.Deployment()
 	d2 := mock.Deployment()
+
+	j := mock.Job()
+	d1.JobID = j.ID
+	d2.JobID = j.ID
+
+	state.UpsertJob(999, j)
 	state.UpsertDeployment(1000, d1)
 	state.UpsertDeployment(1001, d2)
 
@@ -2602,6 +2676,29 @@ func TestFSM_SnapshotRestore_ACLTokens(t *testing.T) {
 	out2, _ := state2.ACLTokenByAccessorID(ws, tk2.AccessorID)
 	assert.Equal(t, tk1, out1)
 	assert.Equal(t, tk2, out2)
+}
+
+func TestFSM_SnapshotRestore_SchedulerConfiguration(t *testing.T) {
+	t.Parallel()
+	// Add some state
+	fsm := testFSM(t)
+	state := fsm.State()
+	schedConfig := &structs.SchedulerConfiguration{
+		PreemptionConfig: structs.PreemptionConfig{
+			SystemSchedulerEnabled: true,
+		},
+	}
+	state.SchedulerSetConfig(1000, schedConfig)
+
+	// Verify the contents
+	require := require.New(t)
+	fsm2 := testSnapshotRestore(t, fsm)
+	state2 := fsm2.State()
+	index, out, err := state2.SchedulerConfig()
+	require.Nil(err)
+	require.EqualValues(1000, index)
+	require.Equal(schedConfig, out)
+
 }
 
 func TestFSM_SnapshotRestore_AddMissingSummary(t *testing.T) {
@@ -2719,6 +2816,96 @@ func TestFSM_ReconcileSummaries(t *testing.T) {
 	}
 }
 
+// COMPAT: Remove in 0.11
+func TestFSM_ReconcileParentJobSummary(t *testing.T) {
+	// This test exercises code to handle https://github.com/hashicorp/nomad/issues/3886
+	t.Parallel()
+
+	require := require.New(t)
+	// Add some state
+	fsm := testFSM(t)
+	state := fsm.State()
+
+	// Add a node
+	node := mock.Node()
+	state.UpsertNode(800, node)
+
+	// Make a parameterized job
+	job1 := mock.BatchJob()
+	job1.ID = "test"
+	job1.ParameterizedJob = &structs.ParameterizedJobConfig{
+		Payload: "random",
+	}
+	job1.TaskGroups[0].Count = 1
+	state.UpsertJob(1000, job1)
+
+	// Make a child job
+	childJob := job1.Copy()
+	childJob.ID = job1.ID + "dispatch-23423423"
+	childJob.ParentID = job1.ID
+	childJob.Dispatched = true
+	childJob.Status = structs.JobStatusRunning
+
+	// Create an alloc for child job
+	alloc := mock.Alloc()
+	alloc.NodeID = node.ID
+	alloc.Job = childJob
+	alloc.JobID = childJob.ID
+	alloc.ClientStatus = structs.AllocClientStatusRunning
+
+	state.UpsertJob(1010, childJob)
+	state.UpsertAllocs(1011, []*structs.Allocation{alloc})
+
+	// Make the summary incorrect in the state store
+	summary, err := state.JobSummaryByID(nil, job1.Namespace, job1.ID)
+	require.Nil(err)
+
+	summary.Children = nil
+	summary.Summary = make(map[string]structs.TaskGroupSummary)
+	summary.Summary["web"] = structs.TaskGroupSummary{
+		Queued: 1,
+	}
+
+	req := structs.GenericRequest{}
+	buf, err := structs.Encode(structs.ReconcileJobSummariesRequestType, req)
+	require.Nil(err)
+
+	resp := fsm.Apply(makeLog(buf))
+	require.Nil(resp)
+
+	ws := memdb.NewWatchSet()
+	out1, _ := state.JobSummaryByID(ws, job1.Namespace, job1.ID)
+	expected := structs.JobSummary{
+		JobID:       job1.ID,
+		Namespace:   job1.Namespace,
+		Summary:     make(map[string]structs.TaskGroupSummary),
+		CreateIndex: 1000,
+		ModifyIndex: out1.ModifyIndex,
+		Children: &structs.JobChildrenSummary{
+			Running: 1,
+		},
+	}
+	require.Equal(&expected, out1)
+}
+
+func TestFSM_LeakedDeployments(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+
+	// Add some state
+	fsm := testFSM(t)
+	state := fsm.State()
+	d := mock.Deployment()
+	require.NoError(state.UpsertDeployment(1000, d))
+
+	// Verify the contents
+	fsm2 := testSnapshotRestore(t, fsm)
+	state2 := fsm2.State()
+	out, _ := state2.DeploymentByID(nil, d.ID)
+	require.NotNil(out)
+	require.Equal(structs.DeploymentStatusCancelled, out.Status)
+}
+
 func TestFSM_Autopilot(t *testing.T) {
 	t.Parallel()
 	fsm := testFSM(t)
@@ -2776,4 +2963,53 @@ func TestFSM_Autopilot(t *testing.T) {
 	if !config.CleanupDeadServers {
 		t.Fatalf("bad: %v", config.CleanupDeadServers)
 	}
+}
+
+func TestFSM_SchedulerConfig(t *testing.T) {
+	t.Parallel()
+	fsm := testFSM(t)
+
+	require := require.New(t)
+
+	// Set the scheduler config using a request.
+	req := structs.SchedulerSetConfigRequest{
+		Config: structs.SchedulerConfiguration{
+			PreemptionConfig: structs.PreemptionConfig{
+				SystemSchedulerEnabled: true,
+				BatchSchedulerEnabled:  true,
+			},
+		},
+	}
+	buf, err := structs.Encode(structs.SchedulerConfigRequestType, req)
+	require.Nil(err)
+
+	resp := fsm.Apply(makeLog(buf))
+	if _, ok := resp.(error); ok {
+		t.Fatalf("bad: %v", resp)
+	}
+
+	// Verify key is set directly in the state store.
+	_, config, err := fsm.state.SchedulerConfig()
+	require.Nil(err)
+
+	require.Equal(config.PreemptionConfig.SystemSchedulerEnabled, req.Config.PreemptionConfig.SystemSchedulerEnabled)
+	require.Equal(config.PreemptionConfig.BatchSchedulerEnabled, req.Config.PreemptionConfig.BatchSchedulerEnabled)
+
+	// Now use CAS and provide an old index
+	req.CAS = true
+	req.Config.PreemptionConfig = structs.PreemptionConfig{SystemSchedulerEnabled: false, BatchSchedulerEnabled: false}
+	req.Config.ModifyIndex = config.ModifyIndex - 1
+	buf, err = structs.Encode(structs.SchedulerConfigRequestType, req)
+	require.Nil(err)
+
+	resp = fsm.Apply(makeLog(buf))
+	if _, ok := resp.(error); ok {
+		t.Fatalf("bad: %v", resp)
+	}
+
+	_, config, err = fsm.state.SchedulerConfig()
+	require.Nil(err)
+	// Verify that preemption is still enabled
+	require.True(config.PreemptionConfig.SystemSchedulerEnabled)
+	require.True(config.PreemptionConfig.BatchSchedulerEnabled)
 }

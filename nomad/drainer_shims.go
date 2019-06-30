@@ -1,6 +1,10 @@
 package nomad
 
-import "github.com/hashicorp/nomad/nomad/structs"
+import (
+	"time"
+
+	"github.com/hashicorp/nomad/nomad/structs"
+)
 
 // drainerShim implements the drainer.RaftApplier interface required by the
 // NodeDrainer.
@@ -8,15 +12,20 @@ type drainerShim struct {
 	s *Server
 }
 
-func (d drainerShim) NodesDrainComplete(nodes []string) (uint64, error) {
+func (d drainerShim) NodesDrainComplete(nodes []string, event *structs.NodeEvent) (uint64, error) {
 	args := &structs.BatchNodeUpdateDrainRequest{
 		Updates:      make(map[string]*structs.DrainUpdate, len(nodes)),
+		NodeEvents:   make(map[string]*structs.NodeEvent, len(nodes)),
 		WriteRequest: structs.WriteRequest{Region: d.s.config.Region},
+		UpdatedAt:    time.Now().Unix(),
 	}
 
 	update := &structs.DrainUpdate{}
 	for _, node := range nodes {
 		args.Updates[node] = update
+		if event != nil {
+			args.NodeEvents[node] = event
+		}
 	}
 
 	resp, index, err := d.s.raftApply(structs.BatchNodeUpdateDrainRequestType, args)
