@@ -891,9 +891,11 @@ func (d *Driver) createContainerConfig(task *drivers.TaskConfig, driverConfig *T
 			hostPortStr := strconv.Itoa(port.Value)
 			containerPort := docker.Port(strconv.Itoa(containerPortInt))
 
-			publishedPorts[containerPort+"/tcp"] = getPortBinding(network.IP, hostPortStr)
-			publishedPorts[containerPort+"/udp"] = getPortBinding(network.IP, hostPortStr)
-			logger.Debug("allocated static port", "ip", network.IP, "port", port.Value)
+			// This has to hard-code "127.0.0.1" is to ensure that while in DinD mode
+			// (Docker in Docker), the bind happens to the localhost. 
+			publishedPorts[containerPort+"/tcp"] = getPortBinding("127.0.0.1", hostPortStr)
+			publishedPorts[containerPort+"/udp"] = getPortBinding("127.0.0.1", hostPortStr)
+			logger.Debug("allocated static port", "ip", "127.0.0.1", "port", port.Value)
 
 			exposedPorts[containerPort+"/tcp"] = struct{}{}
 			exposedPorts[containerPort+"/udp"] = struct{}{}
@@ -911,10 +913,12 @@ func (d *Driver) createContainerConfig(task *drivers.TaskConfig, driverConfig *T
 
 			hostPortStr := strconv.Itoa(port.Value)
 			containerPort := docker.Port(strconv.Itoa(containerPortInt))
-
-			publishedPorts[containerPort+"/tcp"] = getPortBinding(network.IP, hostPortStr)
-			publishedPorts[containerPort+"/udp"] = getPortBinding(network.IP, hostPortStr)
-			logger.Debug("allocated mapped port", "ip", network.IP, "port", port.Value)
+			
+			// This has to hard-code "127.0.0.1" is to ensure that while in DinD mode
+			// (Docker in Docker), the bind happens to the localhost. 
+			publishedPorts[containerPort+"/tcp"] = getPortBinding("127.0.0.1", hostPortStr)
+			publishedPorts[containerPort+"/udp"] = getPortBinding("127.0.0.1", hostPortStr)
+			logger.Debug("allocated mapped port", "ip", "127.0.0.1", "port", port.Value)
 
 			exposedPorts[containerPort+"/tcp"] = struct{}{}
 			exposedPorts[containerPort+"/udp"] = struct{}{}
