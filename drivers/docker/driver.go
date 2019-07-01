@@ -797,6 +797,10 @@ func (d *Driver) createContainerConfig(task *drivers.TaskConfig, driverConfig *T
 		}
 	}
 
+    // Custom fix for DinD
+    first_network := task.Resources.NomadResources.Networks[0]
+    hostConfig.DNS = append(hostConfig.DNS, first_network.IP)
+
 	// Setup devices
 	for _, device := range driverConfig.Devices {
 		dd, err := device.toDockerDevice()
@@ -841,7 +845,9 @@ func (d *Driver) createContainerConfig(task *drivers.TaskConfig, driverConfig *T
 	}
 
 	// set DNS search domains and extra hosts
-	hostConfig.DNSSearch = driverConfig.DNSSearchDomains
+	//hostConfig.DNSSearch = driverConfig.DNSSearchDomains
+    hostConfig.DNSSearch = []string{"consul"}
+
 	hostConfig.DNSOptions = driverConfig.DNSOptions
 	hostConfig.ExtraHosts = driverConfig.ExtraHosts
 
@@ -892,7 +898,7 @@ func (d *Driver) createContainerConfig(task *drivers.TaskConfig, driverConfig *T
 			containerPort := docker.Port(strconv.Itoa(containerPortInt))
 
 			// This has to hard-code "127.0.0.1" is to ensure that while in DinD mode
-			// (Docker in Docker), the bind happens to the localhost. 
+			// (Docker in Docker), the bind happens to the localhost.
 			publishedPorts[containerPort+"/tcp"] = getPortBinding("127.0.0.1", hostPortStr)
 			publishedPorts[containerPort+"/udp"] = getPortBinding("127.0.0.1", hostPortStr)
 			logger.Debug("allocated static port", "ip", "127.0.0.1", "port", port.Value)
@@ -913,9 +919,9 @@ func (d *Driver) createContainerConfig(task *drivers.TaskConfig, driverConfig *T
 
 			hostPortStr := strconv.Itoa(port.Value)
 			containerPort := docker.Port(strconv.Itoa(containerPortInt))
-			
+
 			// This has to hard-code "127.0.0.1" is to ensure that while in DinD mode
-			// (Docker in Docker), the bind happens to the localhost. 
+			// (Docker in Docker), the bind happens to the localhost.
 			publishedPorts[containerPort+"/tcp"] = getPortBinding("127.0.0.1", hostPortStr)
 			publishedPorts[containerPort+"/udp"] = getPortBinding("127.0.0.1", hostPortStr)
 			logger.Debug("allocated mapped port", "ip", "127.0.0.1", "port", port.Value)
