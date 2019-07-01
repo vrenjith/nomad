@@ -848,7 +848,8 @@ func (d *Driver) createContainerConfig(task *drivers.TaskConfig, driverConfig *T
 	//hostConfig.DNSSearch = driverConfig.DNSSearchDomains
     hostConfig.DNSSearch = []string{"consul"}
 
-	hostConfig.DNSOptions = driverConfig.DNSOptions
+	//hostConfig.DNSOptions = driverConfig.DNSOptions
+    hostConfig.DNSOptions = []string{"ndots:2"}
 	hostConfig.ExtraHosts = driverConfig.ExtraHosts
 
 	hostConfig.IpcMode = driverConfig.IPCMode
